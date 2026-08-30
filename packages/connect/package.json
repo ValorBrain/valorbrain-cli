@@ -1,0 +1,30 @@
+{
+  "name": "@valorbrain/connect",
+  "version": "0.1.0",
+  "description": "Connect stdio MCP clients to the hosted ValorBrain MCP server — alias package for `valorbrain mcp`.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "valorbrain-connect": "./bin/valorbrain-connect.js"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@valorbrain/cli": "^0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ValorBrain/valorbrain-cli.git"
+  },
+  "files": [
+    "bin/",
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ]
+}
