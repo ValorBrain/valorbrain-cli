@@ -1,0 +1,47 @@
+name: publish
+
+# Trusted publishing (OIDC): no npm token, no OTP. The identity IS this
+# workflow — registered on npmjs.com as the trusted publisher of
+# @valorbrain/cli and @valorbrain/connect (pending trusted publisher).
+# npm >= 11.5.1 and node >= 22.14 required by the registry for OIDC.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write # OIDC — this is the whole auth model
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm >= 12
+        run: npm install -g npm@12 && npm --version
+
+      - name: Publish @valorbrain/cli
+        run: npm publish --access public
+
+      - name: Wait for @valorbrain/cli to resolve on the registry
+        run: |
+          for i in $(seq 1 12); do
+            if npm view @valorbrain/cli version >/dev/null 2>&1; then
+              echo "resolves"; exit 0
+            fi
+            sleep 5
+          done
+          echo "@valorbrain/cli not visible on registry yet" >&2
+          exit 1
+
+      - name: Publish @valorbrain/connect
+        run: npm publish --access public
+        working-directory: packages/connect
