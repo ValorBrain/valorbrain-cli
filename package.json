@@ -1,7 +1,7 @@
 {
   "name": "@valorbrain/cli",
-  "version": "0.1.0",
-  "description": "ValorBrain CLI — agent-native memory. Sign up, add and search memory from the shell in seconds.",
+  "version": "0.1.1",
+  "description": "ValorBrain CLI \u2014 agent-native memory. Sign up, add and search memory from the shell in seconds.",
   "license": "MIT",
   "type": "module",
   "bin": {

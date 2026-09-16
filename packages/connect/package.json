@@ -1,30 +1,35 @@
 {
   "name": "@valorbrain/connect",
-  "version": "0.1.0",
-  "description": "Connect stdio MCP clients to the hosted ValorBrain MCP server — alias package for `valorbrain mcp`.",
-  "license": "MIT",
+  "version": "0.2.0",
+  "description": "Wire any CLI agent harness (Claude Code, Kiro, OpenCode, Codex, Grok, Gemini CLI, Cursor, OMP) to hosted ValorBrain memory. No dependencies.",
   "type": "module",
   "bin": {
-    "valorbrain-connect": "./bin/valorbrain-connect.js"
+    "valorbrain-connect": "./index.mjs"
   },
-  "main": "./index.js",
-  "exports": {
-    ".": "./index.js"
-  },
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "@valorbrain/cli": "^0.1.0"
-  },
+  "keywords": [
+    "valorbrain",
+    "mcp",
+    "agent-memory",
+    "claude-code",
+    "kiro",
+    "opencode",
+    "codex",
+    "grok",
+    "cursor",
+    "omp"
+  ],
+  "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ValorBrain/valorbrain-cli.git"
-  },
-  "files": [
-    "bin/",
-    "index.js",
-    "README.md",
-    "LICENSE"
-  ]
+    "url": "https://github.com/valor-digital/valorbrain.git",
+    "directory": "packages/connect"
+  }
 }
