@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
-const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://api.valorbrain.valor.digital";
+const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
 const BLOCK_END = "<!-- valorbrain:end -->";
 const TOKEN_PLACEHOLDER = "vbm_<YOUR_TOKEN>";
