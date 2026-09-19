@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# Padrao de repo organizado — fonte: /www/valorbrain-platform/STANDARDS.md
+# Bloqueia staging de segredos e lixo. Bypass consciente: VALORBRAIN_ALLOW=1 git commit ...
+if [ "$VALORBRAIN_ALLOW" = "1" ]; then exit 0; fi
+
+files=$(git diff --cached --name-only)
+[ -z "$files" ] && exit 0
+
+bad_env=$(printf "%s\n" "$files" | grep -E "(^|/)\.env" | grep -v "\.example$")
+bad_junk=$(printf "%s\n" "$files" | grep -E "\.bak|\.DS_Store")
+
+if [ -n "$bad_env" ] || [ -n "$bad_junk" ]; then
+  echo ""
+  echo "X  pre-commit (STANDARDS.md): arquivos que nao entram no git:"
+  [ -n "$bad_env" ]  && echo "$bad_env" | sed "s/^/   .env:  /"
+  [ -n "$bad_junk" ] && echo "$bad_junk" | sed "s/^/   lixo:  /"
+  echo "   Mova backups para /root/backups/env-<repo>/. Bypass: VALORBRAIN_ALLOW=1"
+  exit 1
+fi
+exit 0
+
