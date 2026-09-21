@@ -6,8 +6,8 @@
  * so `valorbrain setup harness` is not available to them. This is the client half:
  * it asks the engine for the rendered artifacts and writes them.
  *
- * Node built-ins only — no dependencies, nothing to audit, runs anywhere the
- * harnesses already run.
+ * Node built-ins + `yaml` (o config do Hermes é YAML; preservamos o arquivo do
+ * cliente e só mesclamos as chaves nossas).
  *
  *   npx @valorbrain/connect --token vbm_xxx            # detect and wire everything
  *   npx @valorbrain/connect --token vbm_xxx --harness kiro
@@ -23,6 +23,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
+import { parseDocument } from "yaml";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -85,6 +86,7 @@ const DETECT = {
   "gemini-cli": ".gemini",
   cursor: ".cursor",
   omp: ".omp",
+  hermes: ".hermes",
 };
 
 function detectInstalled(home) {
@@ -207,6 +209,50 @@ async function fetchManifest(api, harness) {
   return res.json();
 }
 
+/**
+ * Merge do config YAML do Hermes (`~/.hermes/config.yaml`). O arquivo é do
+ * cliente (modelo, providers, tokens) — nada de sobrescrever: copiamos só os
+ * caminhos que são nossos (`mcp_servers.valorbrain`, `memory.provider` e as
+ * chaves de `env` que o manifest trouxer), preservando comentários e o resto.
+ */
+function mergeYaml(existingRaw, renderedRaw, remove) {
+  const existing = parseDocument(existingRaw ?? "");
+  if (existing.errors.length > 0) {
+    throw new Error("existing config is not valid YAML — refusing to overwrite");
+  }
+  const rendered = parseDocument(renderedRaw ?? "");
+  if (rendered.errors.length > 0) throw new Error("server sent invalid YAML");
+  const server = rendered.toJS() ?? {};
+  const serverEntry = server?.mcp_servers?.valorbrain;
+  const serverProvider = server?.memory?.provider;
+  const serverEnv = server?.env && typeof server.env === "object" ? server.env : {};
+
+  if (remove) {
+    existing.deleteIn(["mcp_servers", "valorbrain"]);
+    if (existing.getIn(["memory", "provider"]) === "valorbrain") {
+      existing.deleteIn(["memory", "provider"]);
+    }
+    for (const key of Object.keys(serverEnv)) existing.deleteIn(["env", key]);
+    return existing.toString({ lineWidth: 0 });
+  }
+
+  if (serverEntry !== undefined) {
+    existing.setIn(["mcp_servers", "valorbrain"], serverEntry);
+  }
+  // Provider: não rouba o slot de quem já escolheu outro.
+  const currentProvider = existing.getIn(["memory", "provider"]);
+  if (
+    serverProvider !== undefined &&
+    (currentProvider === undefined || currentProvider === null || currentProvider === "" || currentProvider === "valorbrain")
+  ) {
+    existing.setIn(["memory", "provider"], serverProvider);
+  }
+  for (const [key, value] of Object.entries(serverEnv)) {
+    existing.setIn(["env", key], value);
+  }
+  return existing.toString({ lineWidth: 0 });
+}
+
 function planFor(manifest, token, home, remove) {
   const changes = [];
   for (const artifact of manifest.artifacts) {
@@ -221,7 +267,10 @@ function planFor(manifest, token, home, remove) {
 
     let after;
     try {
-      if (artifact.kind === "mcp" && path.endsWith(".toml")) {
+      if (artifact.kind === "mcp" && /\.ya?ml$/.test(path)) {
+        // Hermes: config.yaml é do cliente; mescla por chave, nunca overwrite.
+        after = mergeYaml(before, rendered, remove);
+      } else if (artifact.kind === "mcp" && path.endsWith(".toml")) {
         after = mergeToml(before, rendered, remove);
       } else if (artifact.kind === "mcp") {
         after = mergeJson(before ?? "{}", rendered, remove);
@@ -437,7 +486,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.3.1";
+const CLIENT_VERSION = "0.4.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -464,14 +513,23 @@ function writeHealState(home, state) {
   }
 }
 
-/** Versão do contrato instalada (marker no arquivo de regras do manifesto). */
+/**
+ * Versão do contrato REALMENTE instalada: lê de volta o arquivo que o apply
+ * acabou de escrever. Regras trazem o marker `valorbrain-contract: vN`; o
+ * plugin do Hermes (que não tem arquivo de regras) traz `_CONTRACT_VERSION`.
+ * Sem leitura possível devolve null — declarar o que não está no disco
+ * inflaria a medição de adoção.
+ */
 function installedContractVersion(manifest, home) {
   for (const artifact of manifest?.artifacts || []) {
-    if (artifact.kind !== "rules") continue;
+    if (artifact.kind !== "rules" && artifact.kind !== "plugin") continue;
     const path = expand(artifact.path, home);
     if (!path || !existsSync(path)) continue;
     try {
-      const m = readFileSync(path, "utf-8").match(/valorbrain-contract:\s*v(\d+)/);
+      const text = readFileSync(path, "utf-8");
+      const m = artifact.kind === "rules"
+        ? text.match(/valorbrain-contract:\s*v(\d+)/)
+        : text.match(/_CONTRACT_VERSION\s*=\s*"([^"]+)"/);
       if (m) return m[1];
     } catch {
       /* segue para o próximo */
