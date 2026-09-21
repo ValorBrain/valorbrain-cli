@@ -1,5 +1,5 @@
 name: valorbrain
-version: "1.4.0"
+version: "1.5.0"
 description: "ValorBrain — hosted hybrid memory (composite scoring, graph traversal, lifecycle) as a MemoryProvider plus MCP tools. Hosted: set VALORBRAIN_ENGINE_URL + VALORBRAIN_API_TOKEN (npx @valorbrain/connect writes them). Self-hosted: the valorbrain binary."
 requires_hermes: ">=0.20"
 external_dependencies:
@@ -9,3 +9,5 @@ external_dependencies:
 hooks:
   - on_session_end
   - on_pre_compress
+provides_middleware:
+  - tool_execution

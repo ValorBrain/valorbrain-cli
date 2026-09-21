@@ -58,7 +58,7 @@ _CONTRACT_VERSION = "5"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.4.0"
+_PLUGIN_VERSION = "1.5.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -442,6 +442,11 @@ class ValorBrainProvider(MemoryProvider):
         self._runtime_key: Optional[str] = None
         self._runtime_id: Optional[str] = None
         self._last_runtime_hb: float = 0.0
+
+        # Pós-compactação: marcado em on_pre_compress, consumido no próximo
+        # prefetch (o canal de injeção do provider substitui o SessionStart
+        # matcher "compact" do Claude Code).
+        self._postcompact_pending: bool = False
 
     @property
     def name(self) -> str:
@@ -956,6 +961,26 @@ class ValorBrainProvider(MemoryProvider):
                 "prompt": query,
                 "hook_event_name": "UserPromptSubmit",
             }
+            parts: list = []
+
+            # Pós-compactação: o Hermes não tem SessionStart com matcher
+            # "compact"; o canal é o próprio prefetch. Re-injeta o estado
+            # (precompact-state.md) uma vez no turno seguinte à compressão —
+            # local via binário, hospedado via REST no engine.
+            with self._prefetch_lock:
+                pending_postcompact = self._postcompact_pending
+                self._postcompact_pending = False
+            if pending_postcompact:
+                pc = self._invoke_hook("postcompact-inject", {
+                    "session_id": run_session_id,
+                    "transcript_path": run_transcript_path,
+                    "hook_event_name": "SessionStart",
+                })
+                if pc:
+                    pc_ctx = _extract_context(pc)
+                    if pc_ctx:
+                        parts.append(pc_ctx)
+
             output = self._invoke_hook(
                 "context-surfacing",
                 hook_input,
@@ -964,30 +989,31 @@ class ValorBrainProvider(MemoryProvider):
             if output:
                 ctx = _extract_context(output)
                 if ctx:
-                    with self._prefetch_lock:
-                        # Only write if we're still the latest generation
-                        if my_gen == self._prefetch_generation:
-                            self._prefetch_result = ctx
-                            self._prefetch_result_gen = my_gen
-                            return  # Success via CLI hook
+                    parts.append(ctx)
 
-            # Fallback: REST memory_prepare if CLI hook returned nothing
-            # (binary missing, hook failed, or empty output). fast_mode: the
-            # per-turn funnel delivered docs=0 in 30/30 prod samples while
-            # costing ~3.5s of p50 (perf profile 2026-08-15) — identity/recall/
-            # goals blocks still arrive, the document funnel does not.
-            try:
-                rest_body = {"message": query, "recall_budget": 600, "fast_mode": True}
-                rest_data = _rest_call(self._port, "POST", "/api/v1/memory/prepare", rest_body)
-                if rest_data:
-                    rest_ctx = json.dumps(rest_data, ensure_ascii=False)
-                    if rest_ctx and len(rest_ctx) > 10:
-                        with self._prefetch_lock:
-                            if my_gen == self._prefetch_generation:
-                                self._prefetch_result = rest_ctx
-                                self._prefetch_result_gen = my_gen
-            except Exception:
-                pass  # Both CLI and REST failed — degrade silently
+            if not parts:
+                # Fallback: REST memory_prepare se o hook não devolveu nada
+                # (sem binário e sem engine remoto, hook falhou, ou vazio).
+                # fast_mode: o funil por turno entregou docs=0 em 30/30 amostras
+                # de produção custando ~3.5s de p50 (perfil 2026-08-15) —
+                # identity/recall/goals continuam vindo, o funil de documentos
+                # não.
+                try:
+                    rest_body = {"message": query, "recall_budget": 600, "fast_mode": True}
+                    rest_data = _rest_call(self._port, "POST", "/api/v1/memory/prepare", rest_body)
+                    if rest_data:
+                        rest_ctx = json.dumps(rest_data, ensure_ascii=False)
+                        if rest_ctx and len(rest_ctx) > 10:
+                            parts.append(rest_ctx)
+                except Exception:
+                    pass  # Degrada em silêncio
+
+            if parts:
+                with self._prefetch_lock:
+                    # Only write if we're still the latest generation
+                    if my_gen == self._prefetch_generation:
+                        self._prefetch_result = "\n\n".join(parts)
+                        self._prefetch_result_gen = my_gen
 
         # Wait for any previous prefetch to finish
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -1135,6 +1161,9 @@ class ValorBrainProvider(MemoryProvider):
             "hook_event_name": "PreCompact",
         }
         self._invoke_hook("precompact-extract", hook_input)
+        # O estado acabou de ser escrito (local ou no engine); o próximo turno
+        # re-injeta via prefetch.
+        self._postcompact_pending = True
         return ""
 
     # -- Tools (REST API) ------------------------------------------------------
@@ -1303,6 +1332,76 @@ class ValorBrainProvider(MemoryProvider):
 
 
 # ---------------------------------------------------------------------------
+# PreToolUse middleware — contexto do vault por arquivo, sem bloquear o agente
+# ---------------------------------------------------------------------------
+#
+# O hook `pretool-inject` (matcher Read|Edit|Write) injeta decisões/antipadrões
+# do vault sobre o arquivo alvo. Hospedado não tem hook de PreToolUse no
+# harness: usamos o middleware NATIVO do Hermes (`tool_execution`), que roda
+# dentro do processo do agente. Middleware é síncrono — uma chamada HTTP ali
+# travaria o loop — então o desenho é cache + aquecimento em background: a
+# resposta do turno nunca espera; a partir da segunda interação com o mesmo
+# arquivo o contexto aparece.
+
+_FILE_CTX_TTL_S = 600
+_PRETOOL_TIMEOUT_S = 5
+_file_ctx_cache: dict = {}
+_file_ctx_inflight: set = set()
+_file_ctx_lock = threading.Lock()
+
+
+def _cached_file_context(provider, path: str) -> str:
+    """Contexto do vault para `path`: devolve o cache e aquece em background."""
+    now = time.time()
+    with _file_ctx_lock:
+        entry = _file_ctx_cache.get(path)
+        if entry and (now - entry[0]) < _FILE_CTX_TTL_S:
+            return entry[1]
+        if path in _file_ctx_inflight:
+            return entry[1] if entry else ""
+        _file_ctx_inflight.add(path)
+
+    def _warm() -> None:
+        try:
+            out = provider._invoke_hook(
+                "pretool-inject",
+                {"tool_input": {"file_path": path}, "hook_event_name": "PreToolUse"},
+                timeout=_PRETOOL_TIMEOUT_S,
+            )
+            ctx = _extract_context(out) if out else ""
+            with _file_ctx_lock:
+                _file_ctx_cache[path] = (time.time(), ctx)
+        except Exception:
+            pass
+        finally:
+            with _file_ctx_lock:
+                _file_ctx_inflight.discard(path)
+
+    threading.Thread(target=_warm, daemon=True, name="valorbrain-pretool").start()
+    return entry[1] if entry else ""
+
+
+def _tool_execution_middleware(provider):
+    """Appenda o contexto do vault ao resultado de tools com `file_path`."""
+
+    def middleware(tool_name, args, next_call, **context):
+        result = next_call(args)
+        try:
+            candidate = None
+            if isinstance(args, dict):
+                candidate = args.get("file_path") or args.get("path")
+            if isinstance(candidate, str) and len(candidate) >= 5 and isinstance(result, str):
+                block = _cached_file_context(provider, candidate)
+                if block:
+                    return result + "\n\n" + block
+        except Exception:
+            pass
+        return result
+
+    return middleware
+
+
+# ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
@@ -1376,5 +1475,12 @@ def _eager_register_gateway_runtime() -> None:
 
 def register(ctx) -> None:
     """Register ValorBrain as a memory provider plugin."""
-    ctx.register_memory_provider(ValorBrainProvider())
+    provider = ValorBrainProvider()
+    ctx.register_memory_provider(provider)
+    # PreToolUse nativo: contexto por arquivo no resultado das tools (o harness
+    # hospedado não tem hook de PreToolUse; middleware é o caminho). Não-bloqueante.
+    try:
+        ctx.register_middleware("tool_execution", _tool_execution_middleware(provider))
+    except Exception as e:
+        logger.debug("valorbrain: tool middleware registration skipped: %s", e)
     _eager_register_gateway_runtime()

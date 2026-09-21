@@ -36,9 +36,17 @@ Without a local binary the provider covers tools, registration, contract
 declaration **and the lifecycle hooks**: bootstrap, per-turn context and the
 Stop/PreCompact extraction run on the engine via `POST /api/v1/hooks/run` (the
 engine owns the code and the database; the client only ships the transcript).
-Only local injections (`postcompact-inject`, `pretool-inject`, `curator-nudge`)
-have no hosted equivalent, because they depend on the harness on the client's
-disk.
+
+The three hooks that used to need the client's disk have their own hosted path:
+
+- **postcompact-inject** — the precompact state lives on the engine, scoped per
+  tenant+session; the plugin re-injects it on the first turn after compaction
+  (the provider's injection channel replaces the `SessionStart` `compact` matcher).
+- **curator-nudge** — folded into the hosted `session-bootstrap` as a per-tenant
+  nudge (`staleness-check`); the local curator report is host-scoped.
+- **pretool-inject** — native Hermes middleware (`tool_execution`): vault context
+  for the target file is appended to tool results carrying `file_path`, with a
+  background-warmed cache (middleware is synchronous; it never blocks the loop).
 
 ## Self-hosted
 
