@@ -225,6 +225,11 @@ function planFor(manifest, token, home, remove) {
         after = mergeToml(before, rendered, remove);
       } else if (artifact.kind === "mcp") {
         after = mergeJson(before ?? "{}", rendered, remove);
+      } else if (artifact.kind === "hooks" && path.endsWith(".json") && !/valorbrain/i.test(path)) {
+        // Arquivo COMPARTILHADO do cliente (ex.: ~/.claude/settings.json):
+        // merge por evento, nunca overwrite. Arquivos nossos (valorbrain.json,
+        // plugins/valorbrain.ts) seguem o caminho normal (write/delete).
+        after = mergeHooksJson(before ?? "", rendered, remove);
       } else if (artifact.strategy === "merge") {
         const block = extractBlock(rendered);
         if (!block) throw new Error("server sent a merge artifact without markers");
@@ -275,6 +280,47 @@ function apply(changes, { dryRun, noBackup }) {
     }
   }
   return { wrote, failed };
+}
+
+/** True when a hook entry was written by us (hosted client or local binary). */
+function isOurHookEntry(entry) {
+  const s = JSON.stringify(entry ?? "");
+  return s.includes("@valorbrain/connect") || s.includes("valorbrain hook");
+}
+
+/**
+ * Merge our hooks into a JSON file the CUSTOMER owns (ex.:
+ * `~/.claude/settings.json`). O servidor renderiza o arquivo a partir de uma
+ * base vazia — sobrescrever aqui apagaria hooks e permissões do cliente (bug
+ * pego ao planejar o heal do Erick/Evous, 2026-09-21). Preserva tudo; troca
+ * apenas as entradas que são nossas, por evento.
+ */
+function mergeHooksJson(existingRaw, renderedRaw, remove) {
+  let existing;
+  try {
+    existing = existingRaw && existingRaw.trim() ? JSON.parse(existingRaw) : {};
+  } catch {
+    throw new Error("existing config is not valid JSON — refusing to overwrite");
+  }
+  const rendered = JSON.parse(renderedRaw);
+  const renderedHooks = rendered?.hooks;
+  if (!renderedHooks || typeof renderedHooks !== "object") {
+    return JSON.stringify(rendered, null, 2);
+  }
+  if (!existing.hooks || typeof existing.hooks !== "object") existing.hooks = {};
+  for (const [event, entries] of Object.entries(renderedHooks)) {
+    const kept = Array.isArray(existing.hooks[event])
+      ? existing.hooks[event].filter((e) => !isOurHookEntry(e))
+      : [];
+    if (remove) {
+      if (kept.length > 0) existing.hooks[event] = kept;
+      else delete existing.hooks[event];
+      continue;
+    }
+    existing.hooks[event] = [...kept, ...(Array.isArray(entries) ? entries : [])];
+  }
+  if (Object.keys(existing.hooks).length === 0) delete existing.hooks;
+  return JSON.stringify(existing, null, 2);
 }
 
 function statusFor(manifest, home) {
@@ -391,7 +437,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.3.0";
+const CLIENT_VERSION = "0.3.1";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -490,14 +536,46 @@ function applyQuiet(changes) {
   return wrote;
 }
 
+/**
+ * Instalações antigas não têm `--harness` no comando de hook. Inferimos o
+ * harness pelo arquivo que invoca este cliente — é o bootstrap que faz o
+ * primeiro hook depois do update consertar a própria config (adicionando o
+ * `--harness` e o contrato novo).
+ */
+const HARNESS_HOOK_FILES = [
+  ["claude-code", [".claude/settings.json"]],
+  ["kiro", [".kiro/hooks/valorbrain.json"]],
+  ["grok", [".grok/hooks/valorbrain.json"]],
+  ["omp", [".omp/agent/hooks/pre/valorbrain.ts"]],
+  ["opencode", [".config/opencode/plugins/valorbrain.ts"]],
+];
+
+function detectHarness(home) {
+  for (const [id, files] of HARNESS_HOOK_FILES) {
+    for (const f of files) {
+      const p = join(home, f);
+      if (!existsSync(p)) continue;
+      try {
+        const body = readFileSync(p, "utf-8");
+        if (body.includes("@valorbrain/connect") || body.includes("valorbrain hook")) return id;
+      } catch {
+        /* segue para o próximo */
+      }
+    }
+  }
+  return "";
+}
+
 async function maybeSelfHeal(api, token, harness, home) {
-  if (!token || !harness) return;
+  if (!token) return;
+  const id = harness || detectHarness(home);
+  if (!id) return;
   try {
     const state = readHealState(home);
     if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
     state.lastHealAt = Date.now();
     writeHealState(home, state); // throttle mesmo em falha: hook roda a cada prompt
-    const manifest = await fetchManifest(api, harness);
+    const manifest = await fetchManifest(api, id);
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
     if (expected && installed !== expected) {
@@ -513,7 +591,7 @@ async function maybeSelfHeal(api, token, harness, home) {
         }
       }
     }
-    await declareContract(api, token, harness, home, manifest);
+    await declareContract(api, token, id, home, manifest);
   } catch {
     /* fail-open */
   }
