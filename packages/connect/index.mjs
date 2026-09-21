@@ -22,7 +22,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -358,6 +358,11 @@ async function main() {
     const res = apply(changes, args);
     failed += res.failed;
 
+    // Instalou/atualizou: informa o engine do estado deste harness (fail-open).
+    if (!args.remove && !args.dryRun) {
+      await declareContract(args.api, token, harness, home, manifest);
+    }
+
     if (!args.remove) {
       if (!manifest.hooks_available) {
         console.log(`  ${C.dim}note: automatic context injection (hooks) needs a self-hosted engine; this install covers tools + instructions${C.off}`);
@@ -376,6 +381,143 @@ async function main() {
 // Dispatch happens at the very bottom of the file, once the hook client below is
 // defined: `connect hook <name>` runs the hook client, anything else installs.
 
+
+// ─── contrato: self-heal + declaração ───────────────────────────────────────
+//
+// O arquivo de regras vive na máquina do cliente e envelhece: o servidor publica
+// um contrato novo e ninguém roda o install de novo. Aqui o próprio cliente se
+// corrige quando o harness o invoca (hooks) ou logo após instalar — no máximo a
+// cada 6h — e **declara** ao engine o que tem. Sem isso o servidor não sabe que
+// o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
+// nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
+
+const CLIENT_VERSION = "0.3.0";
+const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
+const DECLARE_TIMEOUT_MS = 2500;
+/** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
+const HEAL_HOOK_BUDGET_MS = Number(process.env.VALORBRAIN_HEAL_HOOK_BUDGET_MS || 2500);
+
+function healStatePath(home) {
+  return join(home, ".valorbrain", "connect-state.json");
+}
+
+function readHealState(home) {
+  try {
+    return JSON.parse(readFileSync(healStatePath(home), "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeHealState(home, state) {
+  try {
+    mkdirSync(dirname(healStatePath(home)), { recursive: true });
+    writeFileSync(healStatePath(home), JSON.stringify(state));
+  } catch {
+    /* fail-open */
+  }
+}
+
+/** Versão do contrato instalada (marker no arquivo de regras do manifesto). */
+function installedContractVersion(manifest, home) {
+  for (const artifact of manifest?.artifacts || []) {
+    if (artifact.kind !== "rules") continue;
+    const path = expand(artifact.path, home);
+    if (!path || !existsSync(path)) continue;
+    try {
+      const m = readFileSync(path, "utf-8").match(/valorbrain-contract:\s*v(\d+)/);
+      if (m) return m[1];
+    } catch {
+      /* segue para o próximo */
+    }
+  }
+  return null;
+}
+
+/** Declara no engine o que este harness tem. Fail-open; sem token não faz nada. */
+async function declareContract(api, token, harness, home, manifest) {
+  if (!token || !harness) return;
+  try {
+    const m = manifest ?? (await fetchManifest(api, harness));
+    const host = (() => {
+      try {
+        return hostname();
+      } catch {
+        return "host";
+      }
+    })();
+    await fetch(`${api.replace(/\/$/, "")}/api/v1/runtimes/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        runtime_key: `${harness}:${host}:${home}`,
+        agent_platform: harness,
+        display_name: `connect (${harness})`,
+        hostname: host,
+        plugin_version: CLIENT_VERSION,
+        capabilities: {
+          harness,
+          contract_version: installedContractVersion(m, home),
+          connector: "connect",
+          self_heal: true,
+        },
+      }),
+      signal: AbortSignal.timeout(DECLARE_TIMEOUT_MS),
+    });
+  } catch {
+    /* fail-open */
+  }
+}
+
+/** Aplica mudanças sem imprimir nada (no hook, stdout é o canal de contexto). */
+function applyQuiet(changes) {
+  let wrote = 0;
+  for (const c of changes) {
+    if (c.error || !c.changed) continue;
+    try {
+      if (c.before !== null) writeFileSync(`${c.path}.valorbrain-bak`, c.before);
+      if (c.after === null) {
+        if (existsSync(c.path)) unlinkSync(c.path);
+      } else {
+        mkdirSync(dirname(c.path), { recursive: true });
+        writeFileSync(c.path, c.after);
+      }
+      wrote++;
+    } catch {
+      /* fail-open por arquivo */
+    }
+  }
+  return wrote;
+}
+
+async function maybeSelfHeal(api, token, harness, home) {
+  if (!token || !harness) return;
+  try {
+    const state = readHealState(home);
+    if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
+    state.lastHealAt = Date.now();
+    writeHealState(home, state); // throttle mesmo em falha: hook roda a cada prompt
+    const manifest = await fetchManifest(api, harness);
+    const installed = installedContractVersion(manifest, home);
+    const expected = String(manifest?.contract_version || "");
+    if (expected && installed !== expected) {
+      const changes = planFor(manifest, token, home, false).filter(
+        (c) => c.changed && !c.error && c.artifact.kind !== "mcp",
+      );
+      if (changes.length > 0) {
+        const wrote = applyQuiet(changes);
+        if (wrote > 0) {
+          console.error(
+            `[valorbrain] contrato v${installed ?? "?"} -> v${expected} (${wrote} arquivo(s)) — vale no próximo carregamento`,
+          );
+        }
+      }
+    }
+    await declareContract(api, token, harness, home, manifest);
+  } catch {
+    /* fail-open */
+  }
+}
 
 // ─── hook client ─────────────────────────────────────────────────────────────
 //
@@ -479,6 +621,7 @@ async function runHook(argv) {
     const format = argv.find((a) => a.startsWith('--format='))?.slice(9) || 'text';
     const api = argv.find((a) => a.startsWith('--api='))?.slice(6) || DEFAULT_API;
     const token = argv.find((a) => a.startsWith('--token='))?.slice(8) || process.env.VALORBRAIN_TOKEN;
+    const harness = argv.find((a) => a.startsWith('--harness='))?.slice(10) || process.env.VALORBRAIN_HARNESS || '';
 
     const emit = (context) => {
         if (!context) return 0;
@@ -503,16 +646,24 @@ async function runHook(argv) {
     const message = prompt || (name === 'session-bootstrap' ? 'session start' : '');
     if (!message) return emit('');
 
+    // Self-heal + declaração em paralelo com o contexto e com teto de tempo:
+    // throttled a 6h, então quase sempre é um no-op; quando roda, nunca atrasa o
+    // prompt além do orçamento. Nada aqui imprime em stdout (o canal é o contexto).
+    const heal = Promise.race([
+        maybeSelfHeal(api, token, harness, homedir()),
+        new Promise((r) => setTimeout(r, HEAL_HOOK_BUDGET_MS)),
+    ]).catch(() => {});
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HOOK_TIMEOUT_MS);
     try {
-        const result = await callTool(api, token, 'memory_prepare', {
+        const [result] = await Promise.all([callTool(api, token, 'memory_prepare', {
             message,
             // The hook runs on the critical path of every prompt, so it takes the
             // cheap path: recall still covers documents by category, the funnel's
             // embedding + hybrid search is skipped.
             fast_mode: true
-        }, controller.signal);
+        }, controller.signal), heal]);
         const context = (result?.content || []).map((c) => c?.text).filter(Boolean).join('\n').trim();
         return emit(context);
     } catch {
