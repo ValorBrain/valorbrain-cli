@@ -59,6 +59,10 @@ _CONTRACT_VERSION = "5"
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
 _PLUGIN_VERSION = "1.4.0"
+
+# Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
+# 8MB; cortamos antes para não empurrar payload grande por nada).
+_HOOK_TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024
 _HOOK_TIMEOUT = 30  # seconds — fast hooks (bootstrap, lifecycle)
 _CONTEXT_SURFACING_TIMEOUT = 90  # seconds — retrieval hook can take ~60s on bench tenants
 _REST_TIMEOUT = 5.0  # seconds
@@ -593,7 +597,7 @@ class ValorBrainProvider(MemoryProvider):
             "transcript_path": self._transcript_path,
             "hook_event_name": "SessionStart",
         }
-        output = _run_hook(self._bin, "session-bootstrap", hook_input, env_extra=self._env_extra)
+        output = self._invoke_hook("session-bootstrap", hook_input)
         if output:
             ctx = _extract_context(output)
             if ctx:
@@ -629,6 +633,65 @@ class ValorBrainProvider(MemoryProvider):
             logger.debug("valorbrain: foundations fetch failed (non-fatal): %s", e)
 
         self._register_runtime()
+
+    def _remote_engine(self) -> bool:
+        return bool(
+            os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
+        )
+
+    def _has_hooks(self) -> bool:
+        """Hooks rodam local (binário) ou no engine via REST (hospedado)."""
+        return bool(self._bin) or self._remote_engine()
+
+    def _invoke_hook(self, hook_name: str, hook_input: dict,
+                     timeout: int = _HOOK_TIMEOUT) -> Optional[str]:
+        """Roda um hook de ciclo de vida.
+
+        Self-hosted: shell-out para o binário (comportamento original).
+        Hospedado: POST /api/v1/hooks/run — o engine roda o MESMO código com o
+        tenant do token; o cliente só manda o transcript (o engine não lê o
+        disco dele).
+        """
+        if self._bin:
+            return _run_hook(
+                self._bin, hook_name, hook_input,
+                timeout=timeout, env_extra=self._env_extra,
+            )
+        return self._run_hook_remote(hook_name, hook_input, timeout=timeout)
+
+    def _run_hook_remote(self, hook_name: str, hook_input: dict,
+                         timeout: int = _HOOK_TIMEOUT) -> Optional[str]:
+        """Hook hospedado. Devolve stdout no dialeto do binário para o
+        `_extract_context` continuar valendo (JSON com additionalContext)."""
+        try:
+            payload: dict = {"hook": hook_name}
+            inp: dict = {}
+            for src, dst in (
+                ("session_id", "sessionId"),
+                ("prompt", "prompt"),
+                ("hook_event_name", "hookEventName"),
+                ("working_dir", "workingDir"),
+            ):
+                if hook_input.get(src) is not None:
+                    inp[dst] = hook_input[src]
+            if inp:
+                payload["input"] = inp
+            transcript_path = hook_input.get("transcript_path")
+            if transcript_path and os.path.isfile(transcript_path):
+                with open(transcript_path, "r", errors="replace") as fh:
+                    payload["transcript"] = fh.read(_HOOK_TRANSCRIPT_MAX_BYTES)
+            data = _rest_call(
+                self._port, "POST", "/api/v1/hooks/run", payload, timeout=float(timeout)
+            )
+            if not isinstance(data, dict) or not data.get("ok"):
+                return None
+            context = data.get("context") or ""
+            if not context:
+                return None
+            return json.dumps({"hookSpecificOutput": {"additionalContext": context}})
+        except Exception as e:
+            logger.debug("valorbrain: remote hook %s failed: %s", hook_name, e)
+            return None
 
     def _build_runtime_key(self) -> Optional[str]:
         seed = _runtime_seed()
@@ -781,7 +844,7 @@ class ValorBrainProvider(MemoryProvider):
             return ""
 
     def system_prompt_block(self) -> str:
-        if not self._bin:
+        if not self._has_hooks():
             return ""
         agent = _resolve_source_agent()
         # Portable, multi-tenant, multi-language friendly. No company-specific rules.
@@ -861,7 +924,7 @@ class ValorBrainProvider(MemoryProvider):
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Background: run context-surfacing hook for next turn."""
         self._maybe_heartbeat_runtime(session_id)
-        if not self._bin or not query or len(query) < 5:
+        if not query or len(query) < 5:
             return
 
         # Sprint 11.5 — Setup-via-chat detection
@@ -893,12 +956,10 @@ class ValorBrainProvider(MemoryProvider):
                 "prompt": query,
                 "hook_event_name": "UserPromptSubmit",
             }
-            output = _run_hook(
-                self._bin,
+            output = self._invoke_hook(
                 "context-surfacing",
                 hook_input,
                 timeout=_CONTEXT_SURFACING_TIMEOUT,
-                env_extra=self._env_extra,
             )
             if output:
                 ctx = _extract_context(output)
@@ -987,7 +1048,7 @@ class ValorBrainProvider(MemoryProvider):
         """
         if self._agent_context != "primary":
             return
-        if not self._bin or not self._transcript_path:
+        if not self._has_hooks() or not self._transcript_path:
             return
 
         hook_input = {
@@ -999,9 +1060,8 @@ class ValorBrainProvider(MemoryProvider):
         threads = []
         for hook_name in ("decision-extractor", "handoff-generator", "feedback-loop"):
             t = threading.Thread(
-                target=_run_hook,
-                args=(self._bin, hook_name, hook_input),
-                kwargs={"env_extra": self._env_extra},
+                target=self._invoke_hook,
+                args=(hook_name, hook_input),
                 daemon=True,
                 name=f"valorbrain-{hook_name}",
             )
@@ -1032,7 +1092,7 @@ class ValorBrainProvider(MemoryProvider):
         session). Cache coherence, not a vault write, so it runs for all contexts.
         """
         new_id = str(new_session_id or "").strip()
-        if not new_id or not self._bin:
+        if not new_id or not self._has_hooks():
             return
         # Idempotent re-fire (duplicate dispatch) with no reset is a no-op.
         if new_id == self._session_id and not reset:
@@ -1066,7 +1126,7 @@ class ValorBrainProvider(MemoryProvider):
         """
         if self._agent_context != "primary":
             return ""
-        if not self._bin or not self._transcript_path:
+        if not self._has_hooks() or not self._transcript_path:
             return ""
 
         hook_input = {
@@ -1074,7 +1134,7 @@ class ValorBrainProvider(MemoryProvider):
             "transcript_path": self._transcript_path,
             "hook_event_name": "PreCompact",
         }
-        _run_hook(self._bin, "precompact-extract", hook_input, env_extra=self._env_extra)
+        self._invoke_hook("precompact-extract", hook_input)
         return ""
 
     # -- Tools (REST API) ------------------------------------------------------

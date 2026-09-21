@@ -32,8 +32,10 @@ O Hermes recebe três coisas:
    `~/.hermes/config.yaml` (merge por chave — o resto do arquivo, incluindo
    comentários, é preservado);
 2. `env.VALORBRAIN_ENGINE_URL` + `env.VALORBRAIN_API_TOKEN` no mesmo arquivo,
-   para o MemoryProvider funcionar sem binário local (tools e registro/declaração;
-   os hooks de ciclo de vida degradam sem o binário);
+   para o MemoryProvider funcionar sem binário local: tools, registro/declaração
+   **e os hooks de ciclo de vida** (bootstrap, contexto por turno e extração de
+   Stop/PreCompact rodam no engine via `POST /api/v1/hooks/run`; só injeção
+   local — postcompact/pretool/curator — não tem equivalente hospedado);
 3. o plugin MemoryProvider em `~/.hermes/plugins/valorbrain/__init__.py`.
 
 Depois, ative o provider:

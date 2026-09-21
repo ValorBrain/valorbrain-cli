@@ -20,7 +20,7 @@
  * republishing when the rules text changes.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
@@ -486,7 +486,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.4.0";
+const CLIENT_VERSION = "0.4.1";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -752,6 +752,48 @@ async function callTool(api, token, name, args, signal) {
 /** Hooks that produce context, and the tool that produces it for each. */
 const CONTEXT_HOOKS = new Set(['context-surfacing', 'session-bootstrap', 'memory-prepare']);
 
+/**
+ * Hooks de EXTRAÇÃO (Stop/PreCompact). O cliente não tem o binário, então o
+ * engine roda o hook com o tenant do token — o cliente só manda o transcript.
+ * Não injetam contexto: o contrato é silêncio.
+ */
+const EXTRACTION_HOOKS = new Set([
+    'decision-extractor', 'episode-extractor', 'handoff-generator',
+    'feedback-loop', 'precompact-extract', 'staleness-check',
+]);
+const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+/** Teto abaixo do budget do harness (Stop=30s): se estourar, o engine segue. */
+const EXTRACTION_TIMEOUT_MS = 20_000;
+
+async function runExtractionHook(api, token, name, payload) {
+    const input = {
+        sessionId: payload?.session_id || payload?.sessionId,
+        prompt: payload?.prompt,
+        hookEventName: payload?.hook_event_name || payload?.hookEventName,
+        workingDir: payload?.working_dir || payload?.workingDir,
+        lastAssistantMessage: payload?.last_assistant_message || payload?.lastAssistantMessage,
+    };
+    let transcript = '';
+    const tp = payload?.transcript_path || payload?.transcriptPath;
+    if (tp && existsSync(tp)) {
+        try {
+            const size = statSync(tp).size;
+            transcript = size > MAX_TRANSCRIPT_BYTES
+                ? readFileSync(tp, 'utf-8').slice(0, MAX_TRANSCRIPT_BYTES)
+                : readFileSync(tp, 'utf-8');
+        } catch {
+            transcript = '';
+        }
+    }
+    const res = await fetch(`${api.replace(/\/$/, '')}/api/v1/hooks/run`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ hook: name, input, transcript }),
+        signal: AbortSignal.timeout(EXTRACTION_TIMEOUT_MS),
+    });
+    return res.ok;
+}
+
 async function runHook(argv) {
     const name = argv.find((a) => !a.startsWith('-')) || 'context-surfacing';
     const format = argv.find((a) => a.startsWith('--format='))?.slice(9) || 'text';
@@ -773,10 +815,21 @@ async function runHook(argv) {
         return 0;
     };
 
-    // No token, unknown hook, or a hook with no context to produce: stay silent.
-    if (!token || !CONTEXT_HOOKS.has(name)) return emit('');
+    // No token: stay silent.
+    if (!token) return emit('');
 
     const payload = await readStdin();
+
+    // Extração (Stop/PreCompact): roda no engine com o tenant do token; não
+    // injeta contexto — o contrato é silêncio. Fail-open sempre.
+    if (EXTRACTION_HOOKS.has(name)) {
+        await runExtractionHook(api, token, name, payload).catch(() => {});
+        return 0;
+    }
+
+    // Hook sem contexto a produzir: stay silent.
+    if (!CONTEXT_HOOKS.has(name)) return emit('');
+
     const prompt = readPromptFrom(payload);
     // Session start carries no prompt; ask for the stable context instead.
     const message = prompt || (name === 'session-bootstrap' ? 'session start' : '');
