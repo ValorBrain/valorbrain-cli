@@ -29,7 +29,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/valor-digital/valorbrain.git",
+    "url": "git+https://github.com/ValorBrain/valorbrain-cli.git",
     "directory": "packages/connect"
-  }
+  },
+  "homepage": "https://github.com/ValorBrain/valorbrain-cli/tree/main/packages/connect#readme"
 }
