@@ -2,8 +2,15 @@ name: publish
 
 # Trusted publishing (OIDC): no npm token, no OTP. The identity IS this
 # workflow — registered on npmjs.com as the trusted publisher of
-# @valorbrain/cli and @valorbrain/connect (pending trusted publisher).
-# npm >= 11.5.1 and node >= 22.14 required by the registry for OIDC.
+# @valorbrain/cli and @valorbrain/connect. npm >= 11.5.1 and node >= 22.14
+# required by the registry for OIDC.
+#
+# Roda no runner self-hosted do repo (o runner hospedado do GitHub estava
+# parado por billing). OIDC é emitido por job, independente do runner.
+#
+# IDEMPOTENTE: se a versão do package.json já existe no registry, pula o
+# publish. É o que permite taguear um release sem falhar quando o pacote já foi
+# publicado localmente (workaround do trusted publisher pendente).
 
 on:
   workflow_dispatch:
@@ -16,7 +23,8 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, valorbrain-cli]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +37,13 @@ jobs:
         run: npm install -g npm@12 && npm --version
 
       - name: Publish @valorbrain/cli
-        run: npm publish --access public
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "@valorbrain/cli@$V" version >/dev/null 2>&1; then
+            echo "@valorbrain/cli@$V já está no registry — pulando publish"
+          else
+            npm publish --access public
+          fi
 
       - name: Wait for @valorbrain/cli to resolve on the registry
         run: |
@@ -43,5 +57,11 @@ jobs:
           exit 1
 
       - name: Publish @valorbrain/connect
-        run: npm publish --access public
         working-directory: packages/connect
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "@valorbrain/connect@$V" version >/dev/null 2>&1; then
+            echo "@valorbrain/connect@$V já está no registry — pulando publish"
+          else
+            npm publish --access public
+          fi
