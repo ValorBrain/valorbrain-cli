@@ -1,16 +1,17 @@
 name: publish
 
 # Trusted publishing (OIDC): no npm token, no OTP. The identity IS this
-# workflow — registered on npmjs.com as the trusted publisher of
-# @valorbrain/cli and @valorbrain/connect. npm >= 11.5.1 and node >= 22.14
-# required by the registry for OIDC.
+# workflow — precisa estar registrado no npmjs.com como trusted publisher de
+# @valorbrain/cli e @valorbrain/connect (repo ValorBrain/valorbrain-cli,
+# workflow publish.yml). Enquanto não estiver, um publish por aqui falha com
+# E404 "Not found or you do not have permission" — e o caminho é publicar
+# localmente com token (`npm publish --access public`), como em 21/09.
 #
-# Roda no runner self-hosted do repo (o runner hospedado do GitHub estava
-# parado por billing). OIDC é emitido por job, independente do runner.
+# Roda no runner self-hosted do repo (o hospedado do GitHub estava parado por
+# billing). OIDC é emitido por job, independente do runner.
 #
 # IDEMPOTENTE: se a versão do package.json já existe no registry, pula o
-# publish. É o que permite taguear um release sem falhar quando o pacote já foi
-# publicado localmente (workaround do trusted publisher pendente).
+# publish — taguear um release não falha quando o pacote já foi publicado.
 
 on:
   workflow_dispatch:
@@ -38,11 +39,22 @@ jobs:
 
       - name: Publish @valorbrain/cli
         run: |
+          PKG=@valorbrain/cli
           V=$(node -p "require('./package.json').version")
-          if npm view "@valorbrain/cli@$V" version >/dev/null 2>&1; then
-            echo "@valorbrain/cli@$V já está no registry — pulando publish"
-          else
-            npm publish --access public
+          for i in $(seq 1 6); do
+            if npm view "$PKG@$V" version >/dev/null 2>&1; then
+              echo "$PKG@$V já está no registry — pulando publish"; exit 0
+            fi
+            sleep 10
+          done
+          if ! npm publish --access public; then
+            code=$?
+            sleep 15
+            if npm view "$PKG@$V" version >/dev/null 2>&1; then
+              echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
+            fi
+            echo "FALHA: $PKG@$V não está no registry. Se o erro foi E404, registre o trusted publisher (OIDC) no npmjs para $GITHUB_REPOSITORY/$GITHUB_WORKFLOW." >&2
+            exit $code
           fi
 
       - name: Wait for @valorbrain/cli to resolve on the registry
@@ -59,9 +71,20 @@ jobs:
       - name: Publish @valorbrain/connect
         working-directory: packages/connect
         run: |
+          PKG=@valorbrain/connect
           V=$(node -p "require('./package.json').version")
-          if npm view "@valorbrain/connect@$V" version >/dev/null 2>&1; then
-            echo "@valorbrain/connect@$V já está no registry — pulando publish"
-          else
-            npm publish --access public
+          for i in $(seq 1 6); do
+            if npm view "$PKG@$V" version >/dev/null 2>&1; then
+              echo "$PKG@$V já está no registry — pulando publish"; exit 0
+            fi
+            sleep 10
+          done
+          if ! npm publish --access public; then
+            code=$?
+            sleep 15
+            if npm view "$PKG@$V" version >/dev/null 2>&1; then
+              echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
+            fi
+            echo "FALHA: $PKG@$V não está no registry. Se o erro foi E404, registre o trusted publisher (OIDC) no npmjs para $GITHUB_REPOSITORY/$GITHUB_WORKFLOW." >&2
+            exit $code
           fi
