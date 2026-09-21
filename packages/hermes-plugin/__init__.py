@@ -58,7 +58,7 @@ _CONTRACT_VERSION = "5"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.5.0"
+_PLUGIN_VERSION = "1.6.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -402,6 +402,29 @@ WORKING_CONTEXT_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {},
+    },
+}
+
+# FB-0003: o canal de feedback existia só no MCP; o namespace tipado do Hermes
+# (que fala REST) não o expunha. submit abre um FB-XXXX; check acompanha.
+FEEDBACK_SCHEMA = {
+    "name": "valorbrain_feedback",
+    "description": (
+        "Report a ValorBrain product defect (empty/wrong memory_retrieve, ranking noise, "
+        "missing capability, verified fix as praise) or track a submitted one. "
+        "Not for bugs in your own harness/CLI/editor — those belong to their projects."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["submit", "check"], "description": "submit a new FB or check status."},
+            "title": {"type": "string", "description": "submit: short title (5-200 chars)."},
+            "description": {"type": "string", "description": "submit: what happened / expected / steps."},
+            "category": {"type": "string", "description": "submit: bug|feature|question|improvement|praise|feedback."},
+            "priority": {"type": "string", "description": "submit: low|normal|high|critical."},
+            "feedback_id": {"type": "string", "description": "check: FB-XXXX or 'all'."},
+        },
+        "required": ["action"],
     },
 }
 
@@ -1173,6 +1196,7 @@ class ValorBrainProvider(MemoryProvider):
             RETRIEVE_SCHEMA, GET_SCHEMA, SESSION_LOG_SCHEMA,
             TIMELINE_SCHEMA, SIMILAR_SCHEMA,
             STORE_SCHEMA, HEALTH_SCHEMA, WORKING_CONTEXT_SCHEMA,
+            FEEDBACK_SCHEMA,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -1193,6 +1217,8 @@ class ValorBrainProvider(MemoryProvider):
                 return self._tool_health(args)
             elif tool_name == "valorbrain_working_context":
                 return self._tool_working_context(args)
+            elif tool_name == "valorbrain_feedback":
+                return self._tool_feedback(args)
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -1277,6 +1303,28 @@ class ValorBrainProvider(MemoryProvider):
     def _tool_working_context(self, args: dict) -> str:
         """Get working context via GET /api/v1/memory/working-context."""
         data = _rest_call(self._port, "GET", "/api/v1/memory/working-context")
+        if data is None:
+            return json.dumps({"error": "ValorBrain REST API unreachable"})
+        return json.dumps(data, ensure_ascii=False)
+
+    def _tool_feedback(self, args: dict) -> str:
+        """Submit or track agent feedback (FB-0003)."""
+        action = (args.get("action") or "check").lower()
+        if action == "submit":
+            title = (args.get("title") or "").strip()
+            description = (args.get("description") or "").strip()
+            if len(title) < 5 or len(description) < 10:
+                return json.dumps({"error": "submit requires title (>=5) and description (>=10)"})
+            body = {"title": title, "description": description}
+            for key in ("category", "priority"):
+                if args.get(key):
+                    body[key] = args[key]
+            data = _rest_call(self._port, "POST", "/api/v1/feedback", body=body)
+            if data is None:
+                return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return json.dumps(data, ensure_ascii=False)
+        feedback_id = args.get("feedback_id") or "all"
+        data = _rest_call(self._port, "GET", f"/api/v1/feedback/{feedback_id}")
         if data is None:
             return json.dumps({"error": "ValorBrain REST API unreachable"})
         return json.dumps(data, ensure_ascii=False)
