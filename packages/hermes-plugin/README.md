@@ -45,8 +45,7 @@ hermes` writes the same artifacts from the engine — including this plugin.
 
 - **Tools** (REST): `valorbrain_retrieve`, `valorbrain_get`,
   `valorbrain_session_log`, `valorbrain_timeline`, `valorbrain_similar`,
-  `valorbrain_collections` (read) · `valorbrain_ingest`, `valorbrain_forget`,
-  `valorbrain_feedback`, `valorbrain_pin` (write).
+  `valorbrain_store`, `valorbrain_health`, `valorbrain_working_context`.
 - **Hooks**: `on_session_end` (decision extraction, handoff, feedback loop) and
   `on_pre_compress` (state preservation) — shell-outs to the local binary.
 - **Contract declaration**: the plugin reports the contract version it ships
