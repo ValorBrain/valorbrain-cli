@@ -54,7 +54,7 @@ _DEFAULT_PORT = 7438
 # CONTRACT_VERSION em src/harness/contract.ts — tests/unit/hermes-plugin.test.ts
 # falha se divergir. Vai no capabilities do register/heartbeat: é o que permite
 # medir a adoção do contrato por harness (agent_runtimes.contract_declared_at).
-_CONTRACT_VERSION = "5"
+_CONTRACT_VERSION = "6"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
@@ -910,16 +910,16 @@ class ValorBrainProvider(MemoryProvider):
             "declaration the quality signal stays blind. When the user CONFIRMS what a "
             "memory said, pass verdict=\"confirmed\"; when the user CORRECTS or "
             "contradicts it, pass verdict=\"corrected\" — that feeds the trust loop.\n"
-            "Product feedback: `feedback_submit` / `feedback_check` — report ValorBrain product "
+            "Product feedback: `feedback` (action=\"submit\" / action=\"check\") — report ValorBrain product "
             "bugs, bad retrieval, missing capabilities, or verified fixes to the VB team "
             "(returns FB-XXXX). Use when the *product* fails you — not for normal domain work.\n"
             "Lifecycle (automatic): session bootstrap, context surfacing, session-end extraction.\n"
             "\n"
             "## Feedback hygiene (required)\n"
-            "Call `feedback_submit` once per distinct product issue when: tool/MCP errors, empty "
+            "Call `feedback` action=\"submit\" once per distinct product issue when: tool/MCP errors, empty "
             "or wrong recall when knowledge should exist, ranking noise, or a fix you verified "
             "(category=praise). Title = one actionable line; description = repro + expected vs "
-            "actual. Never put secrets in feedback. Track with `feedback_check`.\n"
+            "actual. Never put secrets in feedback. Track with `feedback` action=\"check\".\n"
         )
 
     # -- Prefetch / recall -----------------------------------------------------
