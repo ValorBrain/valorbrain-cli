@@ -85,6 +85,13 @@ function readJson(path) {
 }
 
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
+
+/** Engine adapter aliases (src/harness/adapters.ts) → canonical id. Credentials are keyed by the canonical id. */
+const HARNESS_ALIASES = { claude: 'claude-code', 'kiro-cli': 'kiro', gemini: 'gemini-cli', 'oh-my-pi': 'omp', ohmypi: 'omp', 'hermes-agent': 'hermes' };
+export function canonicalHarness(name) {
+    const n = str(name).toLowerCase();
+    return HARNESS_ALIASES[n] ?? n;
+}
 const normalizeApi = (url) => str(url).replace(/\/+$/, '').replace(/\/mcp$/, '');
 
 function readCredsFile(home) {
@@ -95,7 +102,7 @@ function readCredsFile(home) {
 /** This harness's credential, or null. Never another harness's. */
 export function readCreds(home, harness) {
     if (!harness) return null;
-    const e = readCredsFile(home).harnesses[harness];
+    const e = readCredsFile(home).harnesses[canonicalHarness(harness)];
     const token = str(e?.token);
     return token ? { token, api: normalizeApi(e?.api_url) || null } : null;
 }
@@ -122,6 +129,32 @@ export function listCreds(home) {
     return out;
 }
 
+/**
+ * Serialize read-modify-write of connect.json across processes (two harnesses
+ * migrating at the same moment must not drop each other's entry). Sync, short,
+ * with a stale-lock breaker — a crashed writer never wedges the file.
+ */
+function withCredsLock(home, fn) {
+    const lock = `${credsPath(home)}.lock`;
+    mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
+    const nap = new Int32Array(new SharedArrayBuffer(4));
+    let held = false;
+    for (let i = 0; i < 40 && !held; i++) {
+        try {
+            closeSync(openSync(lock, 'wx'));
+            held = true;
+        } catch {
+            try { if (Date.now() - statSync(lock).mtimeMs > 5_000) unlinkSync(lock); } catch { /* gone */ }
+            Atomics.wait(nap, 0, 0, 25);
+        }
+    }
+    try {
+        return fn();
+    } finally {
+        if (held) { try { unlinkSync(lock); } catch { /* already gone */ } }
+    }
+}
+
 function writeCredsFile(home, data) {
     const path = credsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -135,9 +168,12 @@ function writeCredsFile(home, data) {
 /** Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir. */
 export function writeCreds(home, { api, token, harness }) {
     if (!harness) throw new Error('writeCreds needs the harness id');
-    const data = readCredsFile(home);
-    data.harnesses[harness] = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
-    return writeCredsFile(home, data);
+    const id = canonicalHarness(harness);
+    return withCredsLock(home, () => {
+        const data = readCredsFile(home); // re-read under the lock
+        data.harnesses[id] = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
+        return writeCredsFile(home, data);
+    });
 }
 
 /** Drop one harness's entry (or all); the file goes when nothing is left. */
@@ -147,12 +183,15 @@ export function removeCreds(home, harness) {
             unlinkSync(credsPath(home));
             return true;
         }
-        const data = readCredsFile(home);
-        if (!data.harnesses[harness]) return false;
-        delete data.harnesses[harness];
-        if (Object.keys(data.harnesses).length === 0) unlinkSync(credsPath(home));
-        else writeCredsFile(home, data);
-        return true;
+        const id = canonicalHarness(harness);
+        return withCredsLock(home, () => {
+            const data = readCredsFile(home);
+            if (!data.harnesses[id]) return false;
+            delete data.harnesses[id];
+            if (Object.keys(data.harnesses).length === 0) unlinkSync(credsPath(home));
+            else writeCredsFile(home, data);
+            return true;
+        });
     } catch {
         return false;
     }
@@ -538,7 +577,7 @@ export async function runHook(argv, deps = {}) {
 
     const name = argv.find((a) => !a.startsWith('-')) || 'context-surfacing';
     const format = argv.find((a) => a.startsWith('--format='))?.slice(9) || '';
-    const harness = argv.find((a) => a.startsWith('--harness='))?.slice(10) || str(env.VALORBRAIN_HARNESS);
+    const harness = canonicalHarness(argv.find((a) => a.startsWith('--harness='))?.slice(10) || str(env.VALORBRAIN_HARNESS));
     const dialect = detectDialect(payload, env, harness, format);
     const emit = (s) => { if (s) out(s); return 0; };
 
@@ -604,7 +643,9 @@ export async function runHook(argv, deps = {}) {
             if (!cueKnownMissing) {
                 const r = await postCue(creds.api, creds.token, {
                     ...base, event,
-                    ...(event === 'prompt' ? { prompt } : {}),
+                    // The engine keeps 8k chars and caps the body at 64 KB: a
+                    // pasted log must not become a 413 and lose recall.
+                    ...(event === 'prompt' ? { prompt: prompt.slice(0, 8_000) } : {}),
                     ...(typeof payload.source === 'string' ? { source: payload.source } : {}),
                 }, timeoutMs, fetchImpl);
                 if (r.status === 404 || r.status === 405) writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
@@ -623,7 +664,7 @@ export async function runHook(argv, deps = {}) {
                 }
             }
             if (!served) {
-                context = await legacyContext(creds.api, creds.token, prompt || 'session start', timeoutMs, fetchImpl, clientVersion);
+                context = await legacyContext(creds.api, creds.token, (prompt || 'session start').slice(0, 8_000), timeoutMs, fetchImpl, clientVersion);
             }
         } catch (e) {
             failure = `${event}: ${e?.name === 'TimeoutError' ? 'timed out' : e?.message || 'request failed'}`;
@@ -646,6 +687,13 @@ export async function runHook(argv, deps = {}) {
     // headless runs: an SDK-driven Claude Code session's final message is
     // somebody's program output, never a place for a checkpoint.
     if (/^(off|0|false)$/i.test(str(env.VALORBRAIN_CHECKPOINT)) || /^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) {
+        await heal;
+        return emit(silent);
+    }
+    // Without a session id the state is keyed by directory, and a directory
+    // cannot tell one-shot runs (CI, agent daemons reusing a workdir) from a
+    // session — so no checkpoint. Every documented dialect sends an id.
+    if (!sessionId) {
         await heal;
         return emit(silent);
     }
@@ -706,7 +754,10 @@ export async function runHook(argv, deps = {}) {
                     writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
                     cue = fallbackCue(toolPrefixFor(dialect));
                 } else if (r.status === 403) {
-                    cue = fallbackCue(toolPrefixFor(dialect)); // older engine refusing a read-scoped token
+                    // Refused: on a current engine that is a real "no" (scope,
+                    // VALORBRAIN_CHECKPOINT=off stays server-side) — never
+                    // override it with the built-in cue.
+                    err('stop: HTTP 403');
                 } else if (r.status >= 200 && r.status < 300) {
                     if (r.json?.policy) writeCaps(home, creds.api, { cue: true, policy: r.json.policy, cueCheckedAt: now });
                     cue = typeof r.json?.checkpoint?.text === 'string' ? r.json.checkpoint.text : null;

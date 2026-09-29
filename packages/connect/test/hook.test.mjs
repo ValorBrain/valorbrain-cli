@@ -420,3 +420,38 @@ test('prompt persists turn bookkeeping before the network call (a killed hook mu
     killFetch();
     await settled;
 });
+
+test('credentials are keyed by the canonical harness id (aliases resolve)', () => {
+    const h = home();
+    writeCreds(h, { api: 'https://api.example', token: 'vbm_gem', harness: 'gemini' });
+    assert.equal(readCreds(h, 'gemini-cli').token, 'vbm_gem');
+    assert.equal(resolveCredentials({ argv: [], env: {}, home: h, harness: 'gemini-cli' }).token, 'vbm_gem');
+    assert.equal(JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8')).harnesses['gemini-cli'].token, 'vbm_gem');
+});
+
+test('no session id: stop never checkpoints (a directory cannot tell runs from sessions)', async () => {
+    const h = withCreds(home());
+    const fake = stopApi();
+    const p = { hook_event_name: 'stop', assistant_response: 'done', cwd: '/srv/ci-workdir' };
+    for (const t of [1, 2, 3, 11, 25]) {
+        const r = await run(['stop', '--harness=kiro'], { h, fake, payload: p, now: T0 + t * MIN });
+        assert.equal(r.out, '');
+    }
+    assert.equal(fake.calls.length, 0);
+});
+
+test('403 at stop on a current engine is a real "no": no built-in cue', async () => {
+    const h = withCreds(home());
+    const fake = api({ '/api/v1/hooks/cue': () => new Response('{}', { status: 403 }) });
+    const p = { hook_event_name: 'Stop', session_id: 's403' };
+    for (const t of [1, 2]) await run(['stop', '--harness=claude-code'], { h, fake, payload: p, now: T0 + t * MIN });
+    const r = await run(['stop', '--harness=claude-code'], { h, fake, payload: p, now: T0 + 11 * MIN });
+    assert.equal(r.out, '');
+});
+
+test('long prompts are truncated to the engine limit before sending', async () => {
+    const h = withCreds(home());
+    const fake = api({ '/api/v1/hooks/cue': () => ({ context: 'ok', policy: DEFAULT_POLICY }) });
+    await run(['prompt', '--harness=claude-code'], { h, fake, payload: { hook_event_name: 'UserPromptSubmit', session_id: 'big', prompt: 'x'.repeat(100_000) } });
+    assert.equal(fake.calls[0].body.prompt.length, 8_000);
+});

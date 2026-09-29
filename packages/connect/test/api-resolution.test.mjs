@@ -83,3 +83,20 @@ test('remove: --api omitted → the removal is planned against connect.json api_
     const saved = JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8'));
     assert.deepEqual(Object.keys(saved.harnesses), ['codex']);
 });
+
+test('self-heal never guesses a harness for a legacy hook without --harness (no cross-wiring)', async () => {
+    const { server, url } = await stubApi();
+    const h = home();
+    mkdirSync(join(h, '.kiro', 'hooks'), { recursive: true });
+    mkdirSync(join(h, '.claude'), { recursive: true });
+    const legacy = JSON.stringify({ hooks: { UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: 'npx -y @valorbrain/connect hook context-surfacing --token=vbm_C' }] }] } });
+    writeFileSync(join(h, '.claude', 'settings.json'), legacy);
+    const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', VALORBRAIN_API_URL: url };
+    await new Promise((resolve) => {
+        const child = execFile(process.execPath, [CLI, 'hook', 'context-surfacing', '--token=vbm_C'], { env, timeout: 20_000 }, () => resolve());
+        child.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'status?' }));
+    });
+    server.close();
+    assert.equal(existsSync(join(h, '.valorbrain', 'connect.json')), false);
+    assert.equal(readFileSync(join(h, '.claude', 'settings.json'), 'utf-8'), legacy);
+});

@@ -24,7 +24,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, w
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
-import { HOOK_PROTOCOL, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
+import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -491,7 +491,10 @@ async function main() {
   // CLI config.json engine_url > public default.
   const apiFor = (harness) => resolveInstallApi({ flag: args.api, env: process.env, home, harness, token }).api;
 
-  let targets = args.harnesses;
+  // Canonical ids everywhere (the engine renders hook commands with them, and
+  // credentials are keyed by them): `--harness gemini` must store the entry
+  // the `--harness=gemini-cli` hook will read.
+  let targets = args.harnesses.map(canonicalHarness);
   if (targets.length === 0) {
     targets = detectInstalled(home);
     if (targets.length === 0) {
@@ -579,6 +582,11 @@ async function main() {
     console.log();
   }
 
+  // Full uninstall (targets were detected, not named): the credential file goes
+  // too, including entries of harnesses no longer on this machine.
+  if (args.remove && !args.dryRun && args.harnesses.length === 0 && removeCreds(home)) {
+    console.log(`${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel}${C.off}`);
+  }
   if (args.dryRun) console.log(`${C.yellow}Dry run — nothing was written.${C.off}`);
   else if (!args.status && !args.remove) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
 
@@ -757,7 +765,12 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
     // Token vindo de env não é persistido (quem usa env escolheu env), e uma
     // entrada existente com OUTRO token nunca é sobrescrita: aí não se migra.
     let canMigrateHooks = true;
-    if (credsSource === "argv") {
+    if (credsSource === "argv" && !harness) {
+      // Hook commands from before `--harness` existed: the harness would be a
+      // guess (detectHarness), and writing this token under a guessed id
+      // cross-wires tenants. No credential write, no hook migration.
+      canMigrateHooks = false;
+    } else if (credsSource === "argv") {
       const saved = readCreds(home, id);
       if (!saved) {
         try {
