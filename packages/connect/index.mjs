@@ -38,13 +38,15 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false, scope: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
     else if (a === "--remove") out.remove = true;
     else if (a === "--status") out.status = true;
     else if (a === "--no-backup") out.noBackup = true;
+    else if (a === "--scope") out.scope = argv[++i];
+    else if (a.startsWith("--scope=")) out.scope = a.slice(8);
     else if (a === "--token") out.token = argv[++i];
     else if (a.startsWith("--token=")) out.token = a.slice(8);
     else if (a === "--harness") out.harnesses.push(argv[++i]);
@@ -69,6 +71,10 @@ ${C.bold}@valorbrain/connect${C.off} — wire a CLI agent harness to hosted Valo
 Options
   --token vbm_…     MCP token (Settings → MCP Tokens in the app). Or set VALORBRAIN_TOKEN.
   --api URL         engine base URL (default ${DEFAULT_API})
+  --scope what      where harness-local files go: "workspace" (this project) or
+                    "user" ($HOME). kiro defaults to workspace — kiro-cli only
+                    fires hooks from an agent config in .kiro/agents/, which is
+                    per project; every other harness defaults to user.
   --no-backup       skip .valorbrain-bak copies
 
 Writes, per harness: the MCP server entry (so the tools exist), an instructions
@@ -216,6 +222,69 @@ async function fetchManifest(api, harness) {
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json();
 }
+
+// ── scope: where harness-local files land ───────────────────────────────────
+
+/** Scope names accepted by --scope ("global" is an alias of "user"). */
+const SCOPES = new Set(["workspace", "user", "global"]);
+
+/** kiro defaults to workspace; only an explicit user/global keeps it in $HOME. */
+function kiroWantsWorkspace(scope) {
+  return scope === "workspace" || scope == null;
+}
+
+/**
+ * kiro-cli discovers hooks in exactly one place: the `hooks` key of an AGENT
+ * config (`.kiro/agents/*.json` in the workspace, or `~/.kiro/agents/*.json`).
+ * A `hooks/valorbrain.json` file — at user scope or in the workspace — is
+ * never loaded (verified live against kiro-cli 2.20.1: agentSpawn and
+ * userPromptSubmit fire only from the agent config, and only when the session
+ * runs that agent: `--agent valorbrain` or `kiro-cli agent set-default`).
+ *
+ * The engine renders a v1 hooks FILE (`~/.kiro/hooks/valorbrain.json` —
+ * hosted manifests are rendered with home "~"); this map re-targets that
+ * artifact to where kiro actually loads it and re-shapes the contents into an
+ * agent config. Contents that don't parse throw: planFor reports the artifact
+ * as failed, never a silently dead file. Unknown v1 triggers are dropped.
+ */
+export function scopedManifest(manifest, { harness, scope, home, cwd = process.cwd() }) {
+  if (harness !== "kiro") return manifest;
+  const dir = kiroWantsWorkspace(scope) ? join(cwd, ".kiro", "agents") : join(home, ".kiro", "agents");
+  const artifacts = (manifest.artifacts || []).flatMap((a) => {
+    if (a.kind !== "hooks" || !String(a.path).startsWith("~/.kiro/")) return [a];
+    const v1 = JSON.parse(a.contents);
+    const hooks = {};
+    for (const h of v1?.hooks ?? []) {
+      const event = KIRO_HOOK_EVENTS[h?.trigger];
+      const command = h?.action?.command;
+      if (!event || !command) continue;
+      (hooks[event] ??= []).push({ command, timeout: 10_000 });
+    }
+    if (Object.keys(hooks).length === 0) return []; // nothing kiro would fire — wire nothing
+    return [{
+      ...a,
+      path: join(dir, "valorbrain.json"),
+      label: "lifecycle hooks (kiro agent config)",
+      contents: JSON.stringify({
+        name: "valorbrain",
+        description: "ValorBrain memory — context at session start and on each prompt; a short checkpoint every few turns.",
+        mcpServers: {},
+        tools: KIRO_AGENT_TOOLS,
+        allowedTools: [],
+        resources: [],
+        hooks,
+        includeMcpJson: true,
+      }, null, 2) + "\n",
+    }];
+  });
+  return { ...manifest, artifacts };
+}
+
+/** v1 hook trigger → kiro agent-config hook event (verified on kiro-cli 2.20.1). */
+const KIRO_HOOK_EVENTS = { SessionStart: "agentSpawn", UserPromptSubmit: "userPromptSubmit", Stop: "stop" };
+
+/** Full built-in toolset (agent_config.json.example) — our agent must not shrink the user's session. */
+const KIRO_AGENT_TOOLS = ["read", "write", "shell", "aws", "report", "introspect", "knowledge", "thinking", "todo", "delegate", "grep", "glob"];
 
 /**
  * Merge do config YAML do Hermes (`~/.hermes/config.yaml`). O arquivo é do
@@ -480,6 +549,11 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { console.log(HELP); return 0; }
 
+  if (args.scope != null && !SCOPES.has(args.scope)) {
+    console.error(`--scope must be one of: ${[...SCOPES].join(", ")}`);
+    return 2;
+  }
+
   const home = homedir();
   const token = args.token || process.env.VALORBRAIN_TOKEN || null;
 
@@ -516,7 +590,7 @@ async function main() {
   for (const harness of targets) {
     let manifest;
     try {
-      manifest = await fetchManifest(apiFor(harness), harness);
+      manifest = scopedManifest(await fetchManifest(apiFor(harness), harness), { harness, scope: args.scope, home });
     } catch (err) {
       console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
       failed++;
@@ -578,6 +652,12 @@ async function main() {
         console.log(`  ${C.dim}note: automatic context injection (hooks) needs a self-hosted engine; this install covers tools + instructions${C.off}`);
       }
       for (const n of manifest.notes ?? []) console.log(`  ${C.dim}note: ${n}${C.off}`);
+      if (manifest.hooks_available && harness === "kiro") {
+        const where = kiroWantsWorkspace(args.scope)
+          ? join(process.cwd(), ".kiro", "agents", "valorbrain.json")
+          : join(home, ".kiro", "agents", "valorbrain.json");
+        console.log(`  ${C.dim}note: kiro only fires hooks from an agent config (${where}) — run "kiro-cli agent set-default valorbrain" (or chat with --agent valorbrain) in this project so they fire${C.off}`);
+      }
     }
     console.log();
   }
@@ -606,7 +686,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.5.0";
+const CLIENT_VERSION = "0.5.1";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -788,7 +868,9 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
     if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
     state.lastHealAt = Date.now();
     writeHealState(home, state); // throttle mesmo em falha: hook roda a cada prompt
-    const manifest = await fetchManifest(api, id);
+    // Scope igual ao install: kiro é workspace por default, e o cwd do hook é
+    // o projeto do agente — o self-heal reescreve o agent config no projeto.
+    const manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home });
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
     const contractDrift = Boolean(expected && installed !== expected);
