@@ -46,20 +46,28 @@ O checkpoint chega pelo mecanismo de continuação do próprio harness:
 O modelo do harness revisa o trabalho e grava via MCP o que for durável, ou
 não grava nada.
 
-- **Credencial fora da linha de comando.** O instalador grava
-  `~/.valorbrain/connect.json` (0600), e o hook lê de lá. O token não aparece
-  em `ps`, em `/hooks` nem nos logs do harness.
+- **Credencial fora da linha de comando, uma por harness.** O instalador grava
+  `~/.valorbrain/connect.json` (0600) com uma entrada por harness, e cada hook
+  lê só a sua. Dois harnesses podem ser de tenants diferentes. O token não
+  aparece em `ps`, em `/hooks` nem nos logs do harness, e os backups saem em
+  0600.
 - **Dialeto pelo payload.** O Grok carrega `~/.cursor/hooks.json` e o Cursor
   carrega o `~/.claude/settings.json`. Por isso o cliente identifica quem
   chamou pelos campos do evento, não pelo arquivo.
-- **Sem loop.** O cliente respeita `stop_hook_active` / `stopHookActive`. Onde
-  não existe flag (Kiro, Cursor), uma marca `awaiting` própria cobre o caso.
-  Os limites padrão são intervalo mínimo de 10 min, 3 turnos (ou 8 min de
-  trabalho) e no máximo 6 checkpoints por sessão, e a política vem do servidor.
+- **Sem loop e sem invadir automação.** O cliente respeita `stop_hook_active` /
+  `stopHookActive`. Onde não existe flag (Kiro, Cursor), uma marca `awaiting`
+  própria cobre o caso. Os limites padrão são intervalo mínimo de 10 min, 3
+  turnos (ou 8 min de trabalho em pelo menos 2 turnos) e no máximo 6
+  checkpoints por sessão, e a política vem do servidor. **Nunca há checkpoint
+  no primeiro turno**, então `claude -p`, SDK e `codex exec` terminam com a
+  saída deles. Claude Code via SDK nunca recebe checkpoint.
 - **Engine antigo.** Se o engine não tem `/api/v1/hooks/cue`, o contexto vem
   de `memory_prepare` e o checkpoint usa o texto embutido.
-- **Migração automática.** Um hook v1 (com `--token=`) rodando a 0.5 grava o
-  `connect.json` e reescreve os hooks para v2 no próximo self-heal.
+- **Migração automática.** Um hook v1 (com `--token=`) rodando a 0.5 grava a
+  entrada daquele harness e reescreve os hooks para v2 no próximo self-heal.
+  Entrada existente com outro token não é sobrescrita, e token vindo de env não
+  é persistido. O Codex não migra sozinho, porque comando novo exige re-trust
+  em `/hooks`; basta reinstalar.
 
 Estado local por sessão em `~/.valorbrain/state/hooks/` (apagado após 7 dias).
 Para desligar o checkpoint numa máquina, defina `VALORBRAIN_CHECKPOINT=off` no

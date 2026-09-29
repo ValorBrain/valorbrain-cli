@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-    acquireLock, detectDialect, fallbackCue, localDecide, readCreds, renderCheckpoint, renderContext,
+    acquireLock, detectDialect, fallbackCue, localDecide, readCreds, removeCreds, renderCheckpoint, renderContext,
     renderSilentStop, requestTimeoutMs, resolveCredentials, runHook, sessionKey, writeCreds, DEFAULT_POLICY,
 } from '../hook.mjs';
 
@@ -35,8 +35,9 @@ function api(handlers = {}) {
     return { calls, fetchImpl };
 }
 
+const HARNESSES = ['claude-code', 'codex', 'kiro', 'gemini-cli', 'cursor', 'grok'];
 function withCreds(h) {
-    writeCreds(h, { api: 'https://api.example', token: 'vbm_secret' });
+    for (const harness of HARNESSES) writeCreds(h, { api: 'https://api.example', token: 'vbm_secret', harness });
     return h;
 }
 
@@ -94,19 +95,40 @@ test('checkpoint rendering per dialect', () => {
 
 // ── credentials ────────────────────────────────────────────────────────────
 
-test('credentials: file is 0600, precedence argv > env > connect.json > config.json', () => {
+test('credentials: one 0600 entry per harness; the base always comes with its token', () => {
     const h = home();
-    const path = writeCreds(h, { api: 'https://api.example/mcp', token: 'vbm_file' });
+    const path = writeCreds(h, { api: 'https://api.example/mcp', token: 'vbm_kiro', harness: 'kiro' });
+    writeCreds(h, { api: 'https://other.example', token: 'vbm_claude', harness: 'claude-code' });
     if (process.platform !== 'win32') assert.equal(statSync(path).mode & 0o777, 0o600);
-    assert.deepEqual(readCreds(h), { token: 'vbm_file', api: 'https://api.example' });
-    assert.equal(resolveCredentials({ argv: [], env: {}, home: h }).source, 'connect');
-    assert.equal(resolveCredentials({ argv: [], env: { VALORBRAIN_TOKEN: 'vbm_env' }, home: h }).token, 'vbm_env');
-    assert.equal(resolveCredentials({ argv: ['--token=vbm_argv'], env: { VALORBRAIN_TOKEN: 'vbm_env' }, home: h }).source, 'argv');
+    assert.deepEqual(readCreds(h, 'kiro'), { token: 'vbm_kiro', api: 'https://api.example' });
+    assert.equal(readCreds(h, 'codex'), null);
+    assert.equal(readCreds(h), null);
+    // Two harnesses, two tenants: each reads only its own entry.
+    assert.deepEqual(resolveCredentials({ argv: [], env: {}, home: h, harness: 'claude-code' }), {
+        token: 'vbm_claude', api: 'https://other.example', source: 'connect',
+    });
+    assert.equal(resolveCredentials({ argv: [], env: {}, home: h, harness: 'gemini-cli' }).token, null);
+    // argv/env tokens never borrow a stored base.
+    assert.deepEqual(resolveCredentials({ argv: ['--token=vbm_argv'], env: {}, home: h, harness: 'kiro' }), {
+        token: 'vbm_argv', api: 'https://valorbrain-api.valor.digital', source: 'argv',
+    });
+    assert.equal(resolveCredentials({ argv: [], env: { VALORBRAIN_TOKEN: 'vbm_env', VALORBRAIN_API_URL: 'https://env.example' }, home: h, harness: 'kiro' }).api, 'https://env.example');
     const onlyCli = home();
     mkdirSync(join(onlyCli, '.valorbrain'), { recursive: true });
     writeFileSync(join(onlyCli, '.valorbrain', 'config.json'), JSON.stringify({ api_key: 'vb_cli', engine_url: 'https://engine.example/' }));
-    assert.deepEqual(resolveCredentials({ argv: [], env: {}, home: onlyCli }), { token: 'vb_cli', api: 'https://engine.example', source: 'config' });
-    assert.equal(resolveCredentials({ argv: [], env: {}, home: home() }).token, null);
+    assert.deepEqual(resolveCredentials({ argv: [], env: {}, home: onlyCli, harness: 'kiro' }), { token: 'vb_cli', api: 'https://engine.example', source: 'config' });
+    assert.equal(resolveCredentials({ argv: [], env: {}, home: home(), harness: 'kiro' }).token, null);
+});
+
+test('removing one harness keeps the others; the file goes with the last', () => {
+    const h = home();
+    writeCreds(h, { api: 'https://a', token: 'vbm_a', harness: 'kiro' });
+    writeCreds(h, { api: 'https://b', token: 'vbm_b', harness: 'codex' });
+    assert.equal(removeCreds(h, 'kiro'), true);
+    assert.equal(readCreds(h, 'kiro'), null);
+    assert.equal(readCreds(h, 'codex').token, 'vbm_b');
+    assert.equal(removeCreds(h, 'codex'), true);
+    assert.equal(existsSync(join(h, '.valorbrain', 'connect.json')), false);
 });
 
 // ── context moments ────────────────────────────────────────────────────────
@@ -143,8 +165,8 @@ test('older engine: cue 404 falls back to memory_prepare and is remembered', asy
 test('grok and cursor prompts cost no request (they cannot inject)', async () => {
     const h = withCreds(home());
     const fake = api({ '/api/v1/hooks/cue': () => ({ context: 'never' }) });
-    await run(['session-start'], { h, fake, payload: { hookEventName: 'session_start', sessionId: 'g' } });
-    await run(['prompt'], { h, fake, payload: { conversation_id: 'c', generation_id: 'g1', prompt: 'x' } });
+    await run(['session-start', '--harness=grok'], { h, fake, payload: { hookEventName: 'session_start', sessionId: 'g' } });
+    await run(['prompt', '--harness=claude-code'], { h, fake, payload: { conversation_id: 'c', generation_id: 'g1', prompt: 'x' } });
     assert.equal(fake.calls.length, 0);
 });
 
@@ -202,13 +224,38 @@ test('claude: stop_hook_active is never checkpointed, even when due', async () =
     assert.equal(fake.calls.length, 0);
 });
 
-test('a long single turn is enough work', async () => {
+test('a one-shot run never ends in a checkpoint, however long; two long turns do', async () => {
     const h = withCreds(home());
     const fake = stopApi();
-    const s = { session_id: 'long', hook_event_name: 'UserPromptSubmit', prompt: 'refactor everything' };
-    await run(['prompt', '--harness=claude-code'], { h, fake, payload: s, now: T0 });
-    const r = await run(['stop', '--harness=claude-code'], { h, fake, payload: { session_id: 'long', hook_event_name: 'Stop' }, now: T0 + 12 * MIN });
-    assert.deepEqual(JSON.parse(r.out), { decision: 'block', reason: 'CUE' });
+    const prompt = { session_id: 'long', hook_event_name: 'UserPromptSubmit', prompt: 'refactor everything' };
+    const stop = { session_id: 'long', hook_event_name: 'Stop' };
+    await run(['prompt', '--harness=claude-code'], { h, fake, payload: prompt, now: T0 });
+    const one = await run(['stop', '--harness=claude-code'], { h, fake, payload: stop, now: T0 + 30 * MIN });
+    assert.equal(one.out, ''); // `claude -p "…"`: its final message is somebody's output
+    await run(['prompt', '--harness=claude-code'], { h, fake, payload: prompt, now: T0 + 31 * MIN });
+    const two = await run(['stop', '--harness=claude-code'], { h, fake, payload: stop, now: T0 + 40 * MIN });
+    assert.deepEqual(JSON.parse(two.out), { decision: 'block', reason: 'CUE' });
+});
+
+test('SDK-driven Claude Code (headless): stop stays silent', async () => {
+    const h = withCreds(home());
+    const fake = stopApi();
+    const p = { hook_event_name: 'Stop', session_id: 'sdk' };
+    for (const t of [1, 2, 3, 11]) {
+        const r = await run(['stop', '--harness=claude-code'], { h, fake, payload: p, env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' }, now: T0 + t * MIN });
+        assert.equal(r.out, '');
+    }
+    assert.equal(fake.calls.length, 0);
+});
+
+test('an engine that predates the cue and refuses read-scoped POSTs (403) still gets recall', async () => {
+    const h = withCreds(home());
+    const fake = api({
+        '/api/v1/hooks/cue': () => new Response(JSON.stringify({ code: 'insufficient_scope' }), { status: 403 }),
+        '/mcp': () => ({ jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: 'legacy ctx' }] } }),
+    });
+    const r = await run(['prompt', '--harness=kiro'], { h, fake, payload: { hook_event_name: 'userPromptSubmit', session_id: 'k403', prompt: 'status?' } });
+    assert.equal(r.out, 'legacy ctx');
 });
 
 test('server says the agent already wrote memory: no nudge, counters restart', async () => {
@@ -253,13 +300,13 @@ test('cursor: followup_message; aborted turns and duplicate deliveries do not co
     const h = withCreds(home());
     const fake = stopApi();
     const p = (gen, status = 'completed') => ({ hook_event_name: 'stop', conversation_id: 'conv', generation_id: gen, status, loop_count: 0 });
-    await run(['stop'], { h, fake, payload: p('g1'), now: T0 + MIN });
-    await run(['stop'], { h, fake, payload: p('g1'), now: T0 + MIN });            // same Stop via Claude's file
-    await run(['stop'], { h, fake, payload: p('g2', 'aborted'), now: T0 + 2 * MIN }); // not a completion
-    await run(['stop'], { h, fake, payload: p('g3'), now: T0 + 3 * MIN });
-    const notYet = await run(['stop'], { h, fake, payload: p('g4'), now: T0 + 4 * MIN });
+    await run(['stop', '--harness=cursor'], { h, fake, payload: p('g1'), now: T0 + MIN });
+    await run(['stop', '--harness=claude-code'], { h, fake, payload: p('g1'), now: T0 + MIN });            // same Stop via Claude's file
+    await run(['stop', '--harness=cursor'], { h, fake, payload: p('g2', 'aborted'), now: T0 + 2 * MIN }); // not a completion
+    await run(['stop', '--harness=cursor'], { h, fake, payload: p('g3'), now: T0 + 3 * MIN });
+    const notYet = await run(['stop', '--harness=cursor'], { h, fake, payload: p('g4'), now: T0 + 4 * MIN });
     assert.equal(notYet.out, '{}'); // 3 genuine turns, but inside the 10 min interval
-    const fire = await run(['stop'], { h, fake, payload: p('g5'), now: T0 + 11 * MIN });
+    const fire = await run(['stop', '--harness=cursor'], { h, fake, payload: p('g5'), now: T0 + 11 * MIN });
     assert.deepEqual(JSON.parse(fire.out), { followup_message: 'CUE' });
 });
 
@@ -280,10 +327,10 @@ test('grok: only end_turn stops count; the session-end Stop is ignored', async (
     const h = withCreds(home());
     const fake = stopApi();
     const p = (reason) => ({ hookEventName: 'stop', sessionId: 'gk', stopHookActive: false, reason });
-    for (const t of [1, 2]) await run(['stop'], { h, fake, payload: p('end_turn'), now: T0 + t * MIN });
-    const end = await run(['stop'], { h, fake, payload: p('shutdown'), now: T0 + 11 * MIN });
+    for (const t of [1, 2]) await run(['stop', '--harness=grok'], { h, fake, payload: p('end_turn'), now: T0 + t * MIN });
+    const end = await run(['stop', '--harness=grok'], { h, fake, payload: p('shutdown'), now: T0 + 11 * MIN });
     assert.equal(end.out, '');
-    const fire = await run(['stop'], { h, fake, payload: p('end_turn'), now: T0 + 12 * MIN });
+    const fire = await run(['stop', '--harness=grok'], { h, fake, payload: p('end_turn'), now: T0 + 12 * MIN });
     assert.deepEqual(JSON.parse(fire.out), { decision: 'block', reason: 'CUE' });
 });
 
@@ -304,7 +351,11 @@ test('localDecide mirrors the server policy', () => {
     assert.equal(localDecide(s, DEFAULT_POLICY, T0 + 5 * MIN), false);
     assert.equal(localDecide({ ...s, checkpoints: 6 }, DEFAULT_POLICY, T0 + 11 * MIN), false);
     assert.equal(localDecide(s, { ...DEFAULT_POLICY, max_per_session: 0 }, T0 + 11 * MIN), false);
-    assert.equal(localDecide({ ...s, turns: 1, busyMs: 9 * MIN }, DEFAULT_POLICY, T0 + 11 * MIN), true);
+    assert.equal(localDecide({ ...s, turns: 1, busyMs: 9 * MIN }, DEFAULT_POLICY, T0 + 11 * MIN), false);
+    assert.equal(localDecide({ ...s, turns: 2, busyMs: 9 * MIN }, DEFAULT_POLICY, T0 + 11 * MIN), true);
+    // Floors survive a permissive server policy.
+    assert.equal(localDecide({ ...s, turns: 1 }, { ...DEFAULT_POLICY, min_turns: 1, min_interval_ms: 0 }, T0 + 11 * MIN), false);
+    assert.equal(localDecide({ ...s, lastCheckpointAt: T0 + 11 * MIN - 30_000 }, { ...DEFAULT_POLICY, min_interval_ms: 0 }, T0 + 11 * MIN), false);
 });
 
 test('state files are private', async () => {

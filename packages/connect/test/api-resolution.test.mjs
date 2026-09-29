@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,9 +40,11 @@ function stubApi() {
 function homeWithCreds(apiUrl) {
     const h = home();
     mkdirSync(join(h, '.valorbrain'), { recursive: true });
+    // One entry per harness (a hook never borrows another harness's token).
+    const entry = (token) => ({ api_url: apiUrl, token, updated_at: '2026-09-29T12:00:00.000Z' });
     writeFileSync(
         join(h, '.valorbrain', 'connect.json'),
-        JSON.stringify({ version: 1, api_url: apiUrl, token: 'vbm_secret', updated_at: '2026-09-29T12:00:00.000Z' }) + '\n',
+        JSON.stringify({ version: 2, harnesses: { kiro: entry('vbm_secret'), codex: entry('vbm_other') } }) + '\n',
         { mode: 0o600 },
     );
     return h;
@@ -77,5 +79,7 @@ test('remove: --api omitted → the removal is planned against connect.json api_
     assert.deepEqual(agents, ['kiro']);
     assert.equal(code, 0);
     assert.match(stdout, /Kiro \(kiro, contract v2\)/);
-    assert.ok(existsSync(join(h, '.valorbrain', 'connect.json'))); // --harness keeps creds
+    // Per-harness credentials: kiro's entry leaves with kiro; codex's stays.
+    const saved = JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8'));
+    assert.deepEqual(Object.keys(saved.harnesses), ['codex']);
 });

@@ -20,7 +20,7 @@
  * republishing when the rules text changes.
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
@@ -332,7 +332,7 @@ function apply(changes, { dryRun, noBackup }) {
       // Once per file: a chained change's `before` is the previous change's
       // output, and backing that up would overwrite the copy of the original.
       if (c.before !== null && !noBackup && !backedUp.has(c.path)) {
-        writeFileSync(`${c.path}.valorbrain-bak`, c.before);
+        writeBackup(c.path, c.before);
         backedUp.add(c.path);
       }
       if (c.after === null) {
@@ -348,6 +348,16 @@ function apply(changes, { dryRun, noBackup }) {
     }
   }
   return { wrote, failed };
+}
+
+/**
+ * Backups are private: a v1 hook file carries the token on its command line,
+ * and a harness config carries it in its MCP entry.
+ */
+function writeBackup(path, contents) {
+  const bak = `${path}.valorbrain-bak`;
+  writeFileSync(bak, contents, { mode: 0o600 });
+  try { chmodSync(bak, 0o600); } catch { /* not supported on this fs */ }
 }
 
 /** True when a hook entry was written by us (hosted client or local binary). */
@@ -449,13 +459,14 @@ async function main() {
   const home = homedir();
   const token = args.token || process.env.VALORBRAIN_TOKEN || null;
 
-  // Qa R1 (VAL-195): --status and --remove fetch the manifest from args.api,
-  // whose blind default was the public API — ignoring the api_url that this
+  // Qa R1 (VAL-195): --status and --remove fetch the manifest from the API,
+  // whose blind default was the public one — ignoring the api_url that this
   // same --status prints from ~/.valorbrain/connect.json. With --api omitted,
-  // follow the same chain the hook resolves (resolveCredentials):
-  // VALORBRAIN_API_URL > connect.json api_url > engine config.json engine_url
-  // > public default.
-  if (!args.api) args.api = resolveCredentials({ argv: process.argv.slice(2), env: process.env, home }).api;
+  // each harness follows the chain its own hook resolves (resolveCredentials,
+  // per harness): VALORBRAIN_API_URL > that harness's connect.json api_url >
+  // CLI config.json engine_url > public default.
+  const apiFor = (harness) =>
+    args.api || resolveCredentials({ argv: [], env: process.env, home, harness }).api;
 
   let targets = args.harnesses;
   if (targets.length === 0) {
@@ -476,32 +487,10 @@ async function main() {
   let failed = 0;
   const credsLabel = credsPath(home).replace(home, "~");
 
-  // Hooks read the token from this file (ADR-058) — written before any hook
-  // artifact, so a freshly wired hook never runs without it.
-  if (args.status) {
-    const saved = readCreds(home);
-    console.log(saved
-      ? `${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
-      : `${icon.missing} creds ${credsLabel} absent — hooks stay silent until the installer runs with --token`);
-    console.log();
-  } else if (!args.remove && token) {
-    if (args.dryRun) {
-      console.log(`${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} (0600)${C.off}\n`);
-    } else {
-      try {
-        writeCreds(home, { api: args.api, token });
-        console.log(`${C.green}✓${C.off} hook credentials ${C.dim}${credsLabel} (0600)${C.off}\n`);
-      } catch (err) {
-        console.log(`${C.red}✗${C.off} hook credentials: ${err.message}\n`);
-        failed++;
-      }
-    }
-  }
-
   for (const harness of targets) {
     let manifest;
     try {
-      manifest = await fetchManifest(args.api, harness);
+      manifest = await fetchManifest(apiFor(harness), harness);
     } catch (err) {
       console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
       failed++;
@@ -514,17 +503,44 @@ async function main() {
       for (const r of statusFor(manifest, home)) {
         console.log(`  ${icon[r.state] ?? " "} ${r.kind.padEnd(5)} ${r.detail}`);
       }
+      if (manifest.hooks_available) {
+        const saved = readCreds(home, harness);
+        console.log(saved
+          ? `  ${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
+          : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until the installer runs with --token`);
+      }
       console.log();
       continue;
+    }
+
+    // Hooks read the token from this harness's entry (ADR-058), written before
+    // any hook artifact so a freshly wired hook never runs without it. One
+    // entry per harness: two harnesses may belong to two tenants.
+    if (!args.remove && token && manifest.hooks_available) {
+      if (args.dryRun) {
+        console.log(`  ${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+      } else {
+        try {
+          writeCreds(home, { api: apiFor(harness), token, harness });
+          console.log(`  ${C.green}✓${C.off} hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+        } catch (err) {
+          console.log(`  ${C.red}✗${C.off} hook credentials: ${err.message}`);
+          failed++;
+          continue; // never wire hooks that would have nothing to read
+        }
+      }
     }
 
     const changes = planFor(manifest, token, home, args.remove);
     const res = apply(changes, args);
     failed += res.failed;
+    if (args.remove && !args.dryRun && removeCreds(home, harness)) {
+      console.log(`  ${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel} [${harness}]${C.off}`);
+    }
 
     // Instalou/atualizou: informa o engine do estado deste harness (fail-open).
     if (!args.remove && !args.dryRun) {
-      await declareContract(args.api, token, harness, home, manifest);
+      await declareContract(apiFor(harness), token, harness, home, manifest);
     }
 
     if (!args.remove) {
@@ -537,15 +553,7 @@ async function main() {
   }
 
   if (args.dryRun) console.log(`${C.yellow}Dry run — nothing was written.${C.off}`);
-  else if (args.remove) {
-    // Full uninstall (every detected harness): the hook credential goes too.
-    // With --harness, other harnesses may still use it.
-    if (args.harnesses.length === 0) {
-      if (removeCreds(home)) console.log(`${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel}${C.off}`);
-    } else if (existsSync(credsPath(home))) {
-      console.log(`${C.dim}note: hook credentials kept at ${credsLabel} (other harnesses may use them); --remove without --harness deletes them${C.off}`);
-    }
-  } else if (!args.status) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
+  else if (!args.status && !args.remove) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
 
   return failed > 0 ? 1 : 0;
 }
@@ -664,7 +672,7 @@ function applyQuiet(changes) {
     if (c.error || !c.changed) continue;
     try {
       if (c.before !== null && !backedUp.has(c.path)) {
-        writeFileSync(`${c.path}.valorbrain-bak`, c.before);
+        writeBackup(c.path, c.before);
         backedUp.add(c.path);
       }
       if (c.after === null) {
@@ -716,15 +724,25 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
   const id = harness || detectHarness(home);
   if (!id) return;
   try {
-    // Migração v1 → v2 (ADR-058): quem ainda recebe o token pelo argv (ou env)
-    // ganha o arquivo de credencial ANTES de os hooks serem reescritos sem
-    // token — nunca existe hook v2 sem de onde ler a credencial.
-    if ((credsSource === "argv" || credsSource === "env") && !readCreds(home)) {
-      try {
-        writeCreds(home, { api, token });
-      } catch {
-        return; // sem credencial gravada, não migra os hooks
+    // Migração v1 → v2 (ADR-058): o hook v1 recebe o token pelo argv; a entrada
+    // DESTE harness no connect.json é gravada ANTES de os hooks serem
+    // reescritos sem token — nunca existe hook v2 sem de onde ler a credencial.
+    // Token vindo de env não é persistido (quem usa env escolheu env), e uma
+    // entrada existente com OUTRO token nunca é sobrescrita: aí não se migra.
+    let canMigrateHooks = true;
+    if (credsSource === "argv") {
+      const saved = readCreds(home, id);
+      if (!saved) {
+        try {
+          writeCreds(home, { api, token, harness: id });
+        } catch {
+          canMigrateHooks = false;
+        }
+      } else if (saved.token !== token) {
+        canMigrateHooks = false;
       }
+    } else if (credsSource !== "connect") {
+      canMigrateHooks = false; // env/config: nada garante que o hook v2 terá credencial
     }
     const state = readHealState(home);
     if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
@@ -734,14 +752,18 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
     const contractDrift = Boolean(expected && installed !== expected);
-    const planned = planFor(manifest, token, home, false).filter(
-      (c) => c.changed && !c.error && c.artifact.kind !== "mcp",
-    );
-    // Contrato em drift: reaplica tudo que é nosso (regras + hooks). Sem drift de
-    // contrato, só hooks cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação
-    // de JSON não conta, senão o settings.json do cliente seria regravado a cada
-    // 6h por causa de indentação.
-    const changes = contractDrift ? planned : planned.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c));
+    // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
+    // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
+    // token do heal — para dentro da mudança de hooks.
+    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
+      .filter((c) => c.changed && !c.error);
+    // Contrato em drift: reaplica regras + hooks. Sem drift de contrato, só hooks
+    // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta.
+    // O Codex fica fora da migração automática: comando novo exige re-trust
+    // manual em /hooks, e migrar sozinho desligaria o recall em silêncio.
+    const hooksOk = (c) => c.artifact.kind !== "hooks" || (canMigrateHooks && !(id === "codex" && !contractDrift));
+    const changes = (contractDrift ? planned : planned.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
+      .filter(hooksOk);
     if (changes.length > 0) {
       const wrote = applyQuiet(changes);
       if (wrote > 0) {

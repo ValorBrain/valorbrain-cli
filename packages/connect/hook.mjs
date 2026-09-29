@@ -13,9 +13,10 @@
  *
  * Rules this file keeps:
  *   - The token never travels on argv. It comes from `~/.valorbrain/connect.json`
- *     (0600, written by the installer), `VALORBRAIN_TOKEN`, or — for installs
- *     that predate v2 — a legacy `--token=` argument, which the installer then
- *     migrates into the file.
+ *     (0600, written by the installer, one entry PER HARNESS — two harnesses on
+ *     one machine may belong to two tenants), `VALORBRAIN_TOKEN`, or — for
+ *     installs that predate v2 — a legacy `--token=` argument, which self-heal
+ *     then migrates into this harness's entry.
  *   - The dialect comes from the payload, not from the file that invoked us:
  *     Grok loads ~/.cursor/hooks.json unchanged and Cursor loads Claude's
  *     settings.json, so the same command is called by different harnesses.
@@ -86,27 +87,58 @@ function readJson(path) {
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
 const normalizeApi = (url) => str(url).replace(/\/+$/, '').replace(/\/mcp$/, '');
 
-export function readCreds(home) {
+function readCredsFile(home) {
     const c = readJson(credsPath(home));
-    const token = str(c?.token);
-    return token ? { token, api: normalizeApi(c?.api_url) || null } : null;
+    return c && c.version === 2 && c.harnesses && typeof c.harnesses === 'object' ? c : { version: 2, harnesses: {} };
 }
 
-/** Atomic write, 0600 file in a 0700 directory. Returns the path. */
-export function writeCreds(home, { api, token }) {
+/** This harness's credential, or null. Never another harness's. */
+export function readCreds(home, harness) {
+    if (!harness) return null;
+    const e = readCredsFile(home).harnesses[harness];
+    const token = str(e?.token);
+    return token ? { token, api: normalizeApi(e?.api_url) || null } : null;
+}
+
+/** Every stored entry (for --status). */
+export function listCreds(home) {
+    const out = {};
+    for (const [h, e] of Object.entries(readCredsFile(home).harnesses)) {
+        if (str(e?.token)) out[h] = { api: normalizeApi(e?.api_url) || null };
+    }
+    return out;
+}
+
+function writeCredsFile(home, data) {
     const path = credsPath(home);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const tmp = `${path}.${process.pid}.tmp`;
-    const body = JSON.stringify({ version: 1, api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() }, null, 2) + '\n';
-    writeFileSync(tmp, body, { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
     renameSync(tmp, path);
     try { chmodSync(path, 0o600); } catch { /* not supported on this fs */ }
     return path;
 }
 
-export function removeCreds(home) {
+/** Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir. */
+export function writeCreds(home, { api, token, harness }) {
+    if (!harness) throw new Error('writeCreds needs the harness id');
+    const data = readCredsFile(home);
+    data.harnesses[harness] = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
+    return writeCredsFile(home, data);
+}
+
+/** Drop one harness's entry (or all); the file goes when nothing is left. */
+export function removeCreds(home, harness) {
     try {
-        unlinkSync(credsPath(home));
+        if (!harness) {
+            unlinkSync(credsPath(home));
+            return true;
+        }
+        const data = readCredsFile(home);
+        if (!data.harnesses[harness]) return false;
+        delete data.harnesses[harness];
+        if (Object.keys(data.harnesses).length === 0) unlinkSync(credsPath(home));
+        else writeCredsFile(home, data);
         return true;
     } catch {
         return false;
@@ -114,27 +146,22 @@ export function removeCreds(home) {
 }
 
 /**
- * Precedence: legacy `--token=` (argv) > VALORBRAIN_TOKEN > connect.json >
- * the CLI's ~/.valorbrain/config.json (`api_key`). The API base follows its own
- * chain so an explicit `--api` still wins over a stored one.
+ * Precedence: legacy `--token=` (argv) > VALORBRAIN_TOKEN > this harness's
+ * connect.json entry > the CLI's ~/.valorbrain/config.json (`api_key`). The
+ * API base always comes with its token (or from an explicit --api /
+ * VALORBRAIN_API_URL): pairing a token with another credential's base would
+ * send it to a server it was never issued for.
  */
-export function resolveCredentials({ argv = [], env = {}, home }) {
+export function resolveCredentials({ argv = [], env = {}, home, harness = '' }) {
     const arg = (p) => argv.find((a) => a.startsWith(p))?.slice(p.length) || '';
-    const saved = home ? readCreds(home) : null;
-    const cli = home ? readJson(join(home, '.valorbrain', 'config.json')) : null;
-
-    let token = '';
-    let source = null;
-    if (arg('--token=')) { token = arg('--token='); source = 'argv'; }
-    else if (str(env.VALORBRAIN_TOKEN)) { token = str(env.VALORBRAIN_TOKEN); source = 'env'; }
-    else if (saved?.token) { token = saved.token; source = 'connect'; }
-    else if (str(cli?.api_key)) { token = str(cli.api_key); source = 'config'; }
-
-    // The base that belongs with the token wins over the other file's base.
     const explicit = normalizeApi(arg('--api=')) || normalizeApi(env.VALORBRAIN_API_URL);
-    const paired = source === 'config' ? normalizeApi(cli?.engine_url) : saved?.api || '';
-    const api = explicit || paired || saved?.api || normalizeApi(cli?.engine_url) || DEFAULT_API;
-    return { token: token || null, api, source };
+    if (arg('--token=')) return { token: arg('--token='), api: explicit || DEFAULT_API, source: 'argv' };
+    if (str(env.VALORBRAIN_TOKEN)) return { token: str(env.VALORBRAIN_TOKEN), api: explicit || DEFAULT_API, source: 'env' };
+    const saved = home ? readCreds(home, harness) : null;
+    if (saved?.token) return { token: saved.token, api: explicit || saved.api || DEFAULT_API, source: 'connect' };
+    const cli = home ? readJson(join(home, '.valorbrain', 'config.json')) : null;
+    if (str(cli?.api_key)) return { token: str(cli.api_key), api: explicit || normalizeApi(cli?.engine_url) || DEFAULT_API, source: 'config' };
+    return { token: null, api: explicit || DEFAULT_API, source: null };
 }
 
 // ─── events and dialects ─────────────────────────────────────────────────────
@@ -355,15 +382,19 @@ export function isGenuineCompletion(dialect, payload) {
     return true;
 }
 
-/** Local mirror of the engine's decideCheckpoint — saves a request when nothing is due. */
+/**
+ * Local mirror of the engine's decideCheckpoint — saves a request when nothing
+ * is due. Same floors as the engine: never on the first turn (a one-shot
+ * `-p`/SDK/exec run is not a session) and never less than a minute apart.
+ */
 export function localDecide(state, policy = DEFAULT_POLICY, now = Date.now()) {
     const pol = { ...DEFAULT_POLICY, ...(policy || {}) };
     if (!(pol.max_per_session > 0)) return false;
     if (state.checkpoints >= pol.max_per_session) return false;
     const anchor = state.lastCheckpointAt ?? state.createdAt ?? null;
-    if (anchor !== null && now - anchor < pol.min_interval_ms) return false;
-    const minTurns = Math.max(1, pol.min_turns);
-    return state.turns >= minTurns || (state.turns >= 1 && state.busyMs >= pol.long_turn_ms);
+    if (anchor !== null && now - anchor < Math.max(60_000, pol.min_interval_ms)) return false;
+    const minTurns = Math.max(2, pol.min_turns);
+    return state.turns >= minTurns || (state.turns >= 2 && state.busyMs >= pol.long_turn_ms);
 }
 
 // ─── capability / policy cache (per API) ─────────────────────────────────────
@@ -498,7 +529,7 @@ export async function runHook(argv, deps = {}) {
     const dialect = detectDialect(payload, env, harness, format);
     const emit = (s) => { if (s) out(s); return 0; };
 
-    const creds = resolveCredentials({ argv, env, home });
+    const creds = resolveCredentials({ argv, env, home, harness });
     const event = normalizeEvent(name);
 
     if (!creds.token) {
@@ -564,6 +595,11 @@ export async function runHook(argv, deps = {}) {
                     ...(typeof payload.source === 'string' ? { source: payload.source } : {}),
                 }, timeoutMs, fetchImpl);
                 if (r.status === 404 || r.status === 405) writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
+                else if (r.status === 403) {
+                    // An engine that predates the cue treats this POST as a
+                    // write and refuses read-scoped tokens: use the legacy path
+                    // this once (not cached — on a current engine a 403 is real).
+                }
                 else if (r.status >= 200 && r.status < 300) {
                     served = true;
                     context = typeof r.json?.context === 'string' ? r.json.context : '';
@@ -593,8 +629,10 @@ export async function runHook(argv, deps = {}) {
     // stays silent and does not touch the state — counting it would count the
     // same turn twice.
     const silent = renderSilentStop(dialect);
-    // Machine-level opt-out (the engine has the same switch for everyone).
-    if (/^(off|0|false)$/i.test(str(env.VALORBRAIN_CHECKPOINT))) {
+    // Machine-level opt-out (the engine has the same switch for everyone), and
+    // headless runs: an SDK-driven Claude Code session's final message is
+    // somebody's program output, never a place for a checkpoint.
+    if (/^(off|0|false)$/i.test(str(env.VALORBRAIN_CHECKPOINT)) || /^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) {
         await heal;
         return emit(silent);
     }
@@ -654,6 +692,8 @@ export async function runHook(argv, deps = {}) {
                 if (r.status === 404 || r.status === 405) {
                     writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
                     cue = fallbackCue(toolPrefixFor(dialect));
+                } else if (r.status === 403) {
+                    cue = fallbackCue(toolPrefixFor(dialect)); // older engine refusing a read-scoped token
                 } else if (r.status >= 200 && r.status < 300) {
                     if (r.json?.policy) writeCaps(home, creds.api, { cue: true, policy: r.json.policy, cueCheckedAt: now });
                     cue = typeof r.json?.checkpoint?.text === 'string' ? r.json.checkpoint.text : null;
