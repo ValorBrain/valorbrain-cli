@@ -686,7 +686,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.5.0";
+const CLIENT_VERSION = "0.5.1";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
