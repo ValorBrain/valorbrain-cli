@@ -65,3 +65,26 @@ test('self-heal rewrites hooks only when OUR entries change, not on reformatting
     // Not JSON (OpenCode plugin source): bytes decide.
     assert.equal(hookEntriesChanged({ before: 'const CMD = 1;', after: 'const CMD = 2;' }), true);
 });
+
+
+test('installer engine resolution: the base travels with its token, never with another', async () => {
+    const { resolveInstallApi } = await import('../index.mjs');
+    const { writeCreds } = await import('../hook.mjs');
+    const h = home();
+    writeCreds(h, { api: 'https://private.example', token: 'vbm_A', harness: 'kiro' });
+    // (a) same token, second harness, no --api → the engine that token was saved with.
+    assert.deepEqual(resolveInstallApi({ env: {}, home: h, harness: 'codex', token: 'vbm_A' }), {
+        api: 'https://private.example', from: 'saved with this token',
+    });
+    // (b) a NEW token with no --api never inherits another token's engine.
+    assert.deepEqual(resolveInstallApi({ env: {}, home: h, harness: 'kiro', token: 'vbm_B' }), {
+        api: 'https://valorbrain-api.valor.digital', from: 'default',
+    });
+    // Explicit always wins, and says so.
+    assert.equal(resolveInstallApi({ flag: 'https://x.example/mcp', env: {}, home: h, harness: 'kiro', token: 'vbm_B' }).from, '--api');
+    assert.equal(resolveInstallApi({ env: { VALORBRAIN_API_URL: 'https://env.example' }, home: h, harness: 'kiro', token: 'vbm_B' }).api, 'https://env.example');
+    // --status/--remove (no token): this harness's saved engine.
+    assert.deepEqual(resolveInstallApi({ env: {}, home: h, harness: 'kiro', token: null }), {
+        api: 'https://private.example', from: 'saved credentials',
+    });
+});

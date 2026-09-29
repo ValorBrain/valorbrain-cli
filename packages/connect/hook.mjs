@@ -100,6 +100,19 @@ export function readCreds(home, harness) {
     return token ? { token, api: normalizeApi(e?.api_url) || null } : null;
 }
 
+/**
+ * The API base a token was saved with, from any harness's entry. A base
+ * belongs to its token, not to a harness: installing a second harness with the
+ * same token reuses the engine the first one was pointed at.
+ */
+export function savedApiForToken(home, token) {
+    if (!token) return null;
+    for (const e of Object.values(readCredsFile(home).harnesses)) {
+        if (str(e?.token) === token && normalizeApi(e?.api_url)) return normalizeApi(e.api_url);
+    }
+    return null;
+}
+
 /** Every stored entry (for --status). */
 export function listCreds(home) {
     const out = {};

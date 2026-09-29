@@ -24,7 +24,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, w
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
-import { HOOK_PROTOCOL, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, writeCreds } from "./hook.mjs";
+import { HOOK_PROTOCOL, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -351,6 +351,30 @@ function apply(changes, { dryRun, noBackup }) {
 }
 
 /**
+ * Which engine this command talks to for one harness, and why — printed by the
+ * installer, because "which API did that token go to?" must never be a guess.
+ *
+ *   --api > VALORBRAIN_API_URL > the base saved with THIS token (any harness)
+ *   > [no token given] this harness's saved base, then the CLI's config.json
+ *   > public default.
+ *
+ * A new token never inherits the base saved for a different token: that base
+ * belongs to another engine, possibly another tenant.
+ */
+export function resolveInstallApi({ flag, env = {}, home, harness, token }) {
+  const norm = (u) => String(u).trim().replace(/\/+$/, "").replace(/\/mcp$/, "");
+  if (flag) return { api: norm(flag), from: "--api" };
+  if (env.VALORBRAIN_API_URL) return { api: norm(env.VALORBRAIN_API_URL), from: "VALORBRAIN_API_URL" };
+  if (token) {
+    const saved = savedApiForToken(home, token);
+    return saved ? { api: saved, from: "saved with this token" } : { api: "https://valorbrain-api.valor.digital", from: "default" };
+  }
+  const r = resolveCredentials({ argv: [], env, home, harness });
+  const from = r.source === "connect" ? "saved credentials" : r.source === "config" ? "CLI config.json" : "default";
+  return { api: r.api, from };
+}
+
+/**
  * Backups are private: a v1 hook file carries the token on its command line,
  * and a harness config carries it in its MCP entry.
  */
@@ -465,8 +489,7 @@ async function main() {
   // each harness follows the chain its own hook resolves (resolveCredentials,
   // per harness): VALORBRAIN_API_URL > that harness's connect.json api_url >
   // CLI config.json engine_url > public default.
-  const apiFor = (harness) =>
-    args.api || resolveCredentials({ argv: [], env: process.env, home, harness }).api;
+  const apiFor = (harness) => resolveInstallApi({ flag: args.api, env: process.env, home, harness, token }).api;
 
   let targets = args.harnesses;
   if (targets.length === 0) {
@@ -498,6 +521,10 @@ async function main() {
     }
 
     console.log(`${C.bold}${manifest.name}${C.off} ${C.dim}(${manifest.harness}, contract v${manifest.contract_version})${C.off}`);
+    {
+      const r = resolveInstallApi({ flag: args.api, env: process.env, home, harness, token });
+      console.log(`  ${C.dim}engine ${r.api} (${r.from})${C.off}`);
+    }
 
     if (args.status) {
       for (const r of statusFor(manifest, home)) {
