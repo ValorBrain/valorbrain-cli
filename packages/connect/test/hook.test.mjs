@@ -421,6 +421,27 @@ test('prompt persists turn bookkeeping before the network call (a killed hook mu
     await settled;
 });
 
+test('legacy argv/env tokens take the engine_url step from config.json (v1 migration)', () => {
+    const h = home();
+    mkdirSync(join(h, '.valorbrain'), { recursive: true });
+    writeFileSync(join(h, '.valorbrain', 'config.json'), JSON.stringify({ api_key: 'vbm_cfg', engine_url: 'https://engine.internal:7438/' }));
+    assert.deepEqual(
+        resolveCredentials({ argv: ['prompt', '--token=vbm_legacy'], env: {}, home: h, harness: 'kiro' }),
+        { token: 'vbm_legacy', api: 'https://engine.internal:7438', source: 'argv' },
+    );
+    assert.deepEqual(
+        resolveCredentials({ argv: [], env: { VALORBRAIN_TOKEN: 'vbm_env' }, home: h, harness: 'kiro' }),
+        { token: 'vbm_env', api: 'https://engine.internal:7438', source: 'env' },
+    );
+    // A base saved with THIS token wins over config.json — a base belongs to its token.
+    writeCreds(h, { api: 'https://saved.example', token: 'vbm_legacy', harness: 'kiro' });
+    assert.equal(resolveCredentials({ argv: ['--token=vbm_legacy'], env: {}, home: h, harness: 'kiro' }).api, 'https://saved.example');
+    // A DIFFERENT token never inherits a saved base (falls through to config/default).
+    assert.equal(resolveCredentials({ argv: ['--token=vbm_other'], env: {}, home: h, harness: 'kiro' }).api, 'https://engine.internal:7438');
+    // No local evidence at all: public default, unchanged.
+    assert.equal(resolveCredentials({ argv: ['--token=vbm_new'], env: {}, home: home() }).api, 'https://valorbrain-api.valor.digital');
+});
+
 test('credentials are keyed by the canonical harness id (aliases resolve)', () => {
     const h = home();
     writeCreds(h, { api: 'https://api.example', token: 'vbm_gem', harness: 'gemini' });

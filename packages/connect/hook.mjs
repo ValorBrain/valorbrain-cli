@@ -95,6 +95,10 @@ export function canonicalHarness(name) {
 const normalizeApi = (url) => str(url).replace(/\/+$/, '').replace(/\/mcp$/, '');
 
 function readCredsFile(home) {
+    // A pre-0.5.0 file ({version:1, api_url, token}, single credential) was only
+    // ever written by unpublished builds of this PR and reads as empty on
+    // purpose: v1 keyed no harness, and borrowing one harness's token pulled
+    // recall from the wrong tenant. Run the installer again to be re-keyed.
     const c = readJson(credsPath(home));
     return c && c.version === 2 && c.harnesses && typeof c.harnesses === 'object' ? c : { version: 2, harnesses: {} };
 }
@@ -200,18 +204,24 @@ export function removeCreds(home, harness) {
 /**
  * Precedence: legacy `--token=` (argv) > VALORBRAIN_TOKEN > this harness's
  * connect.json entry > the CLI's ~/.valorbrain/config.json (`api_key`). The
- * API base always comes with its token (or from an explicit --api /
- * VALORBRAIN_API_URL): pairing a token with another credential's base would
- * send it to a server it was never issued for.
+ * API base follows the token: an explicit --api / VALORBRAIN_API_URL wins;
+ * then a base saved with THIS token (a base belongs to its token, never to
+ * another credential's); then — argv/env tokens only — the machine's own
+ * `config.json` engine_url, the local engine CLI's file and the only local
+ * evidence of a non-public engine: v1 hooks installed from it carry the token
+ * on argv, and dropping this step migrated self-hosted v1 clients to the
+ * public API in silence. A connect.json base of a DIFFERENT token never
+ * pairs. Public default last.
  */
 export function resolveCredentials({ argv = [], env = {}, home, harness = '' }) {
     const arg = (p) => argv.find((a) => a.startsWith(p))?.slice(p.length) || '';
+    const cli = home ? readJson(join(home, '.valorbrain', 'config.json')) : null;
     const explicit = normalizeApi(arg('--api=')) || normalizeApi(env.VALORBRAIN_API_URL);
-    if (arg('--token=')) return { token: arg('--token='), api: explicit || DEFAULT_API, source: 'argv' };
-    if (str(env.VALORBRAIN_TOKEN)) return { token: str(env.VALORBRAIN_TOKEN), api: explicit || DEFAULT_API, source: 'env' };
+    const local = (token) => savedApiForToken(home, token) || normalizeApi(cli?.engine_url) || DEFAULT_API;
+    if (arg('--token=')) return { token: arg('--token='), api: explicit || local(arg('--token=')), source: 'argv' };
+    if (str(env.VALORBRAIN_TOKEN)) return { token: str(env.VALORBRAIN_TOKEN), api: explicit || local(str(env.VALORBRAIN_TOKEN)), source: 'env' };
     const saved = home ? readCreds(home, harness) : null;
     if (saved?.token) return { token: saved.token, api: explicit || saved.api || DEFAULT_API, source: 'connect' };
-    const cli = home ? readJson(join(home, '.valorbrain', 'config.json')) : null;
     if (str(cli?.api_key)) return { token: str(cli.api_key), api: explicit || normalizeApi(cli?.engine_url) || DEFAULT_API, source: 'config' };
     return { token: null, api: explicit || DEFAULT_API, source: null };
 }
