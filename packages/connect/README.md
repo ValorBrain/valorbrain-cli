@@ -24,6 +24,51 @@ Para cada um, o instalador escreve:
   sobrescrever o arquivo do cliente);
 - **hooks** quando o harness tem sistema de hook com caminho hospedado.
 
+### Hooks (protocolo v2, ADR-058)
+
+Desde a 0.5.0 os hooks cobrem três momentos. Nenhum deles roda LLM do
+ValorBrain nem envia transcript:
+
+| momento | o que faz |
+|---|---|
+| `session-start` | contexto da sessão (`POST /api/v1/hooks/cue`) |
+| `prompt` | contexto do prompt (mesmo endpoint) |
+| `stop` | a cada alguns turnos, um **checkpoint de memória** |
+
+O checkpoint chega pelo mecanismo de continuação do próprio harness:
+
+| harness | mecanismo |
+|---|---|
+| Claude, Codex, Kiro, Grok | `decision:block` |
+| Gemini | `deny` |
+| Cursor | `followup_message` |
+
+O modelo do harness revisa o trabalho e grava via MCP o que for durável, ou
+não grava nada.
+
+- **Credencial fora da linha de comando.** O instalador grava
+  `~/.valorbrain/connect.json` (0600), e o hook lê de lá. O token não aparece
+  em `ps`, em `/hooks` nem nos logs do harness.
+- **Dialeto pelo payload.** O Grok carrega `~/.cursor/hooks.json` e o Cursor
+  carrega o `~/.claude/settings.json`. Por isso o cliente identifica quem
+  chamou pelos campos do evento, não pelo arquivo.
+- **Sem loop.** O cliente respeita `stop_hook_active` / `stopHookActive`. Onde
+  não existe flag (Kiro, Cursor), uma marca `awaiting` própria cobre o caso.
+  Os limites padrão são intervalo mínimo de 10 min, 3 turnos (ou 8 min de
+  trabalho) e no máximo 6 checkpoints por sessão, e a política vem do servidor.
+- **Engine antigo.** Se o engine não tem `/api/v1/hooks/cue`, o contexto vem
+  de `memory_prepare` e o checkpoint usa o texto embutido.
+- **Migração automática.** Um hook v1 (com `--token=`) rodando a 0.5 grava o
+  `connect.json` e reescreve os hooks para v2 no próximo self-heal.
+
+Estado local por sessão em `~/.valorbrain/state/hooks/` (apagado após 7 dias).
+Para desligar o checkpoint numa máquina, defina `VALORBRAIN_CHECKPOINT=off` no
+ambiente do harness. A mesma variável no engine desliga para todos.
+
+```bash
+npm test   # node --test, sem dependências além do yaml
+```
+
 ### Hermes
 
 O Hermes recebe três coisas:
