@@ -7,7 +7,7 @@ import { join } from 'node:path';
 
 import {
     acquireLock, detectDialect, fallbackCue, localDecide, readCreds, renderCheckpoint, renderContext,
-    renderSilentStop, resolveCredentials, runHook, sessionKey, writeCreds, DEFAULT_POLICY,
+    renderSilentStop, requestTimeoutMs, resolveCredentials, runHook, sessionKey, writeCreds, DEFAULT_POLICY,
 } from '../hook.mjs';
 
 const MIN = 60_000;
@@ -329,4 +329,43 @@ test('VALORBRAIN_CHECKPOINT=off on the machine: stop is silent and costs nothing
         assert.equal(r.out, '');
     }
     assert.equal(fake.calls.length, 0);
+});
+
+// ── request budget (VAL-195, ressalva do Qa) ────────────────────────────────
+
+test('context requests fit the harness 10s cut: cold npx ~3.4s + ≤4s of network', () => {
+    assert.equal(requestTimeoutMs('prompt', {}), 4000);
+    assert.equal(requestTimeoutMs('session_start', {}), 4000);
+    assert.equal(requestTimeoutMs('stop', {}), 4000);
+    assert.ok(3_400 + requestTimeoutMs('prompt', {}) < 10_000);
+    // escape hatch for slow private networks still wins
+    assert.equal(requestTimeoutMs('prompt', { VALORBRAIN_HOOK_TIMEOUT_MS: '9000' }), 9000);
+});
+
+test('prompt persists turn bookkeeping before the network call (a killed hook must not lose it)', async () => {
+    const h = withCreds(home());
+    let fetchSeen;
+    let killFetch;
+    const seen = new Promise((r) => { fetchSeen = r; });
+    // A fetch that never answers while it runs — the window between the call
+    // starting and the harness killing us. We settle it by hand afterwards:
+    // deterministic, no real-timer dependency.
+    const settled = runHook(['prompt', '--harness=kiro'], {
+        env: { VALORBRAIN_HOOK_TIMEOUT_MS: '30' },
+        home: h,
+        payload: { hook_event_name: 'UserPromptSubmit', session_id: 'kill-1', prompt: 'olá' },
+        now: T0,
+        fetchImpl: () => new Promise((_, reject) => {
+            fetchSeen();
+            killFetch = () => reject(new Error('killed mid-request'));
+        }),
+        out: () => {}, err: () => {},
+    });
+    await seen;
+    const key = sessionKey('kiro', { session_id: 'kill-1' }, {});
+    const st = JSON.parse(readFileSync(join(h, '.valorbrain', 'state', 'hooks', `${key}.json`), 'utf-8'));
+    assert.equal(st.turnStartedAt, T0);
+    assert.equal(st.awaiting, false);
+    killFetch();
+    await settled;
 });

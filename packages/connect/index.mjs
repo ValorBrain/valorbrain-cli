@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSyn
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
-import { HOOK_PROTOCOL, credsPath, readCreds, readStdinPayload, removeCreds, runHook, writeCreds } from "./hook.mjs";
+import { HOOK_PROTOCOL, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, writeCreds } from "./hook.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -38,7 +38,7 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: DEFAULT_API, token: null, noBackup: false };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
@@ -448,6 +448,14 @@ async function main() {
 
   const home = homedir();
   const token = args.token || process.env.VALORBRAIN_TOKEN || null;
+
+  // Qa R1 (VAL-195): --status and --remove fetch the manifest from args.api,
+  // whose blind default was the public API — ignoring the api_url that this
+  // same --status prints from ~/.valorbrain/connect.json. With --api omitted,
+  // follow the same chain the hook resolves (resolveCredentials):
+  // VALORBRAIN_API_URL > connect.json api_url > engine config.json engine_url
+  // > public default.
+  if (!args.api) args.api = resolveCredentials({ argv: process.argv.slice(2), env: process.env, home }).api;
 
   let targets = args.harnesses;
   if (targets.length === 0) {

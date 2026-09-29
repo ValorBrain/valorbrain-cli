@@ -54,6 +54,20 @@ const LOCK_STALE_MS = 20_000;
 const CUE_UNSUPPORTED_TTL_MS = 6 * 60 * MIN;
 const STATE_GC_MS = 7 * 24 * 60 * MIN;
 
+// ─── request budget ──────────────────────────────────────────────────────────
+// Harnesses cut a hook at 10s (src/harness/adapters.ts in the engine) and a
+// cold `npx -y` costs ~3.4s (Qa, VAL-195): the old 7s context budget summed to
+// 10.4s, the process got killed mid-request, and the prompt's saved state died
+// with it. Both moments now share the 4s stop ceiling — ~2.5s of margin — and
+// VALORBRAIN_HOOK_TIMEOUT_MS still overrides for slow private networks.
+const CONTEXT_TIMEOUT_MS = 4000;
+const STOP_TIMEOUT_MS = 4000;
+
+/** Network budget for one hook moment (postCue and its legacy fallback). */
+export function requestTimeoutMs(event, env = {}) {
+    return Number(env.VALORBRAIN_HOOK_TIMEOUT_MS) || (event === 'stop' ? STOP_TIMEOUT_MS : CONTEXT_TIMEOUT_MS);
+}
+
 // ─── credentials ─────────────────────────────────────────────────────────────
 
 export function credsPath(home) {
@@ -509,7 +523,7 @@ export async function runHook(argv, deps = {}) {
         return 0;
     }
 
-    const timeoutMs = Number(env.VALORBRAIN_HOOK_TIMEOUT_MS) || (event === 'stop' ? 4000 : 7000);
+    const timeoutMs = requestTimeoutMs(event, env);
     const key = sessionKey(dialect, payload, env);
     const state = loadState(home, key, now);
     const caps = readCaps(home, creds.api);
@@ -533,6 +547,12 @@ export async function runHook(argv, deps = {}) {
             await heal;
             return emit(renderContext(dialect, event, '', payload));
         }
+        // The harness may kill us while the request is in flight (its 10s cut
+        // minus a cold npx). Persist the turn bookkeeping BEFORE the network:
+        // a killed prompt keeps turnStartedAt/awaiting=false on disk, so the
+        // Stop that ends the turn still counts it instead of misreading a
+        // stale awaiting flag as our continuation.
+        saveState(home, key, state, now);
         let context = '';
         let failure = '';
         try {
