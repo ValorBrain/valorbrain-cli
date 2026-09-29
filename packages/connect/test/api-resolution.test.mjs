@@ -153,36 +153,56 @@ test('v1 migration: argv token is saved against the config.json engine, never th
     const saved = JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8'));
     assert.equal(saved.harnesses.kiro.api_url, url);
     assert.equal(saved.harnesses.kiro.token, 'vbm_legacy');
-    // Hooks rewired where kiro loads them (agent config), without the token.
-    const agent = JSON.parse(readFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), 'utf-8'));
-    assert.deepEqual(Object.keys(agent.hooks).sort(), ['agentSpawn', 'stop', 'userPromptSubmit']);
-    assert.match(agent.hooks.userPromptSubmit[0].command, /hook prompt --harness=kiro$/);
-    assert.ok(!JSON.stringify(agent).includes('vbm_legacy'));
+    // Hooks rewired in $HOME (standalone file the V3 engine loads), without
+    // the token — and never inside the project the hook ran in (VAL-224).
+    const hooks = JSON.parse(readFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), 'utf-8'));
+    assert.equal(hooks.version, 'v1');
+    assert.deepEqual(hooks.hooks.map((x) => x.trigger).sort(), ['SessionStart', 'Stop', 'UserPromptSubmit']);
+    assert.match(hooks.hooks[0].action.command, /hook prompt --harness=kiro$/);
+    assert.ok(!JSON.stringify(hooks).includes('vbm_legacy'));
+    assert.equal(existsSync(join(ws, '.kiro')), false, 'self-heal never writes the project dir');
     assert.ok(paths.includes('GET /setup/artifacts'), 'manifest fetched from the resolved engine');
 });
 
-test('install: kiro hooks land in the workspace agent config by default; --scope=user keeps them global', async () => {
+test('install: kiro hooks default to the standalone file in $HOME (v3); legacy is opt-in and mutually exclusive', async () => {
     const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
     const h = home();
     const ws = mkdtempSync(join(tmpdir(), 'vb-connect-ws2-'));
     homes.push(ws);
     mkdirSync(join(h, '.valorbrain'), { recursive: true });
     writeFileSync(join(h, '.valorbrain', 'config.json'), JSON.stringify({ api_key: 'vbm_cfg', engine_url: url }));
+    // A 0.5.1-era agent config of ours in $HOME: installing v3 must remove it,
+    // or a V3 session running the agent fires every event twice.
+    mkdirSync(join(h, '.kiro', 'agents'), { recursive: true });
+    writeFileSync(join(h, '.kiro', 'agents', 'valorbrain.json'), JSON.stringify({
+        name: 'valorbrain',
+        hooks: { agentSpawn: [{ command: 'npx -y @valorbrain/connect hook session-start --harness=kiro' }] },
+    }));
 
     // --api pins the engine to the stub: a fresh token with no --api goes to
     // the public default by design (case b) — never to config.json's base.
     const { code, stdout } = await runCli(['--token', 'vbm_x', '--api', url, '--harness', 'kiro'], h, { cwd: ws });
     assert.equal(code, 0, stdout);
+    const standalone = JSON.parse(readFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), 'utf-8'));
+    assert.equal(standalone.version, 'v1');
+    assert.deepEqual(standalone.hooks.map((x) => x.trigger).sort(), ['SessionStart', 'Stop', 'UserPromptSubmit']);
+    assert.equal(existsSync(join(ws, '.kiro')), false, 'nothing lands in the project by default');
+    assert.equal(existsSync(join(h, '.kiro', 'agents', 'valorbrain.json')), false, 'the other engine mode must not stay active');
+    assert.match(stdout, /--kiro-engine=legacy/); // the escape hatch is printed
+
+    // Legacy opt-in: the agent config replaces the standalone file — the two
+    // never stay active together.
+    const legacy = await runCli(['--token', 'vbm_x', '--api', url, '--harness', 'kiro', '--kiro-engine', 'legacy', '--scope', 'workspace'], h, { cwd: ws });
+    assert.equal(legacy.code, 0, legacy.stdout);
     const agent = JSON.parse(readFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), 'utf-8'));
     assert.equal(agent.name, 'valorbrain');
     assert.deepEqual(Object.keys(agent.hooks).sort(), ['agentSpawn', 'stop', 'userPromptSubmit']);
-    assert.equal(existsSync(join(ws, '.kiro', 'hooks', 'valorbrain.json')), false, 'no dead hooks file in the workspace');
-    assert.equal(existsSync(join(h, '.kiro', 'hooks', 'valorbrain.json')), false, 'no dead hooks file in $HOME');
-    assert.match(stdout, /agent set-default valorbrain/); // the firing condition is printed
+    assert.equal(existsSync(join(h, '.kiro', 'hooks', 'valorbrain.json')), false, 'standalone file removed when legacy is chosen');
 
-    const { code: code2 } = await runCli(['--token', 'vbm_x', '--api', url, '--harness', 'kiro', '--scope=user'], h, { cwd: ws });
-    assert.equal(code2, 0);
-    const globalAgent = JSON.parse(readFileSync(join(h, '.kiro', 'agents', 'valorbrain.json'), 'utf-8'));
-    assert.equal(globalAgent.hooks.userPromptSubmit[0].command.includes('--harness=kiro'), true);
+    // Full uninstall leaves none of our kiro files behind, in either mode.
+    const rm = await runCli(['--remove', '--api', url, '--harness', 'kiro'], h, { cwd: ws });
+    assert.equal(rm.code, 0, rm.stdout);
+    assert.equal(existsSync(join(ws, '.kiro', 'agents', 'valorbrain.json')), false);
+    assert.equal(existsSync(join(h, '.kiro', 'agents', 'valorbrain.json')), false);
     server.close();
 });

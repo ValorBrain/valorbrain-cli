@@ -497,7 +497,7 @@ async function postCue(api, token, body, timeoutMs, fetchImpl) {
  * initialize handshake, a single POST with the `_meta` envelope). Fallback for
  * engines that predate the cue endpoint.
  */
-export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.5.1') {
+export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.5.2') {
     const res = await fetchImpl(`${api}/mcp`, {
         method: 'POST',
         signal: AbortSignal.timeout(timeoutMs),
@@ -582,7 +582,7 @@ export async function runHook(argv, deps = {}) {
     const fetchImpl = deps.fetchImpl ?? ((u, i) => fetch(u, i));
     const out = deps.out ?? ((s) => process.stdout.write(s + '\n'));
     const err = deps.err ?? ((s) => process.stderr.write(`[valorbrain] ${s}\n`));
-    const clientVersion = deps.clientVersion ?? '0.5.1';
+    const clientVersion = deps.clientVersion ?? '0.5.2';
     const payload = deps.payload && typeof deps.payload === 'object' ? deps.payload : {};
 
     const name = argv.find((a) => !a.startsWith('-')) || 'context-surfacing';

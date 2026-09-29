@@ -38,7 +38,7 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false, scope: null };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false, scope: null, kiroEngine: "v3" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
@@ -47,6 +47,8 @@ function parseArgs(argv) {
     else if (a === "--no-backup") out.noBackup = true;
     else if (a === "--scope") out.scope = argv[++i];
     else if (a.startsWith("--scope=")) out.scope = a.slice(8);
+    else if (a === "--kiro-engine") out.kiroEngine = argv[++i];
+    else if (a.startsWith("--kiro-engine=")) out.kiroEngine = a.slice(14);
     else if (a === "--token") out.token = argv[++i];
     else if (a.startsWith("--token=")) out.token = a.slice(8);
     else if (a === "--harness") out.harnesses.push(argv[++i]);
@@ -71,10 +73,17 @@ ${C.bold}@valorbrain/connect${C.off} — wire a CLI agent harness to hosted Valo
 Options
   --token vbm_…     MCP token (Settings → MCP Tokens in the app). Or set VALORBRAIN_TOKEN.
   --api URL         engine base URL (default ${DEFAULT_API})
-  --scope what      where harness-local files go: "workspace" (this project) or
-                    "user" ($HOME). kiro defaults to workspace — kiro-cli only
-                    fires hooks from an agent config in .kiro/agents/, which is
-                    per project; every other harness defaults to user.
+  --scope what      where harness-local files go: "user" ($HOME, the default)
+                    or "workspace" (this project).
+  --kiro-engine e   which kiro engine your sessions run. "v3" (default —
+                    kiro-cli --v3, and the default of Kiro CLI 3.0): hooks as
+                    the standalone file ~/.kiro/hooks/valorbrain.json, firing
+                    with no agent setup. "legacy": hooks inside the agent
+                    config ~/.kiro/agents/valorbrain.json, which kiro-cli 2.x
+                    fires only when the session runs the agent. Installing one
+                    mode removes the other's files — the two never fire
+                    together (a V3 session running the agent would fire every
+                    event twice).
   --no-backup       skip .valorbrain-bak copies
 
 Writes, per harness: the MCP server entry (so the tools exist), an instructions
@@ -228,28 +237,42 @@ async function fetchManifest(api, harness) {
 /** Scope names accepted by --scope ("global" is an alias of "user"). */
 const SCOPES = new Set(["workspace", "user", "global"]);
 
-/** kiro defaults to workspace; only an explicit user/global keeps it in $HOME. */
-function kiroWantsWorkspace(scope) {
-  return scope === "workspace" || scope == null;
-}
-
 /**
- * kiro-cli discovers hooks in exactly one place: the `hooks` key of an AGENT
- * config (`.kiro/agents/*.json` in the workspace, or `~/.kiro/agents/*.json`).
- * A `hooks/valorbrain.json` file — at user scope or in the workspace — is
- * never loaded (verified live against kiro-cli 2.20.1: agentSpawn and
- * userPromptSubmit fire only from the agent config, and only when the session
- * runs that agent: `--agent valorbrain` or `kiro-cli agent set-default`).
+ * kiro loads lifecycle hooks from exactly one of two places, depending on the
+ * ENGINE that runs the session — never from both (VAL-224):
  *
- * The engine renders a v1 hooks FILE (`~/.kiro/hooks/valorbrain.json` —
- * hosted manifests are rendered with home "~"); this map re-targets that
- * artifact to where kiro actually loads it and re-shapes the contents into an
- * agent config. Contents that don't parse throw: planFor reports the artifact
- * as failed, never a silently dead file. Unknown v1 triggers are dropped.
+ *   - V3 (`kiro-cli --v3`, the default of Kiro CLI 3.0) loads STANDALONE hook
+ *     files from `~/.kiro/hooks/` and `<workspace>/.kiro/hooks/` (verified live
+ *     in the 2.20.1 bundle: acp-server.js logs "v2 hooks loaded N standalone
+ *     hooks from .kiro/hooks/" and registers them as "standalone-file"). The
+ *     schema it validates is exactly the v1 file the hosted manifest already
+ *     renders: {version:"v1", hooks:[{name, trigger, action, timeout?}]}.
+ *   - The LEGACY engine never reads those files; it fires hooks from the
+ *     `hooks` key of an AGENT config (`.kiro/agents/*.json`), and only when
+ *     the session runs that agent (`--agent valorbrain` / `agent set-default`;
+ *     verified live against kiro-cli 2.20.1, VAL-195).
+ *
+ * `--kiro-engine` picks which artifact the installer writes; the default
+ * follows where kiro is going (v3). Installing one mode must remove the
+ * other's files: in a V3 session running the agent, standalone-file and
+ * agent-profile hooks BOTH register, and every event fires twice.
  */
-export function scopedManifest(manifest, { harness, scope, home, cwd = process.cwd() }) {
+export function scopedManifest(manifest, { harness, scope, home, cwd = process.cwd(), kiroEngine = "v3" }) {
   if (harness !== "kiro") return manifest;
-  const dir = kiroWantsWorkspace(scope) ? join(cwd, ".kiro", "agents") : join(home, ".kiro", "agents");
+  if (kiroEngine !== "legacy") {
+    // Standalone: the engine-rendered file already matches the V3 loader's
+    // schema — pass it through untouched. Only an explicit workspace scope
+    // moves it into the project.
+    if (scope !== "workspace") return manifest;
+    return {
+      ...manifest,
+      artifacts: (manifest.artifacts || []).map((a) =>
+        a.kind === "hooks" && String(a.path).startsWith("~/.kiro/")
+          ? { ...a, path: join(cwd, String(a.path).slice(2)) }
+          : a),
+    };
+  }
+  const dir = scope === "workspace" ? join(cwd, ".kiro", "agents") : join(home, ".kiro", "agents");
   const artifacts = (manifest.artifacts || []).flatMap((a) => {
     if (a.kind !== "hooks" || !String(a.path).startsWith("~/.kiro/")) return [a];
     const v1 = JSON.parse(a.contents);
@@ -285,6 +308,63 @@ const KIRO_HOOK_EVENTS = { SessionStart: "agentSpawn", UserPromptSubmit: "userPr
 
 /** Full built-in toolset (agent_config.json.example) — our agent must not shrink the user's session. */
 const KIRO_AGENT_TOOLS = ["read", "write", "shell", "aws", "report", "introspect", "knowledge", "thinking", "todo", "delegate", "grep", "glob"];
+
+/** The exact file of the OTHER engine mode: installing one must remove it. */
+const KIRO_OTHER_MODE_FILES = {
+  v3: [".kiro/agents/valorbrain.json"],   // legacy agent config
+  legacy: [".kiro/hooks/valorbrain.json"], // v3 standalone file
+};
+
+function isOurStandaloneHooks(raw) {
+  try {
+    const j = JSON.parse(raw);
+    return j?.version === "v1" && Array.isArray(j.hooks) && JSON.stringify(j).includes("@valorbrain/connect");
+  } catch {
+    return false;
+  }
+}
+
+function isOurAgentConfig(raw) {
+  try {
+    const j = JSON.parse(raw);
+    return j?.name === "valorbrain" && JSON.stringify(j).includes("@valorbrain/connect");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Files of the OTHER kiro mode that are OURS and would keep firing beside the
+ * mode being installed. Only the two exact paths we manage, in $HOME and the
+ * project — a customer's own file (or a foreign file that happens to sit on
+ * the path) is never touched.
+ */
+export function staleKiroFiles({ home, cwd = process.cwd(), kiroEngine = "v3", exists = existsSync, read = (p) => readFileSync(p, "utf-8") }) {
+  const ours = kiroEngine === "legacy" ? isOurStandaloneHooks : isOurAgentConfig;
+  const out = new Set();
+  for (const base of KIRO_OTHER_MODE_FILES[kiroEngine] ?? []) {
+    for (const root of new Set([home, cwd])) {
+      const p = join(root, base);
+      try {
+        if (exists(p) && ours(read(p))) out.add(p);
+      } catch { /* unreadable → not ours */ }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Which kiro mode is installed, from the files on disk — the self-heal must
+ * keep whatever the customer chose, and the files are the only record of it.
+ * An agent config of ours means legacy opt-in; anything else is v3.
+ */
+export function detectKiroMode(home, exists = existsSync, read = (p) => readFileSync(p, "utf-8")) {
+  const p = join(home, ".kiro", "agents", "valorbrain.json");
+  try {
+    if (exists(p) && isOurAgentConfig(read(p))) return "legacy";
+  } catch { /* v3 */ }
+  return "v3";
+}
 
 /**
  * Merge do config YAML do Hermes (`~/.hermes/config.yaml`). O arquivo é do
@@ -553,6 +633,10 @@ async function main() {
     console.error(`--scope must be one of: ${[...SCOPES].join(", ")}`);
     return 2;
   }
+  if (args.kiroEngine !== "v3" && args.kiroEngine !== "legacy") {
+    console.error(`--kiro-engine must be "v3" or "legacy"`);
+    return 2;
+  }
 
   const home = homedir();
   const token = args.token || process.env.VALORBRAIN_TOKEN || null;
@@ -590,7 +674,7 @@ async function main() {
   for (const harness of targets) {
     let manifest;
     try {
-      manifest = scopedManifest(await fetchManifest(apiFor(harness), harness), { harness, scope: args.scope, home });
+      manifest = scopedManifest(await fetchManifest(apiFor(harness), harness), { harness, scope: args.scope, home, kiroEngine: args.kiroEngine });
     } catch (err) {
       console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
       failed++;
@@ -604,6 +688,10 @@ async function main() {
     }
 
     if (args.status) {
+      if (harness === "kiro") {
+        const mode = detectKiroMode(home);
+        console.log(`  ${C.dim}on disk: ${mode === "legacy" ? "legacy (agent config)" : "v3 (standalone ~/.kiro/hooks)"} — switch with --kiro-engine=${mode === "legacy" ? "v3" : "legacy"}${C.off}`);
+      }
       for (const r of statusFor(manifest, home)) {
         console.log(`  ${icon[r.state] ?? " "} ${r.kind.padEnd(5)} ${r.detail}`);
       }
@@ -638,6 +726,30 @@ async function main() {
     const changes = planFor(manifest, token, home, args.remove);
     const res = apply(changes, args);
     failed += res.failed;
+    // kiro fires hooks from exactly one file kind per engine (scopedManifest
+    // doc): a file of the other mode left on disk double-fires every event in
+    // a V3 session running the agent. Only OUR files go; paths planFor just
+    // handled (this mode's artifact, or --remove's whole manifest) are not
+    // reported twice.
+    if (harness === "kiro") {
+      const handled = new Set(changes.map((c) => c.path));
+      const stale = args.remove
+        ? [...staleKiroFiles({ home, kiroEngine: "v3" }), ...staleKiroFiles({ home, kiroEngine: "legacy" })]
+        : staleKiroFiles({ home, kiroEngine: args.kiroEngine });
+      for (const p of new Set(stale)) {
+        if (handled.has(p)) continue;
+        if (args.dryRun) {
+          console.log(`  ${C.green}→${C.off} delete stale kiro hook file (the other engine mode must not stay active)`);
+          console.log(`    ${C.dim}${p}${C.off}`);
+          continue;
+        }
+        try {
+          unlinkSync(p);
+          console.log(`  ${C.green}✓${C.off} delete stale kiro hook file (the other engine mode must not stay active)`);
+          console.log(`    ${C.dim}${p}${C.off}`);
+        } catch { /* fail-open */ }
+      }
+    }
     if (args.remove && !args.dryRun && removeCreds(home, harness)) {
       console.log(`  ${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel} [${harness}]${C.off}`);
     }
@@ -653,10 +765,13 @@ async function main() {
       }
       for (const n of manifest.notes ?? []) console.log(`  ${C.dim}note: ${n}${C.off}`);
       if (manifest.hooks_available && harness === "kiro") {
-        const where = kiroWantsWorkspace(args.scope)
-          ? join(process.cwd(), ".kiro", "agents", "valorbrain.json")
-          : join(home, ".kiro", "agents", "valorbrain.json");
-        console.log(`  ${C.dim}note: kiro only fires hooks from an agent config (${where}) — run "kiro-cli agent set-default valorbrain" (or chat with --agent valorbrain) in this project so they fire${C.off}`);
+        const sub = args.kiroEngine === "legacy" ? "agents" : "hooks";
+        const where = args.scope === "workspace"
+          ? join(process.cwd(), ".kiro", sub, "valorbrain.json")
+          : join(home, ".kiro", sub, "valorbrain.json");
+        console.log(args.kiroEngine === "legacy"
+          ? `  ${C.dim}note: legacy engine — hooks fire only when the session runs the agent: "kiro-cli chat --agent valorbrain" or "kiro-cli agent set-default valorbrain" (${where})${C.off}`
+          : `  ${C.dim}note: V3 engine — hooks fire in "kiro-cli --v3" and Kiro CLI 3.0 sessions with no agent setup (${where}); sessions on the legacy engine need --kiro-engine=legacy${C.off}`);
       }
     }
     console.log();
@@ -686,7 +801,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.5.1";
+const CLIENT_VERSION = "0.5.2";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -868,9 +983,13 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
     if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
     state.lastHealAt = Date.now();
     writeHealState(home, state); // throttle mesmo em falha: hook roda a cada prompt
-    // Scope igual ao install: kiro é workspace por default, e o cwd do hook é
-    // o projeto do agente — o self-heal reescreve o agent config no projeto.
-    const manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home });
+    // Scope: kiro cai em $HOME nos dois modos de engine (arquivo standalone ou
+    // agent config do legado) — o cwd de um hook é o projeto do agente, e o
+    // self-heal nunca escreve lá (VAL-224). detectKiroMode mantém o modo que o
+    // cliente instalou; arquivos do OUTRO modo em $HOME são removidos abaixo,
+    // porque uma sessão V3 rodando o agente dispararia cada evento duas vezes.
+    const kiroMode = id === "kiro" ? detectKiroMode(home) : "v3";
+    const manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
     const contractDrift = Boolean(expected && installed !== expected);
@@ -894,6 +1013,13 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
             ? `[valorbrain] contrato v${installed ?? "?"} -> v${expected} (${wrote} arquivo(s)) — vale no próximo carregamento`
             : `[valorbrain] hooks atualizados (protocolo v${manifest?.hook_protocol ?? 1}, ${wrote} arquivo(s)) — vale no próximo carregamento`,
         );
+      }
+    }
+    // Só $HOME (cwd:home dedupa as raízes): o self-heal não cria — nem apaga —
+    // arquivo de projeto; a troca de modo em projeto é do install explícito.
+    if (id === "kiro") {
+      for (const p of staleKiroFiles({ home, cwd: home, kiroEngine: kiroMode })) {
+        try { unlinkSync(p); } catch { /* fail-open */ }
       }
     }
     await declareContract(api, token, id, home, manifest);
