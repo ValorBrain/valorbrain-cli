@@ -20,10 +20,11 @@
  * republishing when the rules text changes.
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
+import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -37,7 +38,7 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: DEFAULT_API, token: null, noBackup: false };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
@@ -70,9 +71,13 @@ Options
   --api URL         engine base URL (default ${DEFAULT_API})
   --no-backup       skip .valorbrain-bak copies
 
-Writes two things per harness: the MCP server entry (so the tools exist) and an
-instructions file (so the agent knows to consult memory before answering). Files
-you own are edited between ${BLOCK_BEGIN} markers; everything else is preserved.
+Writes, per harness: the MCP server entry (so the tools exist), an instructions
+file (so the agent knows to consult memory before answering) and, where the
+harness has hooks, lifecycle hooks: context at session start and on each prompt,
+and every few turns a short memory checkpoint the agent itself records through
+MCP. Hooks read the token from ~/.valorbrain/connect.json (0600) — never from
+the command line. Files you own are edited between ${BLOCK_BEGIN} markers;
+everything else is preserved.
 `;
 
 // ── harness detection ───────────────────────────────────────────────────────
@@ -203,7 +208,10 @@ function mergeToml(existingRaw, renderedRaw, remove) {
 // ── plan / apply ────────────────────────────────────────────────────────────
 
 async function fetchManifest(api, harness) {
-  const url = `${api.replace(/\/$/, "")}/setup/artifacts?agent=${encodeURIComponent(harness)}`;
+  // `hooks=2`: this client speaks hook protocol v2 (ADR-058). An engine that
+  // predates it ignores the parameter and answers the v1 manifest, which this
+  // client still serves (legacy names, `--token=` on the command line).
+  const url = `${api.replace(/\/$/, "")}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}`;
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.json();
@@ -255,10 +263,14 @@ function mergeYaml(existingRaw, renderedRaw, remove) {
 
 function planFor(manifest, token, home, remove) {
   const changes = [];
+  // Two artifacts can share a file (Gemini keeps MCP servers and hooks in
+  // settings.json): each must build on what the previous one will write, or
+  // the second write reverts the first.
+  const planned = new Map();
   for (const artifact of manifest.artifacts) {
     const path = expand(artifact.path, home);
     if (!path) continue;
-    const before = existsSync(path) ? readFileSync(path, "utf-8") : null;
+    const before = planned.has(path) ? planned.get(path) : existsSync(path) ? readFileSync(path, "utf-8") : null;
     // Substitute the real token, and expand `~` inside file contents too
     // (OpenCode stores an absolute instructions path in its config).
     const rendered = artifact.contents
@@ -292,12 +304,14 @@ function planFor(manifest, token, home, remove) {
     }
     if (remove && after !== null && after.trim() === "") after = null;
     changes.push({ artifact, path, before, after, changed: after !== before });
+    planned.set(path, after);
   }
   return changes;
 }
 
 function apply(changes, { dryRun, noBackup }) {
   let wrote = 0, failed = 0;
+  const backedUp = new Set();
   for (const c of changes) {
     const tag = c.artifact.best_effort ? ` ${C.yellow}[delivery unverified]${C.off}` : "";
     if (c.error) {
@@ -315,7 +329,12 @@ function apply(changes, { dryRun, noBackup }) {
     console.log(`    ${C.dim}${c.path}${C.off}`);
     if (dryRun) continue;
     try {
-      if (c.before !== null && !noBackup) writeFileSync(`${c.path}.valorbrain-bak`, c.before);
+      // Once per file: a chained change's `before` is the previous change's
+      // output, and backing that up would overwrite the copy of the original.
+      if (c.before !== null && !noBackup && !backedUp.has(c.path)) {
+        writeBackup(c.path, c.before);
+        backedUp.add(c.path);
+      }
       if (c.after === null) {
         if (existsSync(c.path)) unlinkSync(c.path);
       } else {
@@ -331,10 +350,44 @@ function apply(changes, { dryRun, noBackup }) {
   return { wrote, failed };
 }
 
+/**
+ * Which engine this command talks to for one harness, and why — printed by the
+ * installer, because "which API did that token go to?" must never be a guess.
+ *
+ *   --api > VALORBRAIN_API_URL > the base saved with THIS token (any harness)
+ *   > [no token given] this harness's saved base, then the CLI's config.json
+ *   > public default.
+ *
+ * A new token never inherits the base saved for a different token: that base
+ * belongs to another engine, possibly another tenant.
+ */
+export function resolveInstallApi({ flag, env = {}, home, harness, token }) {
+  const norm = (u) => String(u).trim().replace(/\/+$/, "").replace(/\/mcp$/, "");
+  if (flag) return { api: norm(flag), from: "--api" };
+  if (env.VALORBRAIN_API_URL) return { api: norm(env.VALORBRAIN_API_URL), from: "VALORBRAIN_API_URL" };
+  if (token) {
+    const saved = savedApiForToken(home, token);
+    return saved ? { api: saved, from: "saved with this token" } : { api: "https://valorbrain-api.valor.digital", from: "default" };
+  }
+  const r = resolveCredentials({ argv: [], env, home, harness });
+  const from = r.source === "connect" ? "saved credentials" : r.source === "config" ? "CLI config.json" : "default";
+  return { api: r.api, from };
+}
+
+/**
+ * Backups are private: a v1 hook file carries the token on its command line,
+ * and a harness config carries it in its MCP entry.
+ */
+function writeBackup(path, contents) {
+  const bak = `${path}.valorbrain-bak`;
+  writeFileSync(bak, contents, { mode: 0o600 });
+  try { chmodSync(bak, 0o600); } catch { /* not supported on this fs */ }
+}
+
 /** True when a hook entry was written by us (hosted client or local binary). */
 function isOurHookEntry(entry) {
   const s = JSON.stringify(entry ?? "");
-  return s.includes("@valorbrain/connect") || s.includes("valorbrain hook");
+  return s.includes("@valorbrain/connect") || s.includes("valorbrain hook") || s.includes("valorbrain-connect hook");
 }
 
 /**
@@ -357,6 +410,13 @@ function mergeHooksJson(existingRaw, renderedRaw, remove) {
     return JSON.stringify(rendered, null, 2);
   }
   if (!existing.hooks || typeof existing.hooks !== "object") existing.hooks = {};
+  // Top-level keys the harness schema requires (Cursor's `version: 1`) come
+  // with the rendered file; never overwrite the customer's own value.
+  if (!remove) {
+    for (const [k, v] of Object.entries(rendered)) {
+      if (k !== "hooks" && !(k in existing)) existing[k] = v;
+    }
+  }
   for (const [event, entries] of Object.entries(renderedHooks)) {
     const kept = Array.isArray(existing.hooks[event])
       ? existing.hooks[event].filter((e) => !isOurHookEntry(e))
@@ -390,6 +450,18 @@ function statusFor(manifest, home) {
         state: ok ? (tokenSet ? "ok" : "drift") : "missing",
         detail: ok ? (tokenSet ? "registered" : "registered but token is still the placeholder") : "not registered",
       });
+    } else if (artifact.kind === "hooks") {
+      const ours = body.includes("@valorbrain/connect") || body.includes("valorbrain-connect");
+      const legacy = /--token=/.test(body);
+      rows.push({
+        kind: "hooks",
+        state: !ours ? "missing" : legacy ? "drift" : "ok",
+        detail: !ours
+          ? "no valorbrain hooks"
+          : legacy
+            ? "hook protocol v1 (token on the command line) — run the installer again to migrate"
+            : "hook protocol v2",
+      });
     } else {
       const m = body.match(/valorbrain-contract:\s*v(\d+)/);
       rows.push({
@@ -411,7 +483,18 @@ async function main() {
   const home = homedir();
   const token = args.token || process.env.VALORBRAIN_TOKEN || null;
 
-  let targets = args.harnesses;
+  // Qa R1 (VAL-195): --status and --remove fetch the manifest from the API,
+  // whose blind default was the public one — ignoring the api_url that this
+  // same --status prints from ~/.valorbrain/connect.json. With --api omitted,
+  // each harness follows the chain its own hook resolves (resolveCredentials,
+  // per harness): VALORBRAIN_API_URL > that harness's connect.json api_url >
+  // CLI config.json engine_url > public default.
+  const apiFor = (harness) => resolveInstallApi({ flag: args.api, env: process.env, home, harness, token }).api;
+
+  // Canonical ids everywhere (the engine renders hook commands with them, and
+  // credentials are keyed by them): `--harness gemini` must store the entry
+  // the `--harness=gemini-cli` hook will read.
+  let targets = args.harnesses.map(canonicalHarness);
   if (targets.length === 0) {
     targets = detectInstalled(home);
     if (targets.length === 0) {
@@ -428,11 +511,12 @@ async function main() {
 
   const icon = { ok: `${C.green}●${C.off}`, drift: `${C.yellow}◐${C.off}`, missing: `${C.red}○${C.off}` };
   let failed = 0;
+  const credsLabel = credsPath(home).replace(home, "~");
 
   for (const harness of targets) {
     let manifest;
     try {
-      manifest = await fetchManifest(args.api, harness);
+      manifest = await fetchManifest(apiFor(harness), harness);
     } catch (err) {
       console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
       failed++;
@@ -440,22 +524,53 @@ async function main() {
     }
 
     console.log(`${C.bold}${manifest.name}${C.off} ${C.dim}(${manifest.harness}, contract v${manifest.contract_version})${C.off}`);
+    {
+      const r = resolveInstallApi({ flag: args.api, env: process.env, home, harness, token });
+      console.log(`  ${C.dim}engine ${r.api} (${r.from})${C.off}`);
+    }
 
     if (args.status) {
       for (const r of statusFor(manifest, home)) {
         console.log(`  ${icon[r.state] ?? " "} ${r.kind.padEnd(5)} ${r.detail}`);
       }
+      if (manifest.hooks_available) {
+        const saved = readCreds(home, harness);
+        console.log(saved
+          ? `  ${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
+          : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until the installer runs with --token`);
+      }
       console.log();
       continue;
+    }
+
+    // Hooks read the token from this harness's entry (ADR-058), written before
+    // any hook artifact so a freshly wired hook never runs without it. One
+    // entry per harness: two harnesses may belong to two tenants.
+    if (!args.remove && token && manifest.hooks_available) {
+      if (args.dryRun) {
+        console.log(`  ${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+      } else {
+        try {
+          writeCreds(home, { api: apiFor(harness), token, harness });
+          console.log(`  ${C.green}✓${C.off} hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+        } catch (err) {
+          console.log(`  ${C.red}✗${C.off} hook credentials: ${err.message}`);
+          failed++;
+          continue; // never wire hooks that would have nothing to read
+        }
+      }
     }
 
     const changes = planFor(manifest, token, home, args.remove);
     const res = apply(changes, args);
     failed += res.failed;
+    if (args.remove && !args.dryRun && removeCreds(home, harness)) {
+      console.log(`  ${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel} [${harness}]${C.off}`);
+    }
 
     // Instalou/atualizou: informa o engine do estado deste harness (fail-open).
     if (!args.remove && !args.dryRun) {
-      await declareContract(args.api, token, harness, home, manifest);
+      await declareContract(apiFor(harness), token, harness, home, manifest);
     }
 
     if (!args.remove) {
@@ -467,14 +582,19 @@ async function main() {
     console.log();
   }
 
+  // Full uninstall (targets were detected, not named): the credential file goes
+  // too, including entries of harnesses no longer on this machine.
+  if (args.remove && !args.dryRun && args.harnesses.length === 0 && removeCreds(home)) {
+    console.log(`${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel}${C.off}`);
+  }
   if (args.dryRun) console.log(`${C.yellow}Dry run — nothing was written.${C.off}`);
-  else if (!args.status) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
+  else if (!args.status && !args.remove) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
 
   return failed > 0 ? 1 : 0;
 }
 
-// Dispatch happens at the very bottom of the file, once the hook client below is
-// defined: `connect hook <name>` runs the hook client, anything else installs.
+// Dispatch happens at the very bottom of the file: `connect hook <name>` runs the
+// hook client (hook.mjs), anything else installs.
 
 
 // ─── contrato: self-heal + declaração ───────────────────────────────────────
@@ -486,7 +606,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.4.1";
+const CLIENT_VERSION = "0.5.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -538,6 +658,11 @@ function installedContractVersion(manifest, home) {
   return null;
 }
 
+/** Protocolo de hook do manifesto instalado: 2 só quando o engine atendeu `hooks=2`. */
+function manifestHookProtocol(manifest) {
+  return Number(manifest?.hook_protocol) === 2 ? 2 : 1;
+}
+
 /** Declara no engine o que este harness tem. Fail-open; sem token não faz nada. */
 async function declareContract(api, token, harness, home, manifest) {
   if (!token || !harness) return;
@@ -564,6 +689,7 @@ async function declareContract(api, token, harness, home, manifest) {
           contract_version: installedContractVersion(m, home),
           connector: "connect",
           self_heal: true,
+          hook_protocol: manifestHookProtocol(m),
         },
       }),
       signal: AbortSignal.timeout(DECLARE_TIMEOUT_MS),
@@ -576,10 +702,14 @@ async function declareContract(api, token, harness, home, manifest) {
 /** Aplica mudanças sem imprimir nada (no hook, stdout é o canal de contexto). */
 function applyQuiet(changes) {
   let wrote = 0;
+  const backedUp = new Set();
   for (const c of changes) {
     if (c.error || !c.changed) continue;
     try {
-      if (c.before !== null) writeFileSync(`${c.path}.valorbrain-bak`, c.before);
+      if (c.before !== null && !backedUp.has(c.path)) {
+        writeBackup(c.path, c.before);
+        backedUp.add(c.path);
+      }
       if (c.after === null) {
         if (existsSync(c.path)) unlinkSync(c.path);
       } else {
@@ -624,11 +754,36 @@ function detectHarness(home) {
   return "";
 }
 
-async function maybeSelfHeal(api, token, harness, home) {
+async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
   if (!token) return;
   const id = harness || detectHarness(home);
   if (!id) return;
   try {
+    // Migração v1 → v2 (ADR-058): o hook v1 recebe o token pelo argv; a entrada
+    // DESTE harness no connect.json é gravada ANTES de os hooks serem
+    // reescritos sem token — nunca existe hook v2 sem de onde ler a credencial.
+    // Token vindo de env não é persistido (quem usa env escolheu env), e uma
+    // entrada existente com OUTRO token nunca é sobrescrita: aí não se migra.
+    let canMigrateHooks = true;
+    if (credsSource === "argv" && !harness) {
+      // Hook commands from before `--harness` existed: the harness would be a
+      // guess (detectHarness), and writing this token under a guessed id
+      // cross-wires tenants. No credential write, no hook migration.
+      canMigrateHooks = false;
+    } else if (credsSource === "argv") {
+      const saved = readCreds(home, id);
+      if (!saved) {
+        try {
+          writeCreds(home, { api, token, harness: id });
+        } catch {
+          canMigrateHooks = false;
+        }
+      } else if (saved.token !== token) {
+        canMigrateHooks = false;
+      }
+    } else if (credsSource !== "connect") {
+      canMigrateHooks = false; // env/config: nada garante que o hook v2 terá credencial
+    }
     const state = readHealState(home);
     if (state.lastHealAt && Date.now() - state.lastHealAt < HEAL_INTERVAL_MS) return;
     state.lastHealAt = Date.now();
@@ -636,17 +791,27 @@ async function maybeSelfHeal(api, token, harness, home) {
     const manifest = await fetchManifest(api, id);
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
-    if (expected && installed !== expected) {
-      const changes = planFor(manifest, token, home, false).filter(
-        (c) => c.changed && !c.error && c.artifact.kind !== "mcp",
-      );
-      if (changes.length > 0) {
-        const wrote = applyQuiet(changes);
-        if (wrote > 0) {
-          console.error(
-            `[valorbrain] contrato v${installed ?? "?"} -> v${expected} (${wrote} arquivo(s)) — vale no próximo carregamento`,
-          );
-        }
+    const contractDrift = Boolean(expected && installed !== expected);
+    // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
+    // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
+    // token do heal — para dentro da mudança de hooks.
+    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
+      .filter((c) => c.changed && !c.error);
+    // Contrato em drift: reaplica regras + hooks. Sem drift de contrato, só hooks
+    // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta.
+    // O Codex fica fora da migração automática: comando novo exige re-trust
+    // manual em /hooks, e migrar sozinho desligaria o recall em silêncio.
+    const hooksOk = (c) => c.artifact.kind !== "hooks" || (canMigrateHooks && !(id === "codex" && !contractDrift));
+    const changes = (contractDrift ? planned : planned.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
+      .filter(hooksOk);
+    if (changes.length > 0) {
+      const wrote = applyQuiet(changes);
+      if (wrote > 0) {
+        console.error(
+          contractDrift
+            ? `[valorbrain] contrato v${installed ?? "?"} -> v${expected} (${wrote} arquivo(s)) — vale no próximo carregamento`
+            : `[valorbrain] hooks atualizados (protocolo v${manifest?.hook_protocol ?? 1}, ${wrote} arquivo(s)) — vale no próximo carregamento`,
+        );
       }
     }
     await declareContract(api, token, id, home, manifest);
@@ -655,219 +820,47 @@ async function maybeSelfHeal(api, token, harness, home) {
   }
 }
 
-// ─── hook client ─────────────────────────────────────────────────────────────
-//
-// ADR-009 layer 3 (automatic context injection) required a local engine binary:
-// hooks shell out to `valorbrain hook <name>`. Hosted customers have no binary,
-// so they got layers 1 and 2 and nothing else — the agent had to remember to ask.
-// Measured consequence of relying on that: 3% declared utilisation.
-//
-// This is layer 3 over HTTP. The harness invokes this file as a hook, it reads the
-// harness's JSON payload on stdin, asks the hosted engine to assemble context for
-// that prompt, and writes it back in the dialect the harness expects.
-//
-// It stays deliberately dumb: one request, a hard timeout, and silence on any
-// failure. A hook that breaks a prompt is worse than a hook that adds nothing, so
-// every error path exits 0 with empty output.
-
-const HOOK_TIMEOUT_MS = Number(process.env.VALORBRAIN_HOOK_TIMEOUT_MS || 8000);
-
-/** Prompt text, under whichever key the calling harness uses. */
-function readPromptFrom(payload) {
-    if (!payload || typeof payload !== 'object') return '';
-    for (const key of ['prompt', 'user_prompt', 'userPrompt', 'message', 'query', 'text']) {
-        const v = payload[key];
-        if (typeof v === 'string' && v.trim()) return v;
-    }
-    return '';
-}
-
-async function readStdin() {
-    if (process.stdin.isTTY) return '';
-    const chunks = [];
-    for await (const chunk of process.stdin) chunks.push(chunk);
-    const raw = Buffer.concat(chunks).toString('utf-8').trim();
-    if (!raw) return '';
-    try {
-        return JSON.parse(raw);
-    } catch {
-        return '';
-    }
-}
-
-/**
- * Call one MCP tool over Streamable HTTP without an SDK.
- *
- * The 2026-07-28 wire makes this possible in a dependency-free script: there is no
- * `initialize` handshake to perform and no session to keep, so a single POST
- * carrying the `_meta` envelope is a complete exchange. The same call on the 2025
- * wire would have needed a handshake first.
- */
-async function callTool(api, token, name, args, signal) {
-    const url = `${api.replace(/\/$/, '')}/mcp`;
-    const body = {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tools/call',
-        params: {
-            name,
-            arguments: args,
-            _meta: {
-                'io.modelcontextprotocol/protocolVersion': '2026-07-28',
-                'io.modelcontextprotocol/clientInfo': { name: process.env.VALORBRAIN_HOOK_CLIENT || 'valorbrain-connect', version: '0.1.0' },
-                'io.modelcontextprotocol/clientCapabilities': {}
-            }
-        }
+/** Did our hook entries change, as opposed to the file's formatting? */
+function hookEntriesChanged(change) {
+  if (change.before === null || change.after === null) return change.before !== change.after;
+  try {
+    const ours = (raw) => {
+      const cfg = JSON.parse(raw);
+      const hooks = cfg?.hooks;
+      if (Array.isArray(hooks)) return JSON.stringify(hooks.filter(isOurHookEntry)); // Kiro v1 file
+      if (!hooks || typeof hooks !== "object") return "";
+      const out = {};
+      for (const [event, entries] of Object.entries(hooks)) {
+        const mine = Array.isArray(entries) ? entries.filter(isOurHookEntry) : [];
+        if (mine.length) out[event] = mine;
+      }
+      return JSON.stringify(out);
     };
-    const res = await fetch(url, {
-        method: 'POST',
-        signal,
-        headers: {
-            'content-type': 'application/json',
-            accept: 'application/json, text/event-stream',
-            authorization: `Bearer ${token}`,
-            // SEP-2243 standard headers. `Mcp-Name` carries the tool name on a
-            // tools/call — the server rejects a mismatch with -32020, which is how
-            // a malformed caller finds out immediately instead of silently.
-            'MCP-Protocol-Version': '2026-07-28',
-            'Mcp-Method': 'tools/call',
-            'Mcp-Name': name
-        },
-        body: JSON.stringify(body)
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const text = await res.text();
-    // The endpoint answers plain JSON for modern exchanges, but accept SSE framing
-    // too rather than depending on which one a given deployment emits.
-    const payload = text.startsWith('{')
-        ? text
-        : (text.split('\n').find((l) => l.startsWith('data:')) || '').slice(5).trim();
-    if (!payload) throw new Error('empty response');
-    const parsed = JSON.parse(payload);
-    if (parsed.error) throw new Error(parsed.error.message || 'tool error');
-    return parsed.result;
+    return ours(change.before) !== ours(change.after);
+  } catch {
+    // Not JSON (OpenCode plugin source): the file is ours, compare bytes.
+    return change.before !== change.after;
+  }
 }
 
-/** Hooks that produce context, and the tool that produces it for each. */
-const CONTEXT_HOOKS = new Set(['context-surfacing', 'session-bootstrap', 'memory-prepare']);
-
-/**
- * Hooks de EXTRAÇÃO (Stop/PreCompact). O cliente não tem o binário, então o
- * engine roda o hook com o tenant do token — o cliente só manda o transcript.
- * Não injetam contexto: o contrato é silêncio.
- */
-const EXTRACTION_HOOKS = new Set([
-    'decision-extractor', 'episode-extractor', 'handoff-generator',
-    'feedback-loop', 'precompact-extract', 'staleness-check',
-]);
-const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
-/** Teto abaixo do budget do harness (Stop=30s): se estourar, o engine segue. */
-const EXTRACTION_TIMEOUT_MS = 20_000;
-
-async function runExtractionHook(api, token, name, payload) {
-    const input = {
-        sessionId: payload?.session_id || payload?.sessionId,
-        prompt: payload?.prompt,
-        hookEventName: payload?.hook_event_name || payload?.hookEventName,
-        workingDir: payload?.working_dir || payload?.workingDir,
-        lastAssistantMessage: payload?.last_assistant_message || payload?.lastAssistantMessage,
-    };
-    let transcript = '';
-    const tp = payload?.transcript_path || payload?.transcriptPath;
-    if (tp && existsSync(tp)) {
-        try {
-            const size = statSync(tp).size;
-            transcript = size > MAX_TRANSCRIPT_BYTES
-                ? readFileSync(tp, 'utf-8').slice(0, MAX_TRANSCRIPT_BYTES)
-                : readFileSync(tp, 'utf-8');
-        } catch {
-            transcript = '';
-        }
-    }
-    const res = await fetch(`${api.replace(/\/$/, '')}/api/v1/hooks/run`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
-        body: JSON.stringify({ hook: name, input, transcript }),
-        signal: AbortSignal.timeout(EXTRACTION_TIMEOUT_MS),
-    });
-    return res.ok;
-}
-
-async function runHook(argv) {
-    const name = argv.find((a) => !a.startsWith('-')) || 'context-surfacing';
-    const format = argv.find((a) => a.startsWith('--format='))?.slice(9) || 'text';
-    const api = argv.find((a) => a.startsWith('--api='))?.slice(6) || DEFAULT_API;
-    const token = argv.find((a) => a.startsWith('--token='))?.slice(8) || process.env.VALORBRAIN_TOKEN;
-    const harness = argv.find((a) => a.startsWith('--harness='))?.slice(10) || process.env.VALORBRAIN_HARNESS || '';
-
-    const emit = (context) => {
-        if (!context) return 0;
-        if (format === 'json') {
-            process.stdout.write(JSON.stringify({
-                continue: true,
-                suppressOutput: false,
-                hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: context }
-            }) + '\n');
-        } else {
-            process.stdout.write(context + '\n');
-        }
-        return 0;
-    };
-
-    // No token: stay silent.
-    if (!token) return emit('');
-
-    const payload = await readStdin();
-
-    // Extração (Stop/PreCompact): roda no engine com o tenant do token; não
-    // injeta contexto — o contrato é silêncio. Fail-open sempre.
-    if (EXTRACTION_HOOKS.has(name)) {
-        await runExtractionHook(api, token, name, payload).catch(() => {});
-        return 0;
-    }
-
-    // Hook sem contexto a produzir: stay silent.
-    if (!CONTEXT_HOOKS.has(name)) return emit('');
-
-    const prompt = readPromptFrom(payload);
-    // Session start carries no prompt; ask for the stable context instead.
-    const message = prompt || (name === 'session-bootstrap' ? 'session start' : '');
-    if (!message) return emit('');
-
-    // Self-heal + declaração em paralelo com o contexto e com teto de tempo:
-    // throttled a 6h, então quase sempre é um no-op; quando roda, nunca atrasa o
-    // prompt além do orçamento. Nada aqui imprime em stdout (o canal é o contexto).
-    const heal = Promise.race([
-        maybeSelfHeal(api, token, harness, homedir()),
-        new Promise((r) => setTimeout(r, HEAL_HOOK_BUDGET_MS)),
-    ]).catch(() => {});
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), HOOK_TIMEOUT_MS);
-    try {
-        const [result] = await Promise.all([callTool(api, token, 'memory_prepare', {
-            message,
-            // The hook runs on the critical path of every prompt, so it takes the
-            // cheap path: recall still covers documents by category, the funnel's
-            // embedding + hybrid search is skipped.
-            fast_mode: true
-        }, controller.signal), heal]);
-        const context = (result?.content || []).map((c) => c?.text).filter(Boolean).join('\n').trim();
-        return emit(context);
-    } catch {
-        // Silence is the contract. A hook that breaks a prompt is worse than one
-        // that adds nothing.
-        return emit('');
-    } finally {
-        clearTimeout(timer);
-    }
-}
+// Pure pieces the tests exercise (node --test test/). Importing this module for
+// them sets VALORBRAIN_CONNECT_NO_MAIN so the dispatch below does not run.
+export { hookEntriesChanged, mergeHooksJson, planFor };
 
 // ─── dispatch ────────────────────────────────────────────────────────────────
 
-if (process.argv[2] === 'hook') {
-    runHook(process.argv.slice(3))
+if (process.env.VALORBRAIN_CONNECT_NO_MAIN === '1') {
+    // imported by the test suite
+} else if (process.argv[2] === 'hook') {
+    // The hook client lives in hook.mjs (protocol v2, ADR-058); this file lends
+    // it the self-heal, which needs the installer's planning code.
+    readStdinPayload()
+        .then((payload) => runHook(process.argv.slice(3), {
+            payload,
+            clientVersion: CLIENT_VERSION,
+            heal: ({ api, token, harness, home, credsSource }) =>
+                maybeSelfHeal(api, token, harness, home, credsSource),
+        }))
         .then((code) => process.exit(code))
         .catch(() => process.exit(0));
 } else if (process.argv[2] === 'mcp') {
