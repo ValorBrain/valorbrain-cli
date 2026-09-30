@@ -318,6 +318,63 @@ test('no second loader: the heal does not create the $HOME standalone while an o
     }
 });
 
+// ── 0.5.3: a guarda barra só a CRIAÇÃO do standalone, nunca a atualização ───
+// O SA v1 que o manifesto v1 de produção renderizava (era 0.4.x): 2 hooks
+// (context-surfacing / session-bootstrap), --format=text, token no argv, SEM
+// Stop. O AC no formato que o heal da 0.5.1 grava.
+
+const SA_V1_PRODUCTION = JSON.stringify({
+    version: 'v1',
+    hooks: [
+        { name: 'valorbrain-context-surfacing', trigger: 'UserPromptSubmit', action: { type: 'command', command: 'npx -y @valorbrain/connect hook context-surfacing --format=text --token=vbm_04x --harness=kiro' } },
+        { name: 'valorbrain-session-bootstrap', trigger: 'SessionStart', action: { type: 'command', command: 'npx -y @valorbrain/connect hook session-bootstrap --format=text --token=vbm_04x --harness=kiro' } },
+    ],
+});
+
+test('guard cell (0.5.3): an existing OURS standalone is migrated even beside a project agent config', async () => {
+    const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
+    const h = home();
+    const ws = mkdtempSync(join(tmpdir(), 'vb-connect-cell-'));
+    homes.push(ws);
+    // A herança da 0.4.x→0.5.1: SA v1 real (sem Stop, token no argv) em $HOME
+    // e agent config nosso no projeto — e a chamada V3 sai desse projeto.
+    mkdirSync(join(h, '.kiro', 'hooks'), { recursive: true });
+    writeFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), SA_V1_PRODUCTION);
+    mkdirSync(join(ws, '.kiro', 'agents'), { recursive: true });
+    writeFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), OUR_AGENT_CONFIG);
+
+    const { code, stderr } = await runCli(['hook', 'prompt', '--harness=kiro', '--token=vbm_04x', `--api=${url}`], h, { cwd: ws, stdin: v3Payload(ws) });
+    server.close();
+    assert.equal(code, 0, stderr);
+    const sa = readFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), 'utf-8');
+    assert.ok(!sa.includes('vbm_04x'), 'token off the command line');
+    assert.ok(!sa.includes('--format=text'), 'protocol v2 needs no format flag');
+    assert.ok(sa.includes('hook stop --harness=kiro'), 'the Stop checkpoint is back');
+    assert.deepEqual(
+        JSON.parse(sa).hooks.map((x) => x.trigger).sort(),
+        ['SessionStart', 'Stop', 'UserPromptSubmit'],
+    );
+    assert.equal(readFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), 'utf-8'), OUR_AGENT_CONFIG, 'project untouched');
+});
+
+test('guard cell (0.5.3): a foreign file at the standalone path stays out of the plan', async () => {
+    const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
+    const h = home();
+    const ws = mkdtempSync(join(tmpdir(), 'vb-connect-cellf-'));
+    homes.push(ws);
+    // v1 shape but NOT ours (no connect marker): the guard must not touch it.
+    const foreign = JSON.stringify({ version: 'v1', hooks: [{ name: 'mine', trigger: 'UserPromptSubmit', action: { type: 'command', command: 'echo mine --token=vbm_mine' } }] });
+    mkdirSync(join(h, '.kiro', 'hooks'), { recursive: true });
+    writeFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), foreign);
+    mkdirSync(join(ws, '.kiro', 'agents'), { recursive: true });
+    writeFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), OUR_AGENT_CONFIG);
+
+    const { code, stderr } = await runCli(['hook', 'prompt', '--harness=kiro', '--token=vbm_04x', `--api=${url}`], h, { cwd: ws, stdin: v3Payload(ws) });
+    server.close();
+    assert.equal(code, 0, stderr);
+    assert.equal(readFileSync(join(h, '.kiro', 'hooks', 'valorbrain.json'), 'utf-8'), foreign, 'foreign file untouched');
+});
+
 test('install: kiro hooks default to the standalone file in $HOME (v3); legacy is opt-in and mutually exclusive', async () => {
     const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
     const h = home();

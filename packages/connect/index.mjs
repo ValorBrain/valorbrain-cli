@@ -832,7 +832,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.5.2";
+const CLIENT_VERSION = "0.5.3";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -1038,16 +1038,24 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     const contractDrift = Boolean(expected && installed !== expected);
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
-    // token do heal — para dentro da mudança de hooks. Com risco de segundo
-    // loader, o artifact de hooks do kiro sai do plano inteiro.
-    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(a.kind === "hooks" && kiroSecondLoaderRisk)) }, token, home, false)
+    // token do heal — para dentro da mudança de hooks.
+    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
       .filter((c) => c.changed && !c.error);
+    // A guarda de segundo loader barra só a CRIAÇÃO do standalone em $HOME
+    // (`before === null`): atualizar um standalone NOSSO que já existe é
+    // migração, não segundo loader — o arquivo já é um loader; torná-lo v2
+    // devolve o checkpoint do Stop e tira o token do argv (célula SA v1 + AC
+    // no projeto, herança 0.4.x→0.5.1). Arquivo de terceiro no caminho
+    // continua fora do plano.
+    const guarded = kiroSecondLoaderRisk
+      ? planned.filter((c) => c.artifact.kind !== "hooks" || (c.before !== null && isOurStandaloneHooks(c.before)))
+      : planned;
     // Contrato em drift: reaplica regras + hooks. Sem drift de contrato, só hooks
     // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta.
     // O Codex fica fora da migração automática: comando novo exige re-trust
     // manual em /hooks, e migrar sozinho desligaria o recall em silêncio.
     const hooksOk = (c) => c.artifact.kind !== "hooks" || (canMigrateHooks && !(id === "codex" && !contractDrift));
-    const changes = (contractDrift ? planned : planned.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
+    const changes = (contractDrift ? guarded : guarded.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
       .filter(hooksOk);
     if (changes.length > 0) {
       const wrote = applyQuiet(changes);
