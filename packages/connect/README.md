@@ -43,6 +43,45 @@ ativos, uma sessão V3 rodando o agente dispara cada evento duas vezes. O
 self-heal mantém o modo instalado e nunca cria arquivo em diretório de
 projeto — o cwd de um hook é o projeto do agente.
 
+## Upgrade a partir da 0.5.1 (VAL-224)
+
+Quem instalou com a 0.5.1 e usa o V3 (`kiro-cli --v3` / Kiro CLI 3.0) **sem
+agente** não tem hook disparando — e o self-heal roda *dentro* do hook, então
+não chega até essa pessoa. **Rode o instalador de novo**:
+
+```bash
+npx -y @valorbrain/connect@latest --token vbm_… --harness kiro
+```
+
+Isso instala o arquivo standalone em `~/.kiro/hooks/valorbrain.json` e remove
+os agent configs da 0.5.1 (em `$HOME` e no projeto em que rodar).
+
+**Onde houver disparo duplo** (standalone em `$HOME` + agent config da 0.5.1
+em um projeto — cada evento sai 2x nas sessões V3 com `--agent valorbrain`),
+rode o instalador **também dentro de cada projeto afetado**: a poda do modo é
+por diretório.
+
+## Notas de release 0.5.2
+
+- **Opt-in legado é registro.** `--kiro-engine=legacy` grava
+  `kiro_engine: "legacy"` na entrada do harness em
+  `~/.valorbrain/connect.json` — é o único sinal de modo que o self-heal
+  respeita (a 0.5.1 gravava agent config em `$HOME` por default, então a
+  existência do arquivo nunca significou opt-in). O install v3 limpa o campo.
+- **Depois que o install v3 poda o agent config do projeto** (verificado ao
+  vivo, kiro-cli 2.20.1):
+  - `kiro-cli agent list` não lista mais `valorbrain`;
+  - `kiro-cli agent set-default valorbrain` → erro limpo: `No agent with name
+    valorbrain found`;
+  - `kiro-cli chat --agent valorbrain` → **não é falha dura**: aviso
+    `agent "valorbrain" not found, using "kiro_default"` e segue com o
+    default — os hooks continuam pelo standalone nas sessões V3.
+- Quem precisa do agente de volta (engine legado, ou preferência pessoal):
+  `npx -y @valorbrain/connect --token vbm_… --harness kiro
+  --kiro-engine=legacy` (global) ou com `--scope=workspace` dentro do
+  projeto — o install recria o agent config e registra o opt-in, e o heal
+  passa a manter esse modo sem tocar no standalone de ninguém.
+
 ### Hooks (protocolo v2, ADR-058)
 
 Desde a 0.5.0 os hooks cobrem três momentos. Nenhum deles roda LLM do
