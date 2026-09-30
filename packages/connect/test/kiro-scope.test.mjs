@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { planFor, scopedManifest, staleKiroFiles, detectKiroMode, kiroProjectHasOurHooks } = await import('../index.mjs');
+const { planFor, scopedManifest, staleKiroFiles, detectKiroMode, kiroEngineFromPayload, kiroProjectHasOurHooks } = await import('../index.mjs');
 
 const HOME = '/home/customer';
 const CWD = '/work/proj';
@@ -121,17 +121,23 @@ test('staleKiroFiles: only OUR files of the other mode, in both roots, deduped',
     assert.deepEqual(staleKiroFiles({ home: HOME, cwd: CWD, kiroEngine: 'v3', exists: (p) => p in junk, read: (p) => junk[p] }), []);
 });
 
-test('detectKiroMode: our agent config on disk means legacy opt-in; anything else is v3', () => {
-    const agentConfig = JSON.stringify({ name: 'valorbrain', hooks: { agentSpawn: [{ command: 'npx -y @valorbrain/connect hook session-start --harness=kiro' }] } });
-    assert.equal(detectKiroMode(HOME, () => false, () => { throw new Error('no read'); }), 'v3');
-    assert.equal(
-        detectKiroMode(HOME, (p) => p === `${HOME}/.kiro/agents/valorbrain.json`, () => agentConfig),
-        'legacy',
-    );
-    assert.equal(
-        detectKiroMode(HOME, () => true, () => 'not json'),
-        'v3',
-    );
+test('detectKiroMode: only the REGISTERED opt-in means legacy — a $HOME agent config proves nothing (S1)', () => {
+    assert.equal(detectKiroMode(null), 'v3');
+    assert.equal(detectKiroMode({ token: 'vbm_c', api: 'https://x' }), 'v3');
+    assert.equal(detectKiroMode({ token: 'vbm_c', api: 'https://x', kiro_engine: 'legacy' }), 'legacy');
+});
+
+test('kiroEngineFromPayload: payload casing names the calling engine (verified live, R2)', () => {
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'SessionStart' }), 'v3');
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'UserPromptSubmit' }), 'v3');
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'Stop' }), 'v3');
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'agentSpawn' }), 'legacy');
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'userPromptSubmit' }), 'legacy');
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'stop' }), 'legacy');
+    // No signal — foreign dialects and garbage protect both sides.
+    assert.equal(kiroEngineFromPayload({}), null);
+    assert.equal(kiroEngineFromPayload({ hook_event_name: 'PreToolUse' }), null);
+    assert.equal(kiroEngineFromPayload(undefined), null);
 });
 
 test('kiroProjectHasOurHooks: an ours file of EITHER kind counts; foreign or missing does not', () => {
