@@ -604,7 +604,7 @@ export async function runHook(argv, deps = {}) {
 
     if (!creds.token) {
         // Not an error for the harness, but the user should be able to find out.
-        if (event || EXTRACTION_HOOKS.has(name)) err(`${name}: no credentials (run: npx @valorbrain/connect --token vbm_…)`);
+        if (event || EXTRACTION_HOOKS.has(name)) err(`${name}: no credentials (run: npx -y @valorbrain/connect)`);
         return emit(event === 'stop' ? renderSilentStop(dialect) : renderContext(dialect, event, '', payload));
     }
 

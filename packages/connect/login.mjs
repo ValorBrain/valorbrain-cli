@@ -9,6 +9,11 @@
  * exactly once. A person without an account creates it on the way: the
  * approval page sends them through sign-up and back.
  *
+ * Two URLs cross from the app into this machine, and neither is trusted as
+ * is: the approval URL is opened only when it is an https page of the app
+ * itself (http only on loopback), and the engine URL the tokens belong to is
+ * accepted under the same rule.
+ *
  * Node built-ins only; everything that touches the network or spawns a
  * process can be injected, so the tests run offline.
  */
@@ -19,6 +24,7 @@ import { hostname, platform as osPlatform } from "node:os";
 export const DEFAULT_APP = "https://valorbrain.valor.digital";
 
 const OS_NAMES = { win32: "Windows", darwin: "macOS", linux: "Linux" };
+const REQUEST_TIMEOUT_MS = 10_000;
 
 export function resolveAppUrl({ flag = null, env = process.env } = {}) {
   const norm = (u) => String(u).trim().replace(/\/+$/, "");
@@ -40,12 +46,56 @@ export function deviceLabel({ host = safeHostname(), platform = osPlatform() } =
   return `${host} (${OS_NAMES[platform] ?? platform})`.slice(0, 80);
 }
 
+function isLoopback(hostnameValue) {
+  return hostnameValue === "localhost" || hostnameValue === "127.0.0.1" || hostnameValue === "[::1]" || hostnameValue === "::1";
+}
+
+/** https, or http on a loopback host (local development). */
+function isAcceptableOrigin(url) {
+  return url.protocol === "https:" || (url.protocol === "http:" && isLoopback(url.hostname));
+}
+
+/**
+ * The approval page URL, resolved against the app and kept only when it is
+ * a page of that same app over an acceptable scheme. Anything else (another
+ * host, `file:`, a custom scheme) is never handed to the OS opener.
+ */
+export function approvalUrl(raw, app) {
+  try {
+    const base = new URL(app);
+    const url = new URL(String(raw ?? ""), `${base.origin}/`);
+    if (url.origin !== base.origin || !isAcceptableOrigin(url)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/** The engine URL the app says the tokens belong to, if it is safe to wire hooks to. */
+export function acceptableApiUrl(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  try {
+    const url = new URL(raw.trim());
+    if (!isAcceptableOrigin(url)) return null;
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+/** True when nobody is at the keyboard to approve (CI, piped output). */
+export function isUnattended({ env = process.env, stdoutIsTTY = Boolean(process.stdout.isTTY) } = {}) {
+  return Boolean(env.CI) || !stdoutIsTTY;
+}
+
 /**
  * How to open a URL in the default browser here, or null when there is no
- * browser to open (CI, SSH without a display, opted out).
+ * browser to open (CI, SSH, no display, opted out).
  */
 export function browserCommand(url, { platform = osPlatform(), env = process.env } = {}) {
   if (env.VALORBRAIN_NO_BROWSER === "1" || env.CI) return null;
+  // Over SSH the browser would open on the remote machine, not in front of the person.
+  if (env.SSH_CONNECTION || env.SSH_TTY) return null;
   if (platform === "win32") return { cmd: "explorer.exe", args: [url] };
   if (platform === "darwin") return { cmd: "open", args: [url] };
   // WSL: the browser lives on the Windows side.
@@ -76,8 +126,12 @@ async function readJson(res) {
   try {
     return await res.json();
   } catch {
-    return {};
+    return null;
   }
+}
+
+function withTimeout(init) {
+  return { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) };
 }
 
 /**
@@ -100,15 +154,15 @@ export async function deviceLogin({
   const headers = { "content-type": "application/json", accept: "application/json" };
   let res;
   try {
-    res = await fetchImpl(`${app}/api/v1/cli/device/code`, {
+    res = await fetchImpl(`${app}/api/v1/cli/device/code`, withTimeout({
       method: "POST",
       headers,
       body: JSON.stringify({ client: "connect", harnesses, device_label: label }),
-    });
+    }));
   } catch (err) {
     throw new LoginError(`Could not reach ${app} (${err?.message ?? err}). Check your connection and try again.`);
   }
-  const code = await readJson(res);
+  const code = (await readJson(res)) ?? {};
   if (!res.ok || !code.device_code || !code.user_code) {
     throw new LoginError(
       code.error_description || code.error
@@ -117,46 +171,63 @@ export async function deviceLogin({
     );
   }
 
-  const url = code.verification_uri_complete || `${code.verification_uri}?code=${encodeURIComponent(code.user_code)}`;
+  const offered = code.verification_uri_complete
+    || (code.verification_uri ? `${code.verification_uri}?code=${encodeURIComponent(code.user_code)}` : null);
+  const url = approvalUrl(offered, app) ?? approvalUrl(`/cli/link?code=${encodeURIComponent(code.user_code)}`, app);
+  if (!url) throw new LoginError(`The app at ${app} did not give an approval page this installer can open.`);
+
   log("");
   log(`${style.bold}Approve this computer in your browser${style.off}`);
   log(`  ${url}`);
   log(`  code ${style.bold}${code.user_code}${style.off} ${style.dim}(check it matches the page)${style.off}`);
-  const opened = browser ? open(url) : false;
-  log(`${style.dim}${opened ? "Opened your browser. " : "Open the link above. "}No account yet? You create it there. Waiting…${style.off}`);
+  const opening = browser ? open(url) : false;
+  log(`${style.dim}${opening ? "Opening your browser… if it does not open, use the link above. " : "Open the link above. "}No account yet? You create it there. Waiting…${style.off}`);
 
   const deadline = now() + Math.max(60, Number(code.expires_in) || 900) * 1000;
-  let interval = Math.max(1, Number(code.interval) || 3) * 1000;
+  const baseInterval = Math.max(1, Number(code.interval) || 3) * 1000;
+  let interval = baseInterval;
   while (now() < deadline) {
     await sleep(interval);
     let poll;
     try {
-      poll = await fetchImpl(`${app}/api/v1/cli/device/token`, {
+      poll = await fetchImpl(`${app}/api/v1/cli/device/token`, withTimeout({
         method: "POST",
         headers,
         body: JSON.stringify({ device_code: code.device_code }),
-      });
+      }));
     } catch {
-      continue; // network blip: the code is still valid, keep waiting
+      continue; // network blip or timeout: the code is still valid, keep waiting
     }
     const body = await readJson(poll);
-    if (poll.ok && body.access_token) {
+    if (poll.ok && body?.access_token) {
       const tokens = body.tokens && typeof body.tokens === "object" ? body.tokens : null;
       return {
         tokens,
         accessToken: body.access_token,
-        apiUrl: typeof body.valorbrain_url === "string" ? body.valorbrain_url : null,
+        apiUrl: acceptableApiUrl(body.valorbrain_url),
         tenantId: body.tenant_id ?? null,
       };
     }
-    if (body.error === "authorization_pending") continue;
-    if (body.error === "slow_down") {
+    const error = body?.error;
+    if (error === "authorization_pending") {
+      interval = baseInterval;
+      continue;
+    }
+    if (error === "slow_down") {
       interval += 5000;
       continue;
     }
-    if (body.error === "access_denied") throw new LoginError("The request was denied in the browser. Nothing was changed.");
-    if (body.error === "expired_token") throw new LoginError("The code expired before it was approved. Run the command again.");
-    throw new LoginError(`Unexpected answer from the app (HTTP ${poll.status}${body.error ? `: ${body.error}` : ""}).`);
+    if (error === "access_denied") throw new LoginError("The request was denied in the browser. Nothing was changed.");
+    if (error === "expired_token") throw new LoginError("The code expired before it was approved. Run the command again.");
+    // The app restarting, a proxy error page, rate limiting: wait and ask again
+    // until the code expires. Giving up here would strand an approval the
+    // person may be completing right now.
+    if (poll.status >= 500 || poll.status === 429 || body === null) {
+      const retryAfter = Number(poll.headers?.get?.("retry-after"));
+      interval = Math.min(30_000, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : interval * 2);
+      continue;
+    }
+    throw new LoginError(`Unexpected answer from the app (HTTP ${poll.status}${error ? `: ${error}` : ""}).`);
   }
   throw new LoginError("The code expired before it was approved. Run the command again.");
 }

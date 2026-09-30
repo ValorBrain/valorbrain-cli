@@ -26,7 +26,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
 import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
-import { deviceLabel, deviceLogin, resolveAppUrl } from "./login.mjs";
+import { deviceLabel, deviceLogin, isUnattended, resolveAppUrl } from "./login.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -40,7 +40,7 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, scope: null, kiroEngine: "v3" };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, relogin: false, scope: null, kiroEngine: "v3" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
@@ -48,6 +48,7 @@ function parseArgs(argv) {
     else if (a === "--status") out.status = true;
     else if (a === "--no-backup") out.noBackup = true;
     else if (a === "--no-browser") out.noBrowser = true;
+    else if (a === "--relogin") out.relogin = true;
     else if (a === "--scope") out.scope = argv[++i];
     else if (a.startsWith("--scope=")) out.scope = a.slice(8);
     else if (a === "--kiro-engine") out.kiroEngine = argv[++i];
@@ -83,10 +84,16 @@ Options
                     (you create your account there if needed) and each agent
                     gets its own token.
   --no-browser      print the approval link instead of opening it (also:
-                    VALORBRAIN_NO_BROWSER=1; CI and SSH sessions never open one)
+                    VALORBRAIN_NO_BROWSER=1). Needed to log in from CI or
+                    piped output, which otherwise stop and ask for --token;
+                    SSH sessions never open a browser.
+  --relogin         replace the tokens of agents already connected on this
+                    computer (by default a re-run keeps them and only
+                    approves the agents that are new)
   --app URL         ValorBrain app for the approval (default https://valorbrain.valor.digital,
                     or VALORBRAIN_APP_URL)
-  --api URL         engine base URL (default ${DEFAULT_API})
+  --api URL         engine base URL (default: the engine of the app that approved
+                    this computer, else ${DEFAULT_API})
   --scope what      where harness-local files go: "user" ($HOME, the default)
                     or "workspace" (this project).
   --kiro-engine e   which kiro engine your sessions run. "v3" (default —
@@ -686,10 +693,19 @@ async function main() {
   const home = homedir();
   let token = args.token || process.env.VALORBRAIN_TOKEN || null;
   // Filled by the browser login: one token per harness, and the engine URL the
-  // app that approved the computer belongs to.
+  // app that approved the computer belongs to. Agents already connected on
+  // this computer keep the token saved in ~/.valorbrain/connect.json.
   let loginTokens = null;
   let loginApi = null;
-  const tokenFor = (harness) => (loginTokens && loginTokens[harness]) || token;
+  let savedTokens = {};
+  const tokenFor = (harness) => {
+    if (loginTokens && loginTokens[harness]) return loginTokens[harness];
+    if (savedTokens[harness]) return savedTokens[harness];
+    // After a login, an agent the app issued nothing for gets nothing (never
+    // another agent's token).
+    return loginTokens ? null : token;
+  };
+  let failed = 0;
 
   // Qa R1 (VAL-195): --status and --remove fetch the manifest from the API,
   // whose blind default was the public one — ignoring the api_url that this
@@ -711,6 +727,22 @@ async function main() {
   };
   const apiFor = (harness) => installApi(harness).api;
 
+  // The manifest needs no token. Fetched once per (engine, harness), and
+  // before any login, so a harness the engine cannot serve never costs an
+  // approval or a token.
+  const manifestCache = new Map();
+  const loadManifest = (harness) => {
+    const api = apiFor(harness);
+    const key = `${api}|${harness}`;
+    if (!manifestCache.has(key)) {
+      const pending = fetchManifest(api, harness);
+      pending.catch(() => {}); // awaited by the caller; never an unhandled rejection
+      manifestCache.set(key, pending);
+    }
+    return manifestCache.get(key);
+  };
+  const unusable = new Set();
+
   // Canonical ids everywhere (the engine renders hook commands with them, and
   // credentials are keyed by them): `--harness gemini` must store the entry
   // the `--harness=gemini-cli` hook will read.
@@ -729,32 +761,84 @@ async function main() {
       console.error("A dry run never opens the browser: pass --token vbm_… (Settings → MCP Tokens) or set VALORBRAIN_TOKEN.");
       return 2;
     }
-    try {
-      const login = await deviceLogin({
-        app: resolveAppUrl({ flag: args.app, env: process.env }),
-        harnesses: targets,
-        label: deviceLabel(),
-        browser: !args.noBrowser,
-        style: C,
-      });
-      loginTokens = login.tokens;
-      token = login.accessToken;
-      loginApi = login.apiUrl;
-      console.log(`${C.green}✓${C.off} approved — ${loginTokens ? Object.keys(loginTokens).length : 1} token(s), one per agent\n`);
-    } catch (err) {
-      console.error(`${C.red}✗${C.off} ${err?.message ?? err}`);
-      return 1;
+    // Nobody at the keyboard (CI, piped output): an approval link in a log is
+    // an invitation for whoever reads the log to wire this machine to their
+    // own workspace. Fail fast, as 0.5 did, unless asked to print the link.
+    if (isUnattended() && !args.noBrowser && process.env.VALORBRAIN_NO_BROWSER !== "1") {
+      console.error("No token, and nobody here to approve in a browser (CI or piped output). Pass --token vbm_… (Settings → MCP Tokens), set VALORBRAIN_TOKEN, or add --no-browser to print the approval link anyway.");
+      return 2;
+    }
+
+    // Agents already connected on this computer keep their token (a re-run
+    // updates their files); only the others need an approval. --relogin
+    // replaces them all.
+    const connected = [];
+    const pending = [];
+    for (const harness of targets) {
+      const saved = args.relogin ? null : readCreds(home, harness);
+      if (saved?.token) {
+        savedTokens[harness] = saved.token;
+        connected.push(harness);
+      } else {
+        pending.push(harness);
+      }
+    }
+    if (connected.length > 0) {
+      console.log(`${C.dim}Already connected: ${connected.join(", ")} (--relogin replaces their tokens)${C.off}`);
+    }
+
+    const resolvable = [];
+    for (const harness of pending) {
+      try {
+        await loadManifest(harness);
+        resolvable.push(harness);
+      } catch (err) {
+        console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
+        unusable.add(harness);
+        failed++;
+      }
+    }
+
+    if (resolvable.length > 0) {
+      try {
+        const login = await deviceLogin({
+          app: resolveAppUrl({ flag: args.app, env: process.env }),
+          harnesses: resolvable,
+          label: deviceLabel(),
+          browser: !args.noBrowser,
+          style: C,
+        });
+        // Only the agents this login asked for: an agent already connected
+        // keeps its saved token even if the app answered with more.
+        const answered = login.tokens ?? (resolvable.length === 1 ? { [resolvable[0]]: login.accessToken } : {});
+        loginTokens = Object.fromEntries(resolvable.filter((h) => answered[h]).map((h) => [h, answered[h]]));
+        loginApi = login.apiUrl;
+        const got = resolvable.filter((h) => loginTokens[h]);
+        console.log(`${C.green}✓${C.off} approved — ${got.length} agent(s), each with its own token\n`);
+        const override = args.api || process.env.VALORBRAIN_API_URL;
+        if (loginApi && override && override.replace(/\/+$/, "") !== loginApi) {
+          console.log(`${C.yellow}!${C.off} the tokens were issued for ${loginApi}, but ${args.api ? "--api" : "VALORBRAIN_API_URL"} points the agents to ${override.replace(/\/+$/, "")}. They will fail there unless it is the same engine.\n`);
+        }
+      } catch (err) {
+        console.error(`${C.red}✗${C.off} ${err?.message ?? err}`);
+        return 1;
+      }
     }
   }
 
   const icon = { ok: `${C.green}●${C.off}`, drift: `${C.yellow}◐${C.off}`, missing: `${C.red}○${C.off}` };
-  let failed = 0;
   const credsLabel = credsPath(home).replace(home, "~");
 
   for (const harness of targets) {
+    if (unusable.has(harness)) continue; // already reported before the login
+    if (!args.status && !args.remove && !tokenFor(harness)) {
+      console.error(`${C.red}✗${C.off} ${harness}: the app issued no token for this agent — nothing changed for it`);
+      failed++;
+      continue;
+    }
     let manifest;
     try {
-      manifest = scopedManifest(await fetchManifest(apiFor(harness), harness), { harness, scope: args.scope, home, kiroEngine: args.kiroEngine });
+      manifest = scopedManifest(await loadManifest(harness), { harness, scope: args.scope, home, kiroEngine: args.kiroEngine });
     } catch (err) {
       console.error(`${C.red}✗${C.off} ${harness}: ${err.message}`);
       failed++;
@@ -779,7 +863,7 @@ async function main() {
         const saved = readCreds(home, harness);
         console.log(saved
           ? `  ${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
-          : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until the installer runs with --token`);
+          : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until you run npx -y @valorbrain/connect`);
       }
       console.log();
       continue;
@@ -788,7 +872,9 @@ async function main() {
     // Hooks read the token from this harness's entry (ADR-058), written before
     // any hook artifact so a freshly wired hook never runs without it. One
     // entry per harness: two harnesses may belong to two tenants.
-    if (!args.remove && tokenFor(harness) && manifest.hooks_available) {
+    // Also saved for agents without hooks when the token came from a browser
+    // login: a re-run then finds the agent connected and needs no approval.
+    if (!args.remove && tokenFor(harness) && (manifest.hooks_available || (loginTokens && loginTokens[harness]))) {
       if (args.dryRun) {
         console.log(`  ${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
       } else {

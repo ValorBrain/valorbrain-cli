@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
-import { browserCommand, deviceLabel, deviceLogin, resolveAppUrl } from '../login.mjs';
+import { acceptableApiUrl, approvalUrl, browserCommand, deviceLabel, deviceLogin, isUnattended, resolveAppUrl } from '../login.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'index.mjs');
 
@@ -131,7 +131,7 @@ function codexManifest() {
 }
 
 function stubAppAndEngine() {
-    const seen = { code: null, polls: 0, registered: [] };
+    const seen = { code: null, polls: 0, registered: [], round: 0 };
     const server = createServer((req, res) => {
         const u = new URL(req.url, 'http://stub');
         let raw = '';
@@ -141,12 +141,15 @@ function stubAppAndEngine() {
             const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
             if (u.pathname === '/api/v1/cli/device/code') {
                 seen.code = body;
+                seen.round++;
+                seen.polls = 0;
                 return send(200, { device_code: 'dev-raw', user_code: 'WXYZ-2345', verification_uri: 'http://stub/cli/link', verification_uri_complete: 'http://stub/cli/link?code=WXYZ-2345', expires_in: 900, interval: 1 });
             }
             if (u.pathname === '/api/v1/cli/device/token') {
                 seen.polls++;
                 if (seen.polls < 2) return send(400, { error: 'authorization_pending' });
-                return send(200, { access_token: 'vbm_claude', tokens: { 'claude-code': 'vbm_claude', codex: 'vbm_codex' }, tenant_id: 't1', valorbrain_url: `http://127.0.0.1:${server.address().port}` });
+                const sfx = seen.round > 1 ? `_${seen.round}` : '';
+                return send(200, { access_token: `vbm_claude${sfx}`, tokens: { 'claude-code': `vbm_claude${sfx}`, codex: `vbm_codex${sfx}` }, tenant_id: 't1', valorbrain_url: `http://127.0.0.1:${server.address().port}` });
             }
             if (u.pathname === '/setup/artifacts') {
                 return send(200, u.searchParams.get('agent') === 'codex' ? codexManifest() : claudeManifest());
@@ -174,8 +177,10 @@ test('no --token: the CLI logs in through the browser flow and wires each harnes
         });
         assert.equal(code, 0, stderr || stdout);
         assert.deepEqual(seen.code, { client: 'connect', harnesses: ['claude-code', 'codex'], device_label: seen.code.device_label });
-        assert.match(stdout, /http:\/\/stub\/cli\/link\?code=WXYZ-2345/);
-        assert.match(stdout, /approved — 2 token\(s\)/);
+        // The stub offered a page on another host: never opened or shown; the app's own page is.
+        assert.doesNotMatch(stdout, /http:\/\/stub\//);
+        assert.match(stdout, new RegExp(`${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/cli/link\\?code=WXYZ-2345`));
+        assert.match(stdout, /approved — 2 agent\(s\), each with its own token/);
 
         const claude = JSON.parse(readFileSync(join(h, '.claude.json'), 'utf-8'));
         assert.equal(claude.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_claude');
@@ -205,6 +210,111 @@ test('--dry-run without a token never opens a login', async () => {
         assert.equal(code, 2);
         assert.match(stderr, /dry run never opens the browser/);
     } finally {
+        rmSync(h, { recursive: true, force: true });
+    }
+});
+
+test('approval URL: only a page of the app itself, https or loopback http', () => {
+    assert.equal(approvalUrl('https://app.test/cli/link?code=AB', 'https://app.test'), 'https://app.test/cli/link?code=AB');
+    assert.equal(approvalUrl('/cli/link?code=AB', 'https://app.test'), 'https://app.test/cli/link?code=AB');
+    assert.equal(approvalUrl('file:///C:/Windows/System32/calc.exe', 'https://app.test'), null);
+    assert.equal(approvalUrl('https://evil.test/cli/link', 'https://app.test'), null);
+    assert.equal(approvalUrl('http://app.test/cli/link', 'http://app.test'), null); // plain http off loopback
+    assert.equal(approvalUrl('http://127.0.0.1:3001/cli/link?code=AB', 'http://127.0.0.1:3001'), 'http://127.0.0.1:3001/cli/link?code=AB');
+    assert.equal(approvalUrl(null, 'https://app.test'), 'https://app.test/');
+});
+
+test('engine URL from the app: https or loopback only', () => {
+    assert.equal(acceptableApiUrl('https://api.test/'), 'https://api.test');
+    assert.equal(acceptableApiUrl('http://localhost:7438'), 'http://localhost:7438');
+    assert.equal(acceptableApiUrl('http://10.0.0.5:7438'), null);
+    assert.equal(acceptableApiUrl('javascript:alert(1)'), null);
+    assert.equal(acceptableApiUrl(''), null);
+});
+
+test('unattended: CI or piped output', () => {
+    assert.equal(isUnattended({ env: { CI: 'true' }, stdoutIsTTY: true }), true);
+    assert.equal(isUnattended({ env: {}, stdoutIsTTY: false }), true);
+    assert.equal(isUnattended({ env: {}, stdoutIsTTY: true }), false);
+});
+
+test('browser: SSH never opens one, on any platform', () => {
+    const url = 'https://app.test/cli/link?code=AB';
+    assert.equal(browserCommand(url, { platform: 'darwin', env: { SSH_CONNECTION: '1 2 3 4' } }), null);
+    assert.equal(browserCommand(url, { platform: 'win32', env: { SSH_TTY: '/dev/pts/1' } }), null);
+});
+
+test('login: a 502 or 429 while waiting is retried until the approval arrives', async () => {
+    const { calls, fetchImpl } = fakeApp([
+        new Response('<html>Bad gateway</html>', { status: 502 }),
+        jsonResponse(429, { error: 'rate_limited' }),
+        jsonResponse(200, { access_token: 'vbm_a', tokens: { codex: 'vbm_a' } }),
+    ]);
+    const out = await deviceLogin({ app: 'https://app.test', harnesses: ['codex'], fetchImpl, ...quiet });
+    assert.equal(out.accessToken, 'vbm_a');
+    assert.equal(calls.length, 4);
+});
+
+test('login: an offered page on another host is replaced by the app page', async () => {
+    const logs = [];
+    const opened = [];
+    const { fetchImpl } = fakeApp(
+        [jsonResponse(200, { access_token: 'vbm_a', tokens: { codex: 'vbm_a' } })],
+        jsonResponse(200, { device_code: 'd', user_code: 'ABCD-EFGH', verification_uri_complete: 'file:///C:/Windows/System32/calc.exe', expires_in: 900, interval: 1 }),
+    );
+    await deviceLogin({ app: 'https://app.test', harnesses: ['codex'], fetchImpl, sleep: async () => {}, log: (l) => logs.push(l), open: (u) => { opened.push(u); return true; } });
+    assert.deepEqual(opened, ['https://app.test/cli/link?code=ABCD-EFGH']);
+    assert.ok(!logs.join('\n').includes('calc.exe'));
+});
+
+function runCliIn(h, args, extraEnv = {}) {
+    const env = { PATH: process.env.PATH, HOME: h, USERPROFILE: h, NO_COLOR: '1', ...extraEnv };
+    return new Promise((resolve) => {
+        const child = execFile(process.execPath, [CLI, ...args], { env, timeout: 30_000 }, (err, so, se) => resolve({ code: err ? (err.code ?? 1) : 0, stdout: so, stderr: se }));
+        child.stdin.end('');
+    });
+}
+
+test('unattended run without a token stops at once instead of printing a link to a log', async () => {
+    const h = mkdtempSync(join(tmpdir(), 'vb-connect-login-'));
+    try {
+        mkdirSync(join(h, '.claude'), { recursive: true });
+        const { code, stderr, stdout } = await runCliIn(h, [], { CI: 'true', VALORBRAIN_APP_URL: 'http://127.0.0.1:9' });
+        assert.equal(code, 2);
+        assert.match(stderr, /nobody here to approve/);
+        assert.doesNotMatch(stdout, /cli\/link/);
+    } finally {
+        rmSync(h, { recursive: true, force: true });
+    }
+});
+
+test('a re-run keeps the agents already connected and only approves the new one', async () => {
+    const { server, seen, url } = await stubAppAndEngine();
+    const h = mkdtempSync(join(tmpdir(), 'vb-connect-login-'));
+    try {
+        mkdirSync(join(h, '.claude'), { recursive: true });
+        mkdirSync(join(h, '.codex'), { recursive: true });
+        const env = { VALORBRAIN_APP_URL: url, VALORBRAIN_NO_BROWSER: '1' };
+        const first = await runCliIn(h, ['--harness', 'claude-code'], env);
+        assert.equal(first.code, 0, first.stderr);
+        assert.deepEqual(seen.code.harnesses, ['claude-code']);
+
+        seen.code = null;
+        const second = await runCliIn(h, [], env); // detects claude-code (connected) + codex (new)
+        assert.equal(second.code, 0, second.stderr);
+        assert.match(second.stdout, /Already connected: claude-code/);
+        assert.deepEqual(seen.code.harnesses, ['codex']); // only the new agent is approved
+        // The stub answers with tokens for both agents; the connected one keeps its own.
+        const claudeCfg = JSON.parse(readFileSync(join(h, '.claude.json'), 'utf-8'));
+        assert.equal(claudeCfg.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_claude');
+
+        seen.code = null;
+        const third = await runCliIn(h, [], env); // everything connected: no approval at all
+        assert.equal(third.code, 0, third.stderr);
+        assert.equal(seen.code, null);
+        assert.match(third.stdout, /Already connected: claude-code, codex/);
+    } finally {
+        server.close();
         rmSync(h, { recursive: true, force: true });
     }
 });
