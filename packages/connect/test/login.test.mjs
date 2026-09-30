@@ -176,7 +176,10 @@ test('no --token: the CLI logs in through the browser flow and wires each harnes
             child.stdin.end('');
         });
         assert.equal(code, 0, stderr || stdout);
-        assert.deepEqual(seen.code, { client: 'connect', harnesses: ['claude-code', 'codex'], device_label: seen.code.device_label });
+        assert.deepEqual(seen.code, { client: 'connect', harnesses: ['claude-code', 'codex'], device_label: seen.code.device_label, install_id: seen.code.install_id });
+        assert.match(seen.code.install_id, /^[a-f0-9]{16}$/);
+        // The same installation keeps its id (a second run sends the same one).
+        assert.equal(readFileSync(join(h, '.valorbrain', 'install-id'), 'utf-8').trim(), seen.code.install_id);
         // The stub offered a page on another host: never opened or shown; the app's own page is.
         assert.doesNotMatch(stdout, /http:\/\/stub\//);
         assert.match(stdout, new RegExp(`${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/cli/link\\?code=WXYZ-2345`));

@@ -26,7 +26,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
 import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
-import { deviceLabel, deviceLogin, isUnattended, resolveAppUrl } from "./login.mjs";
+import { deviceLabel, deviceLogin, installId, isUnattended, resolveAppUrl } from "./login.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -805,6 +805,7 @@ async function main() {
           app: resolveAppUrl({ flag: args.app, env: process.env }),
           harnesses: resolvable,
           label: deviceLabel(),
+          install: installId(home),
           browser: !args.noBrowser,
           style: C,
         });

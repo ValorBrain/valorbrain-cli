@@ -19,7 +19,10 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname, platform as osPlatform } from "node:os";
+import { join } from "node:path";
 
 export const DEFAULT_APP = "https://valorbrain.valor.digital";
 
@@ -39,6 +42,32 @@ function safeHostname() {
   } catch {
     return "computer";
   }
+}
+
+/**
+ * A random id for this installation (~/.valorbrain/install-id), created on
+ * first use. The app puts its first characters in the token names, so two
+ * computers with the same hostname never replace each other's tokens when one
+ * of them re-authorizes. Not a secret; never derived from the machine.
+ */
+export function installId(home) {
+  const dir = join(home, ".valorbrain");
+  const file = join(dir, "install-id");
+  try {
+    const saved = readFileSync(file, "utf-8").trim().toLowerCase();
+    if (/^[a-z0-9]{8,32}$/.test(saved)) return saved;
+  } catch {
+    /* first run */
+  }
+  const fresh = randomBytes(8).toString("hex");
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(file, `${fresh}\n`, { mode: 0o600 });
+    try { chmodSync(file, 0o600); } catch { /* not supported on this fs */ }
+  } catch {
+    /* unwritable home: the id still works for this run */
+  }
+  return fresh;
 }
 
 /** "DESKTOP-7 (Windows)" — how this computer shows on the approval page and in token names. */
@@ -143,6 +172,7 @@ export async function deviceLogin({
   app,
   harnesses,
   label = deviceLabel(),
+  install = null,
   browser = true,
   fetchImpl = fetch,
   sleep = sleepFor,
@@ -157,7 +187,7 @@ export async function deviceLogin({
     res = await fetchImpl(`${app}/api/v1/cli/device/code`, withTimeout({
       method: "POST",
       headers,
-      body: JSON.stringify({ client: "connect", harnesses, device_label: label }),
+      body: JSON.stringify({ client: "connect", harnesses, device_label: label, ...(install ? { install_id: install } : {}) }),
     }));
   } catch (err) {
     throw new LoginError(`Could not reach ${app} (${err?.message ?? err}). Check your connection and try again.`);
