@@ -505,7 +505,7 @@ async function postCue(api, token, body, timeoutMs, fetchImpl) {
  * initialize handshake, a single POST with the `_meta` envelope). Fallback for
  * engines that predate the cue endpoint.
  */
-export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.5.3') {
+export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.6.0') {
     const res = await fetchImpl(`${api}/mcp`, {
         method: 'POST',
         signal: AbortSignal.timeout(timeoutMs),
@@ -590,7 +590,7 @@ export async function runHook(argv, deps = {}) {
     const fetchImpl = deps.fetchImpl ?? ((u, i) => fetch(u, i));
     const out = deps.out ?? ((s) => process.stdout.write(s + '\n'));
     const err = deps.err ?? ((s) => process.stderr.write(`[valorbrain] ${s}\n`));
-    const clientVersion = deps.clientVersion ?? '0.5.3';
+    const clientVersion = deps.clientVersion ?? '0.6.0';
     const payload = deps.payload && typeof deps.payload === 'object' ? deps.payload : {};
 
     const name = argv.find((a) => !a.startsWith('-')) || 'context-surfacing';
@@ -604,7 +604,7 @@ export async function runHook(argv, deps = {}) {
 
     if (!creds.token) {
         // Not an error for the harness, but the user should be able to find out.
-        if (event || EXTRACTION_HOOKS.has(name)) err(`${name}: no credentials (run: npx @valorbrain/connect --token vbm_…)`);
+        if (event || EXTRACTION_HOOKS.has(name)) err(`${name}: no credentials (run: npx -y @valorbrain/connect)`);
         return emit(event === 'stop' ? renderSilentStop(dialect) : renderContext(dialect, event, '', payload));
     }
 
