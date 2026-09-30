@@ -8,7 +8,17 @@ name: publish
 # localmente com token (`npm publish --access public`), como em 21/09.
 #
 # Roda no runner self-hosted do repo (o hospedado do GitHub estava parado por
-# billing). OIDC é emitido por job, independente do runner.
+# billing). ATENÇÃO: o trusted publishing do npm NÃO aceita runner
+# self-hosted (docs.npmjs.com/trusted-publishers: "Self-hosted runners are not
+# currently supported"). Aqui o publish falha com E422 "Unsupported GitHub
+# Actions runner environment: self-hosted" (visto no v0.5.2, 30/09). Até isso
+# mudar, a ordem de release é: `npm publish --access public` local (conta
+# valordigital) e DEPOIS a tag — o job passa pelo check idempotente abaixo.
+# Tag sem publish local deixa o run VERMELHO, de propósito.
+#
+# Até 30/09 o erro saía verde: `if ! npm publish; then code=$?` guarda o status
+# do `!` (0), então `exit $code` saía 0 — v0.5.0, v0.5.1 e v0.5.2 tiveram run
+# "success" com o publish falhado, e cada versão foi publicada à mão depois.
 #
 # IDEMPOTENTE: se a versão do package.json já existe no registry, pula o
 # publish — taguear um release não falha quando o pacote já foi publicado.
@@ -47,14 +57,15 @@ jobs:
             fi
             sleep 10
           done
-          if ! npm publish --access public; then
-            code=$?
+          code=0
+          npm publish --access public || code=$?
+          if [ "$code" -ne 0 ]; then
             sleep 15
             if npm view "$PKG@$V" version >/dev/null 2>&1; then
               echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
             fi
-            echo "FALHA: $PKG@$V não está no registry. Se o erro foi E404, registre o trusted publisher (OIDC) no npmjs para $GITHUB_REPOSITORY/$GITHUB_WORKFLOW." >&2
-            exit $code
+            echo "FALHA (exit $code): $PKG@$V não está no registry. Em runner self-hosted o trusted publishing não funciona (E422, ver o cabeçalho): publique local com 'npm publish --access public' e rode este workflow de novo." >&2
+            exit "$code"
           fi
 
       - name: Wait for @valorbrain/cli to resolve on the registry
@@ -79,12 +90,13 @@ jobs:
             fi
             sleep 10
           done
-          if ! npm publish --access public; then
-            code=$?
+          code=0
+          npm publish --access public || code=$?
+          if [ "$code" -ne 0 ]; then
             sleep 15
             if npm view "$PKG@$V" version >/dev/null 2>&1; then
               echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
             fi
-            echo "FALHA: $PKG@$V não está no registry. Se o erro foi E404, registre o trusted publisher (OIDC) no npmjs para $GITHUB_REPOSITORY/$GITHUB_WORKFLOW." >&2
-            exit $code
+            echo "FALHA (exit $code): $PKG@$V não está no registry. Em runner self-hosted o trusted publishing não funciona (E422, ver o cabeçalho): publique local com 'npm publish --access public' e rode este workflow de novo." >&2
+            exit "$code"
           fi
