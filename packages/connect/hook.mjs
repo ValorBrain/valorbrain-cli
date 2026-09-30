@@ -108,7 +108,10 @@ export function readCreds(home, harness) {
     if (!harness) return null;
     const e = readCredsFile(home).harnesses[canonicalHarness(harness)];
     const token = str(e?.token);
-    return token ? { token, api: normalizeApi(e?.api_url) || null } : null;
+    if (!token) return null;
+    const creds = { token, api: normalizeApi(e?.api_url) || null };
+    if (e?.kiro_engine === 'legacy') creds.kiro_engine = 'legacy';
+    return creds;
 }
 
 /**
@@ -170,12 +173,17 @@ function writeCredsFile(home, data) {
 }
 
 /** Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir. */
-export function writeCreds(home, { api, token, harness }) {
+export function writeCreds(home, { api, token, harness, kiroEngine }) {
     if (!harness) throw new Error('writeCreds needs the harness id');
     const id = canonicalHarness(harness);
     return withCredsLock(home, () => {
         const data = readCredsFile(home); // re-read under the lock
-        data.harnesses[id] = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
+        const entry = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
+        // The engine opt-in is the ONLY record that "agent config in $HOME"
+        // means legacy: connect 0.5.1 wrote that file BY DEFAULT, so its
+        // existence proves nothing (VAL-224 S1). The default (v3) clears it.
+        if (kiroEngine === 'legacy') entry.kiro_engine = 'legacy';
+        data.harnesses[id] = entry;
         return writeCredsFile(home, data);
     });
 }
