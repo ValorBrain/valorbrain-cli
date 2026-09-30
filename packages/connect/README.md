@@ -24,6 +24,25 @@ Para cada um, o instalador escreve:
   sobrescrever o arquivo do cliente);
 - **hooks** quando o harness tem sistema de hook com caminho hospedado.
 
+### Kiro: um engine, um arquivo (VAL-224)
+
+O kiro-cli carrega hooks de exatamente um lugar, conforme o engine da sessão —
+nunca dos dois:
+
+- **V3** (`kiro-cli --v3`; default do Kiro CLI 3.0) carrega o arquivo standalone
+  `~/.kiro/hooks/valorbrain.json` — é o default do instalador, e os hooks
+  disparam sem nenhuma configuração de agente (o log do engine registra
+  `v2 hooks loaded N standalone hooks from .kiro/hooks/`).
+- **Legado** (kiro-cli 2.x sem `--v3`) só dispara hooks do agent config
+  (`--kiro-engine=legacy` grava `~/.kiro/agents/valorbrain.json`), e só quando
+  a sessão roda o agente (`kiro-cli chat --agent valorbrain` ou
+  `kiro-cli agent set-default valorbrain`).
+
+Instalar um modo remove os arquivos do outro (só os nossos): com os dois
+ativos, uma sessão V3 rodando o agente dispara cada evento duas vezes. O
+self-heal mantém o modo instalado e nunca cria arquivo em diretório de
+projeto — o cwd de um hook é o projeto do agente.
+
 ### Hooks (protocolo v2, ADR-058)
 
 Desde a 0.5.0 os hooks cobrem três momentos. Nenhum deles roda LLM do
