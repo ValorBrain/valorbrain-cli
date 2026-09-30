@@ -367,6 +367,25 @@ export function detectKiroMode(home, exists = existsSync, read = (p) => readFile
 }
 
 /**
+ * True when a kiro hooks file of OURS — either engine kind — sits under this
+ * root. The self-heal checks the project root before creating anything in
+ * $HOME: a project file keeps firing (the heal never writes to projects), so
+ * adding the standalone would register our hooks under a SECOND loader in a
+ * V3 session and every event would fire twice (VAL-224 follow-up).
+ */
+export function kiroProjectHasOurHooks(root, { exists = existsSync, read = (p) => readFileSync(p, "utf-8") } = {}) {
+  for (const base of [".kiro/agents/valorbrain.json", ".kiro/hooks/valorbrain.json"]) {
+    const p = join(root, base);
+    try {
+      if (!exists(p)) continue;
+      const raw = read(p);
+      if (isOurAgentConfig(raw) || isOurStandaloneHooks(raw)) return true;
+    } catch { /* unreadable → not ours */ }
+  }
+  return false;
+}
+
+/**
  * Merge do config YAML do Hermes (`~/.hermes/config.yaml`). O arquivo é do
  * cliente (modelo, providers, tokens) — nada de sobrescrever: copiamos só os
  * caminhos que são nossos (`mcp_servers.valorbrain`, `memory.provider` e as
@@ -989,14 +1008,28 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null) {
     // cliente instalou; arquivos do OUTRO modo em $HOME são removidos abaixo,
     // porque uma sessão V3 rodando o agente dispararia cada evento duas vezes.
     const kiroMode = id === "kiro" ? detectKiroMode(home) : "v3";
+    // Invariante do VAL-224: o heal nunca CRIA um estado em que dois loaders
+    // registram nossos hooks numa sessão V3. Num projeto que já tem arquivo
+    // nosso de hooks (agent config deixado pela 0.5.1, ou install
+    // --scope=workspace), criar o standalone em $HOME faz exatamente isso — o
+    // arquivo do projeto continua (o heal não escreve em projeto) e cada
+    // evento passa a disparar 2x. Então o heal não cria nada aqui — vale
+    // também sob contractDrift; regras seguem normalmente. Remover o
+    // standalone de $HOME tampouco é opção: não dá para distinguir um
+    // standalone vivo (usuário V3 sem agente) de um resto da era 0.5.0, e
+    // apagar qualquer um dos dois quebra sempre alguém. O estado duplo que já
+    // existe só sai com um install explícito no projeto, que faz a poda do
+    // modo escolhido.
+    const kiroSecondLoaderRisk = id === "kiro" && kiroMode === "v3" && kiroProjectHasOurHooks(process.cwd());
     const manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
     const contractDrift = Boolean(expected && installed !== expected);
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
-    // token do heal — para dentro da mudança de hooks.
-    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
+    // token do heal — para dentro da mudança de hooks. Com risco de segundo
+    // loader, o artifact de hooks do kiro sai do plano inteiro.
+    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(a.kind === "hooks" && kiroSecondLoaderRisk)) }, token, home, false)
       .filter((c) => c.changed && !c.error);
     // Contrato em drift: reaplica regras + hooks. Sem drift de contrato, só hooks
     // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta.

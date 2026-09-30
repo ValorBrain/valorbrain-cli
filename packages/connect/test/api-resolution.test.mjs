@@ -164,6 +164,37 @@ test('v1 migration: argv token is saved against the config.json engine, never th
     assert.ok(paths.includes('GET /setup/artifacts'), 'manifest fetched from the resolved engine');
 });
 
+test('self-heal never adds a second loader: no $HOME standalone while the project has an ours kiro hooks file (VAL-224)', async () => {
+    const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
+    const h = home();
+    const ws = mkdtempSync(join(tmpdir(), 'vb-connect-ws3-'));
+    homes.push(ws);
+    mkdirSync(join(h, '.valorbrain'), { recursive: true });
+    writeFileSync(join(h, '.valorbrain', 'config.json'), JSON.stringify({ api_key: 'vbm_cfg', engine_url: url }));
+    // A 0.5.1-era (or --scope=workspace legacy) agent config of ours in the
+    // PROJECT, empty $HOME: the hook firing here comes from that file (V3 with
+    // the agent active, or the legacy engine). The heal must not react by
+    // creating the $HOME standalone — the project file keeps firing (the heal
+    // never writes to projects), so that would register our hooks under a
+    // SECOND loader and every event would fire twice from the next session on.
+    mkdirSync(join(ws, '.kiro', 'agents'), { recursive: true });
+    const projectAgent = JSON.stringify({
+        name: 'valorbrain',
+        hooks: { agentSpawn: [{ command: 'npx -y @valorbrain/connect hook session-start --harness=kiro' }] },
+    });
+    writeFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), projectAgent);
+
+    const { code, stderr } = await runCli(['hook', 'prompt', '--harness=kiro', '--token=vbm_legacy', `--api=${url}`], h, { cwd: ws });
+    server.close();
+    assert.equal(code, 0, stderr);
+    assert.equal(
+        existsSync(join(h, '.kiro', 'hooks', 'valorbrain.json')),
+        false,
+        'self-heal must not create the $HOME standalone beside a project kiro hooks file of ours',
+    );
+    assert.equal(readFileSync(join(ws, '.kiro', 'agents', 'valorbrain.json'), 'utf-8'), projectAgent, 'project file untouched');
+});
+
 test('install: kiro hooks default to the standalone file in $HOME (v3); legacy is opt-in and mutually exclusive', async () => {
     const { server, url } = await stubApi({ '/setup/artifacts': kiroV2Manifest, '/api/v1/hooks/cue': () => ({ context: '' }) });
     const h = home();

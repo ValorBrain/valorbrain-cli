@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { planFor, scopedManifest, staleKiroFiles, detectKiroMode } = await import('../index.mjs');
+const { planFor, scopedManifest, staleKiroFiles, detectKiroMode, kiroProjectHasOurHooks } = await import('../index.mjs');
 
 const HOME = '/home/customer';
 const CWD = '/work/proj';
@@ -132,4 +132,21 @@ test('detectKiroMode: our agent config on disk means legacy opt-in; anything els
         detectKiroMode(HOME, () => true, () => 'not json'),
         'v3',
     );
+});
+
+test('kiroProjectHasOurHooks: an ours file of EITHER kind counts; foreign or missing does not', () => {
+    const agentConfig = JSON.stringify({ name: 'valorbrain', hooks: { agentSpawn: [{ command: 'npx -y @valorbrain/connect hook session-start --harness=kiro' }] } });
+    const fs = {
+        [`${HOME}/.kiro/agents/valorbrain.json`]: agentConfig,
+        [`${CWD}/.kiro/hooks/valorbrain.json`]: STANDALONE,
+        [`${CWD}/.kiro/agents/valorbrain.json`]: JSON.stringify({ name: 'other-agent', hooks: {} }),
+    };
+    const exists = (p) => p in fs;
+    const read = (p) => fs[p];
+    assert.equal(kiroProjectHasOurHooks(HOME, { exists, read }), true); // agent config (0.5.1 era)
+    assert.equal(kiroProjectHasOurHooks(CWD, { exists, read }), true); // standalone beats the foreign agent config
+    assert.equal(kiroProjectHasOurHooks('/elsewhere', { exists, read }), false);
+    // Garbage on the exact path is not ours.
+    const junk = { [`${CWD}/.kiro/hooks/valorbrain.json`]: 'not json' };
+    assert.equal(kiroProjectHasOurHooks(CWD, { exists: (p) => p in junk, read: (p) => junk[p] }), false);
 });
