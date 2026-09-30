@@ -66,8 +66,10 @@ por diretório.
 - **Opt-in legado é registro.** `--kiro-engine=legacy` grava
   `kiro_engine: "legacy"` na entrada do harness em
   `~/.valorbrain/connect.json` — é o único sinal de modo que o self-heal
-  respeita (a 0.5.1 gravava agent config em `$HOME` por default, então a
-  existência do arquivo nunca significou opt-in). O install v3 limpa o campo.
+  respeita (a 0.5.1 gravava agent config no diretório em que rodava —
+  `kiroWantsWorkspace(null)` → cwd, o que cai em `$HOME` quando o install roda
+  a partir de `~` — então a existência do arquivo nunca significou opt-in).
+  O install v3 limpa o campo.
 - **Depois que o install v3 poda o agent config do projeto** (verificado ao
   vivo, kiro-cli 2.20.1):
   - `kiro-cli agent list` não lista mais `valorbrain`;
