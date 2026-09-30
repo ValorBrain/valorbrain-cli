@@ -5,8 +5,8 @@ MCP e grava os artefatos que o engine mandar (o engine é a fonte única — mud
 contrato no servidor, o próximo run instala).
 
 ```bash
-npx -y @valorbrain/connect                                # detecta, autoriza no navegador, conecta tudo
-npx -y @valorbrain/connect --harness kiro                 # um harness
+npx -y @valorbrain/connect@0.6                            # detecta, autoriza no navegador, conecta tudo
+npx -y @valorbrain/connect@0.6 --harness kiro             # um harness
 npx @valorbrain/connect --token vbm_xxx                   # com um token que você já tem (sem navegador)
 npx @valorbrain/connect --token vbm_xxx --dry-run         # mostra o plano
 npx @valorbrain/connect --status                          # o que está instalado
@@ -25,6 +25,9 @@ curl -fsSL https://valorbrain.valor.digital/install.sh | sh  # macOS e Linux
 ```
 
 ## Login pelo navegador (0.6)
+
+A 0.6 sai com a dist-tag `next` (o `latest` segue na 0.5.2 até a promoção),
+por isso os exemplos fixam `@0.6`.
 
 Sem `--token`, o instalador faz o device flow (RFC 8628) com o app:
 
