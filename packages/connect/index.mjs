@@ -9,7 +9,8 @@
  * Node built-ins + `yaml` (o config do Hermes é YAML; preservamos o arquivo do
  * cliente e só mesclamos as chaves nossas).
  *
- *   npx @valorbrain/connect --token vbm_xxx            # detect and wire everything
+ *   npx @valorbrain/connect                            # detect, approve in the browser, wire everything
+ *   npx @valorbrain/connect --token vbm_xxx            # same, with a token you already have
  *   npx @valorbrain/connect --token vbm_xxx --harness kiro
  *   npx @valorbrain/connect --token vbm_xxx --dry-run
  *   npx @valorbrain/connect --status
@@ -25,6 +26,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
 import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
+import { deviceLabel, deviceLogin, resolveAppUrl } from "./login.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -38,13 +40,14 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, token: null, noBackup: false, scope: null, kiroEngine: "v3" };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, scope: null, kiroEngine: "v3" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
     else if (a === "--remove") out.remove = true;
     else if (a === "--status") out.status = true;
     else if (a === "--no-backup") out.noBackup = true;
+    else if (a === "--no-browser") out.noBrowser = true;
     else if (a === "--scope") out.scope = argv[++i];
     else if (a.startsWith("--scope=")) out.scope = a.slice(8);
     else if (a === "--kiro-engine") out.kiroEngine = argv[++i];
@@ -55,6 +58,8 @@ function parseArgs(argv) {
     else if (a.startsWith("--harness=")) out.harnesses.push(a.slice(10));
     else if (a === "--api") out.api = argv[++i];
     else if (a.startsWith("--api=")) out.api = a.slice(6);
+    else if (a === "--app") out.app = argv[++i];
+    else if (a.startsWith("--app=")) out.app = a.slice(6);
     else if (a === "--help" || a === "-h") out.help = true;
     else if (!a.startsWith("-")) out.harnesses.push(a);
   }
@@ -64,14 +69,23 @@ function parseArgs(argv) {
 const HELP = `
 ${C.bold}@valorbrain/connect${C.off} — wire a CLI agent harness to hosted ValorBrain
 
-  npx @valorbrain/connect --token vbm_xxx                 detect installed harnesses and wire them
-  npx @valorbrain/connect --token vbm_xxx --harness kiro   wire one
+  npx @valorbrain/connect                                  detect your agents, approve this computer
+                                                           in the browser, wire them all
+  npx @valorbrain/connect --harness kiro                   wire one
+  npx @valorbrain/connect --token vbm_xxx                  use a token you already have (no browser)
   npx @valorbrain/connect --token vbm_xxx --dry-run        show the plan, write nothing
   npx @valorbrain/connect --status                         what is wired right now
   npx @valorbrain/connect --token vbm_xxx --remove         undo
 
 Options
   --token vbm_…     MCP token (Settings → MCP Tokens in the app). Or set VALORBRAIN_TOKEN.
+                    Without one, the browser opens so you approve this computer
+                    (you create your account there if needed) and each agent
+                    gets its own token.
+  --no-browser      print the approval link instead of opening it (also:
+                    VALORBRAIN_NO_BROWSER=1; CI and SSH sessions never open one)
+  --app URL         ValorBrain app for the approval (default https://valorbrain.valor.digital,
+                    or VALORBRAIN_APP_URL)
   --api URL         engine base URL (default ${DEFAULT_API})
   --scope what      where harness-local files go: "user" ($HOME, the default)
                     or "workspace" (this project).
@@ -670,15 +684,32 @@ async function main() {
   }
 
   const home = homedir();
-  const token = args.token || process.env.VALORBRAIN_TOKEN || null;
+  let token = args.token || process.env.VALORBRAIN_TOKEN || null;
+  // Filled by the browser login: one token per harness, and the engine URL the
+  // app that approved the computer belongs to.
+  let loginTokens = null;
+  let loginApi = null;
+  const tokenFor = (harness) => (loginTokens && loginTokens[harness]) || token;
 
   // Qa R1 (VAL-195): --status and --remove fetch the manifest from the API,
   // whose blind default was the public one — ignoring the api_url that this
   // same --status prints from ~/.valorbrain/connect.json. With --api omitted,
   // each harness follows the chain its own hook resolves (resolveCredentials,
   // per harness): VALORBRAIN_API_URL > that harness's connect.json api_url >
-  // CLI config.json engine_url > public default.
-  const apiFor = (harness) => resolveInstallApi({ flag: args.api, env: process.env, home, harness, token }).api;
+  // CLI config.json engine_url > public default. After a browser login the
+  // approving app's engine comes right after --api and VALORBRAIN_API_URL.
+  const installApi = (harness) => {
+    const fromLogin = !args.api && !process.env.VALORBRAIN_API_URL && loginApi;
+    const r = resolveInstallApi({
+      flag: args.api || fromLogin || null,
+      env: process.env,
+      home,
+      harness,
+      token: tokenFor(harness),
+    });
+    return fromLogin ? { ...r, from: "the app that approved this computer" } : r;
+  };
+  const apiFor = (harness) => installApi(harness).api;
 
   // Canonical ids everywhere (the engine renders hook commands with them, and
   // credentials are keyed by them): `--harness gemini` must store the entry
@@ -687,15 +718,33 @@ async function main() {
   if (targets.length === 0) {
     targets = detectInstalled(home);
     if (targets.length === 0) {
-      console.error(`No supported harness found under ${home}. Pass one explicitly: ${Object.keys(DETECT).join(", ")}`);
+      console.error(`No supported agent found under ${home}. Install one first (Claude Code, Codex, Cursor, Gemini CLI, Kiro, OpenCode, …) or name it: --harness ${Object.keys(DETECT).join("|")}`);
       return 1;
     }
     console.log(`${C.dim}Detected: ${targets.join(", ")}${C.off}\n`);
   }
 
   if (!args.status && !args.remove && !token) {
-    console.error("A token is required. Get one at Settings → MCP Tokens, then pass --token vbm_… (or set VALORBRAIN_TOKEN).");
-    return 2;
+    if (args.dryRun) {
+      console.error("A dry run never opens the browser: pass --token vbm_… (Settings → MCP Tokens) or set VALORBRAIN_TOKEN.");
+      return 2;
+    }
+    try {
+      const login = await deviceLogin({
+        app: resolveAppUrl({ flag: args.app, env: process.env }),
+        harnesses: targets,
+        label: deviceLabel(),
+        browser: !args.noBrowser,
+        style: C,
+      });
+      loginTokens = login.tokens;
+      token = login.accessToken;
+      loginApi = login.apiUrl;
+      console.log(`${C.green}✓${C.off} approved — ${loginTokens ? Object.keys(loginTokens).length : 1} token(s), one per agent\n`);
+    } catch (err) {
+      console.error(`${C.red}✗${C.off} ${err?.message ?? err}`);
+      return 1;
+    }
   }
 
   const icon = { ok: `${C.green}●${C.off}`, drift: `${C.yellow}◐${C.off}`, missing: `${C.red}○${C.off}` };
@@ -714,7 +763,7 @@ async function main() {
 
     console.log(`${C.bold}${manifest.name}${C.off} ${C.dim}(${manifest.harness}, contract v${manifest.contract_version})${C.off}`);
     {
-      const r = resolveInstallApi({ flag: args.api, env: process.env, home, harness, token });
+      const r = installApi(harness);
       console.log(`  ${C.dim}engine ${r.api} (${r.from})${C.off}`);
     }
 
@@ -739,12 +788,12 @@ async function main() {
     // Hooks read the token from this harness's entry (ADR-058), written before
     // any hook artifact so a freshly wired hook never runs without it. One
     // entry per harness: two harnesses may belong to two tenants.
-    if (!args.remove && token && manifest.hooks_available) {
+    if (!args.remove && tokenFor(harness) && manifest.hooks_available) {
       if (args.dryRun) {
         console.log(`  ${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
       } else {
         try {
-          writeCreds(home, { api: apiFor(harness), token, harness, kiroEngine: args.kiroEngine });
+          writeCreds(home, { api: apiFor(harness), token: tokenFor(harness), harness, kiroEngine: args.kiroEngine });
           console.log(`  ${C.green}✓${C.off} hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
         } catch (err) {
           console.log(`  ${C.red}✗${C.off} hook credentials: ${err.message}`);
@@ -754,7 +803,7 @@ async function main() {
       }
     }
 
-    const changes = planFor(manifest, token, home, args.remove);
+    const changes = planFor(manifest, tokenFor(harness), home, args.remove);
     const res = apply(changes, args);
     failed += res.failed;
     // kiro fires hooks from exactly one file kind per engine (scopedManifest
@@ -787,7 +836,7 @@ async function main() {
 
     // Instalou/atualizou: informa o engine do estado deste harness (fail-open).
     if (!args.remove && !args.dryRun) {
-      await declareContract(apiFor(harness), token, harness, home, manifest);
+      await declareContract(apiFor(harness), tokenFor(harness), harness, home, manifest);
     }
 
     if (!args.remove) {
@@ -814,7 +863,10 @@ async function main() {
     console.log(`${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel}${C.off}`);
   }
   if (args.dryRun) console.log(`${C.yellow}Dry run — nothing was written.${C.off}`);
-  else if (!args.status && !args.remove) console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
+  else if (!args.status && !args.remove) {
+    console.log(`Restart your agent, then verify with: ${C.bold}npx @valorbrain/connect --status${C.off}`);
+    console.log(`${C.dim}First thing to try in the agent:${C.off} "Use ValorBrain: what do you already know about this project? Then save a summary of what we are doing now."`);
+  }
 
   return failed > 0 ? 1 : 0;
 }
@@ -832,7 +884,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.5.3";
+const CLIENT_VERSION = "0.6.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */

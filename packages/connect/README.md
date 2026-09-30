@@ -5,12 +5,44 @@ MCP e grava os artefatos que o engine mandar (o engine é a fonte única — mud
 contrato no servidor, o próximo run instala).
 
 ```bash
-npx @valorbrain/connect --token vbm_xxx                  # detecta e conecta tudo
-npx @valorbrain/connect --token vbm_xxx --harness kiro    # um harness
+npx -y @valorbrain/connect                                # detecta, autoriza no navegador, conecta tudo
+npx -y @valorbrain/connect --harness kiro                 # um harness
+npx @valorbrain/connect --token vbm_xxx                   # com um token que você já tem (sem navegador)
 npx @valorbrain/connect --token vbm_xxx --dry-run         # mostra o plano
 npx @valorbrain/connect --status                          # o que está instalado
 npx @valorbrain/connect --token vbm_xxx --remove          # desfaz
 ```
+
+Sem Node.js instalado, o app serve um instalador de uma linha que confere o
+Node 18+ antes (no Windows, oferece instalar a LTS com o winget):
+
+```powershell
+irm https://valorbrain.valor.digital/install.ps1 | iex      # Windows (PowerShell)
+```
+
+```bash
+curl -fsSL https://valorbrain.valor.digital/install.sh | sh  # macOS e Linux
+```
+
+## Login pelo navegador (0.6)
+
+Sem `--token`, o instalador faz o device flow (RFC 8628) com o app:
+
+1. pede um código em `POST /api/v1/cli/device/code` com `client: "connect"`,
+   os harnesses que encontrou e o nome do computador;
+2. abre `https://valorbrain.valor.digital/cli/link?code=XXXX-XXXX` (no Windows
+   `explorer.exe`, no macOS `open`, no Linux `xdg-open`; no WSL, o navegador do
+   Windows). Em CI, por SSH sem display ou com `--no-browser`
+   (`VALORBRAIN_NO_BROWSER=1`), só imprime o link;
+3. a pessoa confere o código e autoriza. Quem ainda não tem conta cria no
+   caminho e volta para a mesma página;
+4. o app cria **um token MCP por harness**, atribuído àquele agente e
+   revogável sozinho em Configurações → Tokens MCP, e entrega uma única vez em
+   `POST /api/v1/cli/device/token`.
+
+`--app URL` (ou `VALORBRAIN_APP_URL`) aponta para outro app (staging). O engine
+de cada harness passa a ser o do app que autorizou, salvo `--api` ou
+`VALORBRAIN_API_URL`.
 
 ## Harnesses
 
