@@ -54,7 +54,7 @@ _DEFAULT_PORT = 7438
 # CONTRACT_VERSION em src/harness/contract.ts — tests/unit/hermes-plugin.test.ts
 # falha se divergir. Vai no capabilities do register/heartbeat: é o que permite
 # medir a adoção do contrato por harness (agent_runtimes.contract_declared_at).
-_CONTRACT_VERSION = "6"
+_CONTRACT_VERSION = "7"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
