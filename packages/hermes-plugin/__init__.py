@@ -202,9 +202,93 @@ def _runtime_seed() -> Optional[str]:
     return token[:12] if token else None
 
 
+def _error_kind(status: int) -> str:
+    """Status HTTP → família de causa. O resto é 'http'."""
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "forbidden"
+    if status == 404:
+        return "not_found"
+    return "http"
+
+
+def _rest_actionable_error(kind: str, detail: str, url: str = "",
+                           status: Optional[int] = None) -> str:
+    """Mensagem que o agente pode agir, não o rótulo que sobrou (FB-0100).
+
+    O relato era "ValorBrain REST API unreachable" com o MCP funcionando ao
+    lado: o texto não dizia se faltava token, se a rota mudou ou se o engine
+    estava fora do ar — e o agente que não sabe qual dos três é não tem o que
+    corrigir. Aqui cada caso vira instrução.
+    """
+    if kind == "unauthorized":
+        return (
+            "ValorBrain REST recusou a chamada (401): sem VALORBRAIN_API_TOKEN ou "
+            "token expirado/revogado. Não é problema de rede — o engine respondeu."
+        )
+    if kind == "forbidden":
+        return (
+            "ValorBrain REST recusou a chamada (403): token sem escopo para esta "
+            "operação ou tenant fora do token. O engine respondeu; faltou permissão."
+        )
+    if kind == "not_found":
+        return (
+            f"ValorBrain REST respondeu 404 para {url or 'a rota chamada'}: a rota "
+            "não existe nesta versão do engine (verifique se o cliente está mais "
+            "antigo que o engine)."
+        )
+    if kind == "http":
+        return (
+            f"ValorBrain REST respondeu {status} em {url or 'a chamada'}: o engine "
+            f"está no ar e deu erro. Detalhe: {detail}"
+        )
+    if kind == "transport":
+        return (
+            f"ValorBrain REST inacessível em {url or f'127.0.0.1:{_DEFAULT_PORT}'}: "
+            f"{detail}. Se o engine é hospedado, VALORBRAIN_ENGINE_URL não está "
+            "apontando para ele; se é local, o processo `valorbrain serve` não está "
+            "ouvindo nessa porta."
+        )
+    return f"ValorBrain REST falhou: {detail}"
+
+
+def _rest_call_detail(port: int, method: str, path: str,
+                      body: Optional[dict] = None, timeout: float = _REST_TIMEOUT,
+                      raw: bool = False):
+    """`_rest_call` com o motivo da falha. Devolve (data, err).
+
+    `err` é None em sucesso; caso contrário um dict {kind, detail, url, status}:
+      transport  — ninguém respondeu (conexão recusada, DNS, timeout)
+      http       — o engine respondeu com status >= 400
+      decode     — resposta 2xx que não é JSON
+    A separação é o conserto de FB-0100: antes, 401 e 404 e recusa de conexão
+    viravam o mesmo `None` e saíam como "REST API unreachable".
+    """
+    out: list = [None]
+    data = _rest_call(port, method, path, body=body, timeout=timeout, raw=raw, _out=out)
+    return data, out[0]
+
+
+def _tool_call_error(err: Optional[dict]) -> str:
+    """Corpo de erro de tool a partir do detalhe da chamada REST."""
+    if not err:
+        return json.dumps({"error": "ValorBrain REST API unreachable"})
+    return json.dumps(
+        {
+            "error": _rest_actionable_error(
+                err.get("kind", "http"), err.get("detail", ""),
+                err.get("url", ""), err.get("status"),
+            ),
+            "status": err.get("status"),
+            "kind": err.get("kind"),
+        }
+    )
+
+
 def _rest_call(port: int, method: str, path: str,
                body: Optional[dict] = None, timeout: float = _REST_TIMEOUT,
-               raw: bool = False):
+               raw: bool = False, _out: Optional[list] = None):
     """Call the ValorBrain REST API. Parsed JSON, raw text (raw=True), or None.
 
     Multi-tenant headers:
@@ -213,6 +297,9 @@ def _rest_call(port: int, method: str, path: str,
       X-Source-Agent — defaults to 'hermes-plugin' so the engine can attribute
                        writes to this client.
       X-Source-System — from VALORBRAIN_SOURCE_SYSTEM env, defaults 'hermes'.
+
+    Com `_out` (lista de uma posição), recebe {kind, detail, url, status} no
+    lugar de None como metadado da falha — o chamador decide se usa.
     """
     headers: dict = {"Content-Type": "application/json"}
     token = os.environ.get("VALORBRAIN_API_TOKEN")
@@ -235,6 +322,21 @@ def _rest_call(port: int, method: str, path: str,
 
     base = _engine_base_url(port)
 
+    def _fail(kind: str, detail: str, status: Optional[int] = None):
+        url = f"{base}{path}"
+        logger.debug("ValorBrain REST %s %s failed (%s/%s): %s", method, path, kind, status, detail)
+        if _out is not None:
+            _out[0] = {"kind": kind, "detail": detail, "url": url, "status": status}
+        return None
+
+    def _ok(payload_text: str):
+        if raw:
+            return payload_text
+        try:
+            return json.loads(payload_text)
+        except json.JSONDecodeError as e:
+            return _fail("decode", f"resposta 2xx que não é JSON: {e}")
+
     try:
         import httpx
     except ImportError:
@@ -250,11 +352,16 @@ def _rest_call(port: int, method: str, path: str,
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                payload = resp.read().decode()
-                return payload if raw else json.loads(payload)
+                return _ok(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read().decode()[:200]
+            except Exception:
+                detail = ""
+            kind = _error_kind(e.code)
+            return _fail(kind, detail or str(e), e.code)
         except (urllib.error.URLError, Exception) as e:
-            logger.debug("ValorBrain REST %s %s failed: %s", method, path, e)
-            return None
+            return _fail("transport", str(e))
 
     try:
         client = httpx.Client(timeout=timeout)
@@ -266,11 +373,17 @@ def _rest_call(port: int, method: str, path: str,
                 json=body or {},
                 headers=headers,
             )
-        resp.raise_for_status()
-        return resp.text if raw else resp.json()
     except Exception as e:
-        logger.debug("ValorBrain REST %s %s failed: %s", method, path, e)
-        return None
+        # Antes do request: ninguém respondeu (conexão recusada, DNS, timeout).
+        return _fail("transport", f"{type(e).__name__}: {e}")
+
+    status = resp.status_code
+    if status >= 400:
+        return _fail(_error_kind(status), resp.text[:200], status)
+    try:
+        return _ok(resp.text)
+    except Exception as e:
+        return _fail("decode", f"{type(e).__name__}: {e}", status)
 
 
 def _extract_context(hook_output: str) -> str:
@@ -1230,25 +1343,29 @@ class ValorBrainProvider(MemoryProvider):
         body = {"query": query, "compact": True}
         if args.get("limit"):
             body["limit"] = args["limit"]
-        data = _rest_call(self._port, "POST", "/retrieve", body)
+        data, err = _rest_call_detail(self._port, "POST", "/retrieve", body)
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_get(self, args: dict) -> str:
         docid = args.get("docid", "")
         if not docid:
             return json.dumps({"error": "docid is required"})
-        data = _rest_call(self._port, "GET", f"/documents/{docid}")
+        data, err = _rest_call_detail(self._port, "GET", f"/documents/{docid}")
         if data is None:
-            return json.dumps({"error": f"Document not found: {docid}"})
+            # 404 aqui é o caso comum (docid curto/inexistente), não engine fora
+            # do ar: antes respondia "Document not found" para 401 e 5xx também.
+            if err and err.get("kind") == "not_found":
+                return json.dumps({"error": f"Document not found: {docid}"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_session_log(self, args: dict) -> str:
         limit = args.get("limit", 5)
-        data = _rest_call(self._port, "GET", f"/sessions?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/sessions?limit={limit}")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_timeline(self, args: dict) -> str:
@@ -1257,9 +1374,9 @@ class ValorBrainProvider(MemoryProvider):
             return json.dumps({"error": "docid is required"})
         before = args.get("before", 5)
         after = args.get("after", 5)
-        data = _rest_call(self._port, "GET", f"/timeline/{docid}?before={before}&after={after}")
+        data, err = _rest_call_detail(self._port, "GET", f"/timeline/{docid}?before={before}&after={after}")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_similar(self, args: dict) -> str:
@@ -1267,9 +1384,9 @@ class ValorBrainProvider(MemoryProvider):
         if not docid:
             return json.dumps({"error": "docid is required"})
         limit = args.get("limit", 5)
-        data = _rest_call(self._port, "GET", f"/graph/similar/{docid}?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/graph/similar/{docid}?limit={limit}")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_store(self, args: dict) -> str:
@@ -1287,24 +1404,24 @@ class ValorBrainProvider(MemoryProvider):
         }
         if args.get("tags"):
             body["tags"] = args["tags"]
-        data = _rest_call(self._port, "POST", "/api/v1/memory/store", body)
+        data, err = _rest_call_detail(self._port, "POST", "/api/v1/memory/store", body)
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_health(self, args: dict) -> str:
         """Check memory health via GET /api/v1/memory/health."""
         limit = args.get("limit", 3)
-        data = _rest_call(self._port, "GET", f"/api/v1/memory/health?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/memory/health?limit={limit}")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_working_context(self, args: dict) -> str:
         """Get working context via GET /api/v1/memory/working-context."""
-        data = _rest_call(self._port, "GET", "/api/v1/memory/working-context")
+        data, err = _rest_call_detail(self._port, "GET", "/api/v1/memory/working-context")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_feedback(self, args: dict) -> str:
@@ -1319,14 +1436,14 @@ class ValorBrainProvider(MemoryProvider):
             for key in ("category", "priority"):
                 if args.get(key):
                     body[key] = args[key]
-            data = _rest_call(self._port, "POST", "/api/v1/feedback", body=body)
+            data, err = _rest_call_detail(self._port, "POST", "/api/v1/feedback", body=body)
             if data is None:
-                return json.dumps({"error": "ValorBrain REST API unreachable"})
+                return _tool_call_error(err)
             return json.dumps(data, ensure_ascii=False)
         feedback_id = args.get("feedback_id") or "all"
-        data = _rest_call(self._port, "GET", f"/api/v1/feedback/{feedback_id}")
+        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/feedback/{feedback_id}")
         if data is None:
-            return json.dumps({"error": "ValorBrain REST API unreachable"})
+            return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     # -- Managed serve ---------------------------------------------------------
