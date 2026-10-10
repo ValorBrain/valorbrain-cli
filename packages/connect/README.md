@@ -5,13 +5,16 @@ MCP e grava os artefatos que o engine mandar (o engine é a fonte única — mud
 contrato no servidor, o próximo run instala).
 
 ```bash
-npx -y @valorbrain/connect@0.6                            # detecta, autoriza no navegador, conecta tudo
-npx -y @valorbrain/connect@0.6 --harness kiro             # um harness
-npx @valorbrain/connect --token vbm_xxx                   # com um token que você já tem (sem navegador)
-npx @valorbrain/connect --token vbm_xxx --dry-run         # mostra o plano
-npx @valorbrain/connect --status                          # o que está instalado
-npx @valorbrain/connect --token vbm_xxx --remove          # desfaz
+npx -y @valorbrain/connect@0.7                            # detecta, autoriza no navegador, conecta tudo
+npx -y @valorbrain/connect@0.7 --harness kiro             # um harness
+npx -y @valorbrain/connect@0.7 --token vbm_xxx            # com um token que você já tem (sem navegador)
+npx -y @valorbrain/connect@0.7 --token vbm_xxx --dry-run  # mostra o plano
+npx -y @valorbrain/connect@0.7 --status                   # o que está instalado
+npx -y @valorbrain/connect@0.7 --token vbm_xxx --remove   # desfaz
 ```
+
+A 0.7 sai com a dist-tag `next` (o `latest` segue na 0.6.0 até a promoção),
+por isso os exemplos fixam `@0.7`.
 
 Sem Node.js instalado, o app serve um instalador de uma linha que confere o
 Node 18+ antes (no Windows, oferece instalar a LTS com o winget):
@@ -24,10 +27,28 @@ irm https://valorbrain.valor.digital/install.ps1 | iex      # Windows (PowerShel
 curl -fsSL https://valorbrain.valor.digital/install.sh | sh  # macOS e Linux
 ```
 
-## Login pelo navegador (0.6)
+## De onde vem o token
 
-A 0.6 sai com a dist-tag `next` (o `latest` segue na 0.5.2 até a promoção),
-por isso os exemplos fixam `@0.6`.
+Só tokens MCP (`vbm_…`) são aceitos; uma chave REST (`vb_agent_…`, `vb_…`)
+em `--token` ou `VALORBRAIN_MCP_TOKEN` para o instalador com uma mensagem que
+diz onde achar o token certo. A ordem:
+
+1. `--token vbm_…`
+2. `VALORBRAIN_MCP_TOKEN`
+3. `VALORBRAIN_TOKEN` (depreciada, com aviso; só vale se for `vbm_` — qualquer
+   outra coisa é a chave REST e é ignorada aqui)
+4. o `mcp_token` que `npx -y @valorbrain/cli init --agent` gravou em
+   `~/.valorbrain/config.json` — para os agentes que ainda não têm token próprio
+   neste computador (os já conectados mantêm o seu; `--relogin` troca todos)
+5. sem nada disso, o login pelo navegador (abaixo)
+
+## Onde o instalador escreve
+
+Os caminhos vêm do manifesto do servidor e só podem cair dentro da sua home ou
+do projeto atual (`--scope workspace`). Caminho com `..` ou absoluto fora dessas
+duas raízes é recusado e aparece como erro no plano — nada é escrito nele.
+
+## Login pelo navegador (0.6)
 
 Sem `--token`, o instalador faz o device flow (RFC 8628) com o app:
 
@@ -198,14 +219,17 @@ identificado (com data de adoção) na cobertura do dashboard.
 
 ## MCP client (stdio)
 
-Para clientes que falam MCP via stdio em vez de config de arquivo:
+Para clientes que falam MCP via stdio em vez de config de arquivo, o proxy é o
+da CLI (`@valorbrain/connect` é o instalador; `valorbrain-connect mcp` só
+repassa para ele). Usa o `mcp_token` salvo por `npx -y @valorbrain/cli init
+--agent`, ou `VALORBRAIN_MCP_TOKEN` / `--token vbm_…`:
 
 ```json
 {
   "mcpServers": {
     "valorbrain": {
       "command": "npx",
-      "args": ["-y", "@valorbrain/connect", "--token", "vbm_…"]
+      "args": ["-y", "@valorbrain/cli", "mcp"]
     }
   }
 }

@@ -22,9 +22,10 @@
  */
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { parseDocument } from "yaml";
+import { spawn } from "node:child_process";
 import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
 import { deviceLabel, deviceLogin, installId, isUnattended, resolveAppUrl } from "./login.mjs";
 
@@ -79,10 +80,12 @@ ${C.bold}@valorbrain/connect${C.off} — wire a CLI agent harness to hosted Valo
   npx @valorbrain/connect --token vbm_xxx --remove         undo
 
 Options
-  --token vbm_…     MCP token (Settings → MCP Tokens in the app). Or set VALORBRAIN_TOKEN.
-                    Without one, the browser opens so you approve this computer
+  --token vbm_…     MCP token (Settings → MCP Tokens in the app). Or set VALORBRAIN_MCP_TOKEN.
+                    Without one, the mcp_token saved by \`npx -y @valorbrain/cli init --agent\`
+                    (~/.valorbrain/config.json) is used for agents not yet connected;
+                    without that either, the browser opens so you approve this computer
                     (you create your account there if needed) and each agent
-                    gets its own token.
+                    gets its own token. Only vbm_ tokens are accepted.
   --no-browser      print the approval link instead of opening it (also:
                     VALORBRAIN_NO_BROWSER=1). Needed to log in from CI or
                     piped output, which otherwise stop and ask for --token;
@@ -462,14 +465,38 @@ function mergeYaml(existingRaw, renderedRaw, remove) {
   return existing.toString({ lineWidth: 0 });
 }
 
-function planFor(manifest, token, home, remove) {
+/**
+ * Where a manifest artifact may write: inside the user's home or the current
+ * project, nowhere else. The manifest comes from the network; a path with a
+ * `..` segment, or an absolute path outside both roots, is refused instead of
+ * written (it would let a bad manifest edit any file the user can write).
+ */
+export function manifestTarget(rawPath, home, cwd = process.cwd()) {
+  const raw = String(rawPath ?? "");
+  if (raw.split(/[\\/]+/).includes("..")) return { error: `refusing manifest path with "..": ${raw}` };
+  const path = expand(raw, home);
+  if (!path) return { path: null };
+  const inside = (root) => {
+    const rel = relative(resolve(root), path);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+  if (!inside(home) && !inside(cwd)) return { error: `refusing manifest path outside your home and this project: ${raw}` };
+  return { path };
+}
+
+function planFor(manifest, token, home, remove, cwd = process.cwd()) {
   const changes = [];
   // Two artifacts can share a file (Gemini keeps MCP servers and hooks in
   // settings.json): each must build on what the previous one will write, or
   // the second write reverts the first.
   const planned = new Map();
   for (const artifact of manifest.artifacts) {
-    const path = expand(artifact.path, home);
+    const target = manifestTarget(artifact.path, home, cwd);
+    if (target.error) {
+      changes.push({ artifact, path: String(artifact.path), before: null, after: null, changed: false, error: target.error });
+      continue;
+    }
+    const path = target.path;
     if (!path) continue;
     const before = planned.has(path) ? planned.get(path) : existsSync(path) ? readFileSync(path, "utf-8") : null;
     // Substitute the real token, and expand `~` inside file contents too
@@ -549,6 +576,53 @@ function apply(changes, { dryRun, noBackup }) {
     }
   }
   return { wrote, failed };
+}
+
+/**
+ * The MCP token this run installs, and where it came from:
+ *   --token > VALORBRAIN_MCP_TOKEN > VALORBRAIN_TOKEN (deprecated; only a vbm_
+ *   value — anything else is the REST key) > [installing only] the mcp_token
+ *   @valorbrain/cli saved in ~/.valorbrain/config.json.
+ * An explicit token that is not vbm_ is an error: the MCP host accepts nothing
+ * else, and a REST key wired into a harness fails later with a generic 401.
+ */
+export function resolveInstallToken({ flag, env = {}, home, install = true }) {
+  const warnings = [];
+  const notMcp = (from, value) => ({
+    token: null, source: null, warnings,
+    error: `${from} must be an MCP token (vbm_…); got one starting with "${String(value).slice(0, 9)}". ` +
+      "vb_agent_… / vb_… is the REST key. Use the mcp_token from `npx -y @valorbrain/cli init --agent` or Settings → MCP Tokens in the app.",
+  });
+  if (flag != null) {
+    if (!isMcpToken(flag)) return notMcp("--token", flag);
+    return { token: flag, source: "flag", warnings };
+  }
+  if (env.VALORBRAIN_MCP_TOKEN) {
+    if (!isMcpToken(env.VALORBRAIN_MCP_TOKEN)) return notMcp("VALORBRAIN_MCP_TOKEN", env.VALORBRAIN_MCP_TOKEN);
+    return { token: env.VALORBRAIN_MCP_TOKEN, source: "VALORBRAIN_MCP_TOKEN", warnings };
+  }
+  if (env.VALORBRAIN_TOKEN) {
+    if (isMcpToken(env.VALORBRAIN_TOKEN)) {
+      warnings.push("VALORBRAIN_TOKEN is deprecated — use VALORBRAIN_MCP_TOKEN for the MCP token (vbm_)");
+      return { token: env.VALORBRAIN_TOKEN, source: "VALORBRAIN_TOKEN", warnings };
+    }
+    warnings.push("VALORBRAIN_TOKEN holds a REST key, not an MCP token (vbm_) — ignored here");
+  }
+  if (install && home) {
+    let cfg = null;
+    try {
+      cfg = JSON.parse(readFileSync(join(home, ".valorbrain", "config.json"), "utf-8"));
+    } catch { /* no CLI config */ }
+    if (isMcpToken(cfg?.mcp_token)) {
+      const api = typeof cfg.engine_url === "string" && cfg.engine_url ? cfg.engine_url.replace(/\/+$/, "") : null;
+      return { token: cfg.mcp_token, source: "cli", api, warnings };
+    }
+  }
+  return { token: null, source: null, warnings };
+}
+
+function isMcpToken(value) {
+  return typeof value === "string" && value.startsWith("vbm_");
 }
 
 /**
@@ -691,7 +765,14 @@ async function main() {
   }
 
   const home = homedir();
-  let token = args.token || process.env.VALORBRAIN_TOKEN || null;
+  const resolved = resolveInstallToken({ flag: args.token, env: process.env, home, install: !args.status && !args.remove });
+  if (resolved.error) {
+    console.error(`${C.red}✗${C.off} ${resolved.error}`);
+    return 2;
+  }
+  for (const w of resolved.warnings) console.error(`${C.yellow}!${C.off} ${w}`);
+  let token = resolved.token;
+  if (resolved.source === "cli") console.log(`${C.dim}Using the MCP token saved by @valorbrain/cli (~/.valorbrain/config.json)${C.off}`);
   // Filled by the browser login: one token per harness, and the engine URL the
   // app that approved the computer belongs to. Agents already connected on
   // this computer keep the token saved in ~/.valorbrain/connect.json.
@@ -716,14 +797,18 @@ async function main() {
   // approving app's engine comes right after --api and VALORBRAIN_API_URL.
   const installApi = (harness) => {
     const fromLogin = !args.api && !process.env.VALORBRAIN_API_URL && loginApi;
+    // The CLI's token belongs to the engine the CLI signed up on.
+    const fromCli = !args.api && !process.env.VALORBRAIN_API_URL && !fromLogin
+      && resolved.source === "cli" && resolved.api && tokenFor(harness) === token ? resolved.api : null;
     const r = resolveInstallApi({
-      flag: args.api || fromLogin || null,
+      flag: args.api || fromLogin || fromCli || null,
       env: process.env,
       home,
       harness,
       token: tokenFor(harness),
     });
-    return fromLogin ? { ...r, from: "the app that approved this computer" } : r;
+    if (fromLogin) return { ...r, from: "the app that approved this computer" };
+    return fromCli ? { ...r, from: "CLI config.json" } : r;
   };
   const apiFor = (harness) => installApi(harness).api;
 
@@ -756,16 +841,25 @@ async function main() {
     console.log(`${C.dim}Detected: ${targets.join(", ")}${C.off}\n`);
   }
 
+  // The CLI's token is a fallback for agents that have none of their own: an
+  // agent already connected on this computer keeps its saved token.
+  if (resolved.source === "cli" && !args.relogin) {
+    for (const harness of targets) {
+      const saved = readCreds(home, harness);
+      if (saved?.token) savedTokens[harness] = saved.token;
+    }
+  }
+
   if (!args.status && !args.remove && !token) {
     if (args.dryRun) {
-      console.error("A dry run never opens the browser: pass --token vbm_… (Settings → MCP Tokens) or set VALORBRAIN_TOKEN.");
+      console.error("A dry run never opens the browser: pass --token vbm_… (Settings → MCP Tokens), set VALORBRAIN_MCP_TOKEN, or run `npx -y @valorbrain/cli init --agent` first.");
       return 2;
     }
     // Nobody at the keyboard (CI, piped output): an approval link in a log is
     // an invitation for whoever reads the log to wire this machine to their
     // own workspace. Fail fast, as 0.5 did, unless asked to print the link.
     if (isUnattended() && !args.noBrowser && process.env.VALORBRAIN_NO_BROWSER !== "1") {
-      console.error("No token, and nobody here to approve in a browser (CI or piped output). Pass --token vbm_… (Settings → MCP Tokens), set VALORBRAIN_TOKEN, or add --no-browser to print the approval link anyway.");
+      console.error("No token, and nobody here to approve in a browser (CI or piped output). Pass --token vbm_… (Settings → MCP Tokens), set VALORBRAIN_MCP_TOKEN, run `npx -y @valorbrain/cli init --agent` first, or add --no-browser to print the approval link anyway.");
       return 2;
     }
 
@@ -971,7 +1065,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.6.0";
+const CLIENT_VERSION = "0.7.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -1276,16 +1370,18 @@ if (process.env.VALORBRAIN_CONNECT_NO_MAIN === '1') {
         .then((code) => process.exit(code))
         .catch(() => process.exit(0));
 } else if (process.argv[2] === 'mcp') {
-    // 0.1.x compat: `valorbrain-connect --token …` used to BE the MCP proxy
-    // (same as `valorbrain mcp`). The installer is the new default surface;
-    // the proxy survives as an explicit subcommand, served by @valorbrain/cli
-    // when it is installed alongside.
-    import('@valorbrain/cli/lib/mcp-proxy.js')
-        .then((m) => m.runMcpProxy(process.argv.slice(3)))
-        .catch(() => {
-            console.error('valorbrain-connect mcp needs @valorbrain/cli installed (npm i -g @valorbrain/cli), or use: valorbrain mcp');
-            process.exit(1);
-        });
+    // 0.1.x compat: `valorbrain-connect --token …` used to BE the MCP proxy.
+    // The installer is the default surface; the proxy lives in @valorbrain/cli
+    // (`npx -y @valorbrain/cli mcp`), which this subcommand runs as-is.
+    const child = spawn('npx', ['-y', '@valorbrain/cli', 'mcp', ...process.argv.slice(3)], {
+        stdio: 'inherit',
+        shell: process.platform === 'win32',
+    });
+    child.on('error', (err) => {
+        console.error(`valorbrain-connect mcp: could not start \`npx -y @valorbrain/cli mcp\` (${err.message}). Run it directly.`);
+        process.exit(1);
+    });
+    child.on('exit', (code, signal) => process.exit(signal ? 1 : (code ?? 1)));
 } else {
     main().then((code) => process.exit(code)).catch((err) => {
         console.error(`connect failed: ${err?.stack || err}`);
