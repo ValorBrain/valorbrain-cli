@@ -1,0 +1,23 @@
+name: test
+
+# Contract tests for the CLI (node --test, zero dependencies). Same runner
+# labels as publish.yml.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, linux, x64, valorbrain-cli]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
