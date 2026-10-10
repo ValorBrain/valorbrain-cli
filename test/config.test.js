@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveMcpToken, isMcpToken, fingerprint } from "../lib/config.js";
+import { resolveMcpToken, isMcpToken, fingerprint, findApiKey, requireApiKey, resolveBaseUrl } from "../lib/config.js";
 
 const VBM = "vbm_" + "x".repeat(65);
 const AGENT = "vb_agent_" + "a".repeat(32);
@@ -62,4 +62,47 @@ test("isMcpToken recognises the vbm_ prefix only", () => {
 test("fingerprint keeps 12 + 4 characters and nothing else", () => {
   assert.equal(fingerprint(AGENT), `${AGENT.slice(0, 12)}…${AGENT.slice(-4)}`);
   assert.equal(fingerprint(null), null);
+});
+
+const cleanAll = { ...clean, VALORBRAIN_API_KEY: undefined, VALORBRAIN_API_TOKEN: undefined, VALORBRAIN_API_URL: undefined, VALORBRAIN_URL: undefined };
+
+test("findApiKey: flag > VALORBRAIN_API_KEY > legacy VALORBRAIN_TOKEN > VALORBRAIN_API_TOKEN > config", () => {
+  const cfg = { api_key: "vb_agent_cfg" };
+  withEnv({ ...cleanAll, VALORBRAIN_API_KEY: "vb_agent_env", VALORBRAIN_TOKEN: "vb_agent_legacy" }, () => {
+    assert.deepEqual(findApiKey({ keyFlag: "vb_agent_flag", cfg }), { key: "vb_agent_flag", source: "flag" });
+    assert.deepEqual(findApiKey({ cfg }), { key: "vb_agent_env", source: "VALORBRAIN_API_KEY" });
+  });
+  withEnv({ ...cleanAll, VALORBRAIN_TOKEN: "vb_agent_legacy", VALORBRAIN_API_TOKEN: "vb_agent_api_token" }, () => {
+    assert.equal(findApiKey({ cfg }).source, "VALORBRAIN_TOKEN");
+  });
+  withEnv({ ...cleanAll, VALORBRAIN_TOKEN: VBM, VALORBRAIN_API_TOKEN: "vb_agent_api_token" }, () => {
+    assert.equal(findApiKey({ cfg }).source, "VALORBRAIN_API_TOKEN", "a vbm_ VALORBRAIN_TOKEN is the MCP token, not the REST key");
+  });
+  withEnv(cleanAll, () => {
+    assert.deepEqual(findApiKey({ cfg }), { key: "vb_agent_cfg", source: "config" });
+    assert.equal(findApiKey({ cfg: null }), null);
+  });
+});
+
+test("requireApiKey refuses a vbm_ token for REST and explains where it goes", () => {
+  withEnv({ ...cleanAll, VALORBRAIN_API_KEY: VBM }, () => {
+    assert.throws(() => requireApiKey({ cfg: null }), (e) => e.code === "wrong_credential_type" && e.exit === 3 && /VALORBRAIN_MCP_TOKEN/.test(e.message));
+  });
+  withEnv(cleanAll, () => {
+    assert.throws(() => requireApiKey({ cfg: null }), (e) => e.code === "no_credential" && e.exit === 3);
+  });
+});
+
+test("resolveBaseUrl: VALORBRAIN_API_URL, legacy VALORBRAIN_URL, flag wins", () => {
+  withEnv({ ...cleanAll, VALORBRAIN_API_URL: "https://a.test/", VALORBRAIN_URL: "https://legacy.test" }, () => {
+    assert.equal(resolveBaseUrl({}), "https://a.test");
+    assert.equal(resolveBaseUrl({ urlFlag: "https://flag.test" }), "https://flag.test");
+  });
+  withEnv({ ...cleanAll, VALORBRAIN_URL: "https://legacy.test" }, () => {
+    assert.equal(resolveBaseUrl({}), "https://legacy.test");
+  });
+  withEnv(cleanAll, () => {
+    assert.equal(resolveBaseUrl({ cfg: { engine_url: "https://cfg.test" } }), "https://cfg.test");
+    assert.equal(resolveBaseUrl({}), "https://valorbrain-api.valor.digital");
+  });
 });

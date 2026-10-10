@@ -71,7 +71,7 @@ test("a REST key is refused locally, before any request", async () => {
   const mcp = await fakeMcp(200, { jsonrpc: "2.0", id: 1, result: {} });
   try {
     const r = await proxy(["--url", mcp.url, "--token", AGENT], { home: freshHome(), send: INIT });
-    assert.equal(r.code, 1);
+    assert.equal(r.code, 3);
     assert.match(r.stderr, /only accepts vbm_ tokens/);
     assert.equal(mcp.calls.length, 0);
   } finally {
@@ -81,7 +81,7 @@ test("a REST key is refused locally, before any request", async () => {
 
 test("without any token the proxy explains where one comes from", async () => {
   const r = await proxy([], { home: freshHome(), send: INIT });
-  assert.equal(r.code, 1);
+  assert.equal(r.code, 3);
   assert.match(r.stderr, /VALORBRAIN_MCP_TOKEN/);
   assert.match(r.stderr, /init --agent/);
 });
@@ -123,7 +123,7 @@ test("a config without mcp_token never falls back to the REST key", async () => 
   const home = freshHome({ tenant_id: "t", api_key: AGENT, mcp_url: mcp.url });
   try {
     const r = await proxy([], { home, send: INIT });
-    assert.equal(r.code, 1);
+    assert.equal(r.code, 3);
     assert.match(r.stderr, /no MCP token/);
     assert.equal(mcp.calls.length, 0);
   } finally {

@@ -85,7 +85,7 @@ function run(args, { home, url, path = fakeBin(), stdin = null }) {
         HOME: home,
         USERPROFILE: home,
         PATH: path,
-        VALORBRAIN_URL: url,
+        VALORBRAIN_API_URL: url,
         VALORBRAIN_TOKEN: "",
         VALORBRAIN_MCP_TOKEN: "",
       },
@@ -197,7 +197,8 @@ test("a second init --agent is refused without --force and keeps the config", as
   try {
     assert.equal((await run(["init", "--agent", "--json"], { home, url: engine.url })).status, 0);
     const second = await run(["init", "--agent", "--json"], { home, url: engine.url });
-    assert.equal(second.status, 1);
+    assert.equal(second.status, 2, "config_exists is a usage error (exit 2)");
+    assert.equal(JSON.parse(second.stdout.trim()).code, "config_exists");
     const out = JSON.parse(second.stdout.trim());
     assert.equal(out.ok, false);
     assert.equal(out.existing_tenant_id, SIGNUP.tenant_id);
