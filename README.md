@@ -34,20 +34,35 @@ pass `--force` to replace it, and a backup is written first.
 | `init --agent [--agent-caller <platform>] [--force]` | Creates an account with a REST key and an MCP token |
 | `init --email <address> [--otp <code>]` | Binds the account to an email via OTP — **neither credential changes**. With `--json`, the first call sends the code and the second (`--otp`) verifies it |
 | `identify <platform>` | Records which agent is calling (idempotent) |
-| `add <text>` / `--file <path>` | Stores a memory (`--collection`, `--title`, `--type`) |
-| `search <query>` | Search (`--collection`, `--mode auto\|keyword\|semantic\|hybrid`) |
+| `add <text>` / `--file <path>` | Stores a memory (`--collection`, `--title`, `--type decision\|observation\|problem\|milestone\|handoff\|lesson\|note`, `--sensitivity public\|internal\|private\|company_confidential`) |
+| `add --key <name> <text>` | Stores it under a stable path (`cli/key/<slug>`): adding the same key again revises the memory (`action: updated`, `revision_count` + 1) |
+| `add --supersedes <docid\|path> <text>` | Marks an older memory as superseded by this one (repeatable) |
+| `search <query>` | Search (`--collection`, `--limit 1-100`, `--mode auto\|keyword\|semantic\|hybrid`) |
+| `forget <docid>` | Forgets a memory (soft delete; it stops appearing in search) |
 | `list` | Lists collections |
 | `status` | Local config + remote health |
 | `mcp [--token vbm_…]` | Bridges stdio MCP clients to the hosted MCP server (uses the saved `mcp_token`) |
-| `help --json` | The whole surface, machine-readable |
+| `help --json` | The whole surface, machine-readable — generated from the same spec the parser enforces |
 
-Every command takes `--json` (alias `--agent`) for single-object
-machine-readable output, `--key` for an explicit API key, and `--url` to point
-at another deployment.
+Global flags work in any position, before or after the command: `--json` for
+single-object machine-readable output, `--api-key` for an explicit REST key
+(`--key` is an alias, except after `add`, where it is the memory key), and
+`--url` to point at another deployment (on `mcp`, the MCP URL). `--agent` only
+exists on `init`.
 
-Environment: `VALORBRAIN_TOKEN` is the REST key, `VALORBRAIN_MCP_TOKEN` the
-MCP token (`VALORBRAIN_TOKEN` is also accepted by `mcp` when it holds a
-`vbm_` token); `VALORBRAIN_URL` and `VALORBRAIN_MCP_URL` override the hosts.
+Unknown flags are errors — their values never end up in a memory. Text that
+starts with a dash goes after `--`: `valorbrain add -- "-5 °C at night"`.
+
+With `--json`, errors are one object on stdout too:
+`{ "ok": false, "error": "…", "code": "unknown_flag", "exit_code": 2 }`.
+Exit codes: `0` ok · `1` server or network failure · `2` usage error · `3`
+credential missing, of the wrong type, or rejected (401/403).
+
+Environment: `VALORBRAIN_API_KEY` (REST key), `VALORBRAIN_MCP_TOKEN` (MCP
+token), `VALORBRAIN_API_URL`, `VALORBRAIN_MCP_URL`. Still accepted with a
+warning on stderr: `VALORBRAIN_TOKEN` (a `vbm_` value is the MCP token,
+anything else the REST key), `VALORBRAIN_API_TOKEN`, `VALORBRAIN_URL`. A `vbm_`
+token is never sent to the REST API.
 
 ## Notes for agents
 
