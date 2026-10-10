@@ -23,21 +23,25 @@ const HELP = `valorbrain ${version} — agent-native memory
 Usage: valorbrain <command> [args]
 
 Commands:
-  init --agent [--agent-caller <platform>]   Create an account and API key (no email needed)
-  init --email <address>                     Claim the account with an email (key stays the same)
+  init --agent [--agent-caller <platform>]   Create an account: REST key + MCP token (no email needed)
+       [--force]                             Replace an existing config (a backup is written first)
+  init --email <address>                     Claim the account with an email (keys stay the same)
   identify <platform>                        Set/fix which agent is calling (idempotent)
   add <text> | --file <path>                 Store a memory [--collection --title --type]
   search <query>                             Search memories [--collection --mode]
   list                                       List collections
   status                                     Local config + remote health
   mcp [--token vbm_…]                        Bridge stdio MCP clients to the hosted MCP server
+                                             (default token: mcp_token from the config, or VALORBRAIN_MCP_TOKEN)
   help                                       This help (--help for options)
 
 Global:
   --json | --agent      Machine-readable single-object output
-  --key <key>           API key (default: ~/.valorbrain/config.json or VALORBRAIN_TOKEN)
+  --key <key>           REST API key (default: ~/.valorbrain/config.json or VALORBRAIN_TOKEN)
   --url <base>          REST base URL (default: https://valorbrain-api.valor.digital)
 
+Credentials: vb_agent_… is the REST key (api_key); vbm_… is the MCP token (mcp_token).
+Env: VALORBRAIN_TOKEN (REST key) · VALORBRAIN_MCP_TOKEN (MCP token) · VALORBRAIN_URL · VALORBRAIN_MCP_URL
 Config: ~/.valorbrain/config.json (0600) — same file the engine CLI reads.
 Docs:   https://valorbrain.valor.digital/docs`;
 
@@ -48,13 +52,17 @@ function helpJson() {
     config: "~/.valorbrain/config.json",
     default_rest_base_url: "https://valorbrain-api.valor.digital",
     default_mcp_url: "https://mcpbrain.valor.digital/mcp",
+    credentials: [
+      { prefix: "vb_agent_", config_field: "api_key", env: "VALORBRAIN_TOKEN", accepted_on: "REST (default_rest_base_url)" },
+      { prefix: "vbm_", config_field: "mcp_token", env: "VALORBRAIN_MCP_TOKEN", accepted_on: "MCP (default_mcp_url)" },
+    ],
     global_flags: [
       { flag: "--json", aliases: ["--agent"], description: "machine-readable output" },
-      { flag: "--key", description: "API key override" },
+      { flag: "--key", description: "REST API key override" },
       { flag: "--url", description: "REST base URL override" },
     ],
     commands: [
-      { name: "init", usage: "init --agent [--agent-caller <platform>] | init --email <address> [--otp <code>]", description: "create an agent account or claim it with an email" },
+      { name: "init", usage: "init --agent [--agent-caller <platform>] [--force] | init --email <address> [--otp <code>]", description: "create an agent account (REST key + MCP token) or claim it with an email" },
       { name: "identify", usage: "identify <platform>", description: "idempotent agent_caller backfill" },
       { name: "add", usage: "add <text> [--file <path>] [--collection <name>] [--title <t>] [--type <t>]", description: "store a memory" },
       { name: "search", usage: "search <query> [--collection <name>] [--mode auto|keyword|semantic|hybrid]", description: "search memories" },
