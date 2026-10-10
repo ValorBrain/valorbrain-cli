@@ -1,16 +1,19 @@
 /**
  * Contract test: `init --agent` against the signup response the engine returns
  * (src/agent-signup.ts, createShadowTenant) — both credentials must be saved,
- * and a second signup must not silently replace them.
+ * a second signup must not silently replace them, and the output must carry
+ * the next step of the connect contract. `init --email` against the claim
+ * response (src/server.ts handleAgentClaim).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { otpWhere } from "../lib/cmd-init.js";
 
 const BIN = fileURLToPath(new URL("../bin/valorbrain.js", import.meta.url));
 const API_KEY = "vb_agent_" + "a".repeat(32);
@@ -28,17 +31,22 @@ const SIGNUP = {
   message: "Surface to your human: claim with `valorbrain init --email <addr>`.",
 };
 
-async function fakeEngine(signupBody) {
+async function fakeEngine(signupBody, { claim = { ok: true, emailed: true, expires_in_minutes: 15 } } = {}) {
   const calls = [];
   const server = createServer((req, res) => {
-    calls.push({ method: req.method, url: req.url });
-    if (req.method === "POST" && req.url === "/api/v1/agents/signup") {
-      res.writeHead(201, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(signupBody));
-      return;
-    }
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end('{"error":"not found"}');
+    let data = "";
+    req.on("data", (c) => { data += c; });
+    req.on("end", () => {
+      calls.push({ method: req.method, url: req.url, body: data ? JSON.parse(data) : null });
+      const send = (status, body) => {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      if (req.method === "POST" && req.url === "/api/v1/agents/signup") return send(201, signupBody);
+      if (req.method === "POST" && req.url === "/api/v1/agents/claim") return send(200, claim);
+      if (req.method === "POST" && req.url === "/api/v1/agents/claim/verify") return send(200, { ok: true, tenant_id: signupBody.tenant_id });
+      send(404, { error: "not found" });
+    });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   return {
@@ -48,29 +56,46 @@ async function fakeEngine(signupBody) {
   };
 }
 
-function freshHome() {
-  return mkdtempSync(join(tmpdir(), "vb-cli-init-"));
+function freshHome(config) {
+  const home = mkdtempSync(join(tmpdir(), "vb-cli-init-"));
+  if (config) {
+    mkdirSync(join(home, ".valorbrain"), { recursive: true });
+    writeFileSync(join(home, ".valorbrain", "config.json"), JSON.stringify(config));
+  }
+  return home;
+}
+
+/** A directory holding fake executables, standing in for client binaries on PATH. */
+function fakeBin(...names) {
+  const dir = mkdtempSync(join(tmpdir(), "vb-cli-bin-"));
+  for (const n of names) {
+    writeFileSync(join(dir, n), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(dir, n), 0o755);
+  }
+  return dir;
 }
 
 // Async on purpose: the fake engine lives in this process, and a blocking
 // spawnSync would stop it from ever answering.
-function run(args, { home, url }) {
+function run(args, { home, url, path = fakeBin(), stdin = null }) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, ...args], {
       env: {
         ...process.env,
         HOME: home,
         USERPROFILE: home,
+        PATH: path,
         VALORBRAIN_URL: url,
         VALORBRAIN_TOKEN: "",
         VALORBRAIN_MCP_TOKEN: "",
       },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
     child.stdout.on("data", (d) => { stdout += d; });
     child.stderr.on("data", (d) => { stderr += d; });
     child.on("close", (status) => resolve({ status, stdout, stderr }));
+    if (stdin !== null) child.stdin.end(stdin);
   });
 }
 
@@ -107,17 +132,60 @@ test("init --agent saves both credentials and reports them with --json", async (
   }
 });
 
-test("init --agent prints fingerprints, never the full secrets", async () => {
+test("init --agent --json lists the connect commands with the token, detected clients first", async () => {
   const engine = await fakeEngine(SIGNUP);
   const home = freshHome();
   try {
-    const r = await run(["init", "--agent", "--agent-caller", "claude-code"], { home, url: engine.url });
+    const r = await run(["init", "--agent", "--json"], { home, url: engine.url, path: fakeBin("codex") });
     assert.equal(r.status, 0, r.stderr);
-    assert.ok(!r.stdout.includes(API_KEY), "full REST key must not be printed");
-    assert.ok(!r.stdout.includes(MCP_TOKEN), "full MCP token must not be printed");
-    assert.match(r.stdout, /REST key:\s+vb_agent_/);
-    assert.match(r.stdout, /MCP token:\s+vbm_/);
+    const { next_steps: next } = JSON.parse(r.stdout.trim());
+    assert.equal(next.connect[0].client, "codex");
+    assert.equal(next.connect[0].detected, true);
+    assert.ok(next.connect[0].command.includes(`VALORBRAIN_MCP_TOKEN=${MCP_TOKEN}`));
+    assert.ok(next.connect[0].command.includes(`--url ${SIGNUP.mcp_url}`));
+    const claude = next.connect.find((c) => c.client === "claude-code");
+    assert.equal(claude.detected, false);
+    assert.equal(claude.command,
+      `claude mcp add --transport http --scope user valorbrain ${SIGNUP.mcp_url} --header "Authorization: Bearer ${MCP_TOKEN}"`);
+    assert.equal(next.stdio, "npx -y @valorbrain/cli mcp");
+    assert.equal(next.doc, "https://valorbrain.com.br/connect.md");
+    assert.match(next.verify, /memory_prepare/);
+    assert.match(next.claim, /init --email/);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("init --agent prints both credentials labeled and the detected client's command", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  const home = freshHome();
+  try {
+    const r = await run(["init", "--agent", "--agent-caller", "claude-code"], { home, url: engine.url, path: fakeBin("claude") });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, new RegExp(`REST key:\\s+${API_KEY}`));
+    assert.match(r.stdout, /vb_agent_, REST only/);
+    assert.match(r.stdout, new RegExp(`MCP token:\\s+${MCP_TOKEN}`));
+    assert.match(r.stdout, /vbm_, MCP only/);
+    assert.match(r.stdout, /claude-code \(found on PATH\)/);
+    assert.ok(r.stdout.includes(`--header "Authorization: Bearer ${MCP_TOKEN}"`));
+    assert.ok(!r.stdout.includes("codex mcp add"), "only detected clients are listed when one is found");
+    assert.match(r.stdout, /memory_prepare/);
     assert.ok(r.stdout.includes(SIGNUP.message));
+  } finally {
+    await engine.close();
+  }
+});
+
+test("init --agent without a known client on PATH lists every client", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  const home = freshHome();
+  try {
+    const r = await run(["init", "--agent"], { home, url: engine.url });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stdout.includes("claude mcp add"));
+    assert.ok(r.stdout.includes("codex mcp add"));
+    assert.ok(r.stdout.includes(".gemini/settings.json"));
+    assert.ok(r.stdout.includes("https://valorbrain.com.br/connect.md"));
   } finally {
     await engine.close();
   }
@@ -167,8 +235,52 @@ test("an engine that does not issue an MCP token leaves mcp_token null", async (
     assert.equal(r.status, 0, r.stderr);
     const out = JSON.parse(r.stdout.trim());
     assert.equal(out.mcp_token, null);
+    assert.deepEqual(out.next_steps.connect, []);
     assert.equal(readConfig(home).mcp_token, null);
   } finally {
     await engine.close();
   }
+});
+
+const SAVED = { tenant_id: SIGNUP.tenant_id, api_key: API_KEY, mcp_token: MCP_TOKEN, claimed: false };
+
+test("init --email --json requests the OTP and says how to finish, without failing", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  const home = freshHome(SAVED);
+  try {
+    const r = await run(["init", "--email", "a@example.com", "--json"], { home, url: engine.url });
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout.trim());
+    assert.equal(out.otp_requested, true);
+    assert.equal(out.emailed, true);
+    assert.match(out.message, /check your inbox/);
+    assert.match(out.next, /--otp <code>/);
+    assert.deepEqual(engine.calls.map((c) => c.url), ["/api/v1/agents/claim"]);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("init --email --otp verifies without asking the server to mail a new code", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  const home = freshHome(SAVED);
+  try {
+    const r = await run(["init", "--email", "a@example.com", "--otp", "123456", "--json"], { home, url: engine.url });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout.trim()).claimed, true);
+    assert.deepEqual(engine.calls.map((c) => c.url), ["/api/v1/agents/claim/verify"]);
+    assert.deepEqual(engine.calls[0].body, { email: "a@example.com", otp: "123456" });
+    assert.equal(readConfig(home).claimed, true);
+    assert.equal(readConfig(home).mcp_token, MCP_TOKEN, "claim keeps the MCP token");
+  } finally {
+    await engine.close();
+  }
+});
+
+test("a failed OTP email on the hosted service never says 'ask your operator'", () => {
+  const hosted = otpWhere({ emailed: false }, "https://valorbrain-api.valor.digital", "a@example.com");
+  assert.ok(!/operator|journal/i.test(hosted), hosted);
+  assert.match(hosted, /init --email a@example.com/);
+  assert.match(otpWhere({ emailed: true }, "https://valorbrain-api.valor.digital", "a@example.com"), /check your inbox/);
+  assert.match(otpWhere({ emailed: false }, "http://127.0.0.1:3000", "a@example.com"), /self-hosted/);
 });

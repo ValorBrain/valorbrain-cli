@@ -20,16 +20,19 @@ in `~/.valorbrain/config.json` (mode 0600) and work immediately:
 | MCP token (`mcp_token`) | `vbm_…` | the hosted MCP server (`https://mcpbrain.valor.digital/mcp`) |
 
 The MCP token is shown once by the server — the config file is the only place
-it lives. `init --agent` refuses to replace an existing config (that would
-create a second account and drop both keys); pass `--force` to replace it,
-and a backup is written first.
+it lives. `init --agent` prints both credentials, labeled, and the next step:
+the connect command for the MCP clients it finds on `PATH` (`claude`, `codex`,
+`gemini`), the same commands as https://valorbrain.com.br/connect.md. With
+`--json` the same data comes as `next_steps`. `init --agent` refuses to replace
+an existing config (that would create a second account and drop both keys);
+pass `--force` to replace it, and a backup is written first.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `init --agent [--agent-caller <platform>] [--force]` | Creates an account with a REST key and an MCP token |
-| `init --email <address>` | Binds the account to an email via OTP — **the key does not change** |
+| `init --email <address> [--otp <code>]` | Binds the account to an email via OTP — **neither credential changes**. With `--json`, the first call sends the code and the second (`--otp`) verifies it |
 | `identify <platform>` | Records which agent is calling (idempotent) |
 | `add <text>` / `--file <path>` | Stores a memory (`--collection`, `--title`, `--type`) |
 | `search <query>` | Search (`--collection`, `--mode auto\|keyword\|semantic\|hybrid`) |
@@ -62,7 +65,7 @@ Clients that speak streamable HTTP connect directly, with the MCP token as a
 bearer (Claude Code example):
 
 ```bash
-claude mcp add --transport http valorbrain https://mcpbrain.valor.digital/mcp \
+claude mcp add --transport http --scope user valorbrain https://mcpbrain.valor.digital/mcp \
   --header "Authorization: Bearer vbm_…"
 ```
 

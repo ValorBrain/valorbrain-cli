@@ -130,3 +130,54 @@ test("a config without mcp_token never falls back to the REST key", async () => 
     await mcp.close();
   }
 });
+
+test("a piped batch waits for initialize, so later requests carry the session id", async () => {
+  const calls = [];
+  const server = createServer((req, res) => {
+    let data = "";
+    req.on("data", (c) => { data += c; });
+    req.on("end", () => {
+      const msg = JSON.parse(data);
+      calls.push({ method: msg.method, session: req.headers["mcp-session-id"] ?? null });
+      if (msg.method === "initialize") {
+        // Answer late: a proxy that does not wait would already have sent tools/list.
+        setTimeout(() => {
+          res.writeHead(200, { "Content-Type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {} } }));
+        }, 200);
+        return;
+      }
+      if (msg.id === undefined) { res.writeHead(202); res.end(); return; }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.end(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } })}\n\n`);
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${server.address().port}/mcp`;
+  try {
+    const batch = [
+      INIT,
+      JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    ].join("\n") + "\n";
+    const r = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [BIN, "mcp", "--url", url, "--token", VBM], {
+        env: { ...process.env, HOME: freshHome(), VALORBRAIN_TOKEN: "", VALORBRAIN_MCP_TOKEN: "" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+      child.stdin.end(batch); // stdin closes right away: the proxy must still answer everything
+      setTimeout(() => child.kill(), 8000).unref();
+    });
+    const replies = r.stdout.trim().split("\n").map((l) => JSON.parse(l));
+    assert.deepEqual(replies.map((x) => x.id), [1, 2], r.stderr);
+    assert.deepEqual(calls.map((c) => c.method), ["initialize", "notifications/initialized", "tools/list"]);
+    assert.equal(calls[1].session, "sess-1");
+    assert.equal(calls[2].session, "sess-1");
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
