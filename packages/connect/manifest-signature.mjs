@@ -21,7 +21,10 @@ import { createHash, createPublicKey, verify } from 'node:crypto';
  * GET /setup/manifest-keys and quoted in the docs. `npm publish` refuses an
  * empty set (prepublishOnly): a release that trusts nothing installs nothing.
  */
-export const MANIFEST_PUBLIC_KEYS = Object.freeze({});
+export const MANIFEST_PUBLIC_KEYS = Object.freeze({
+    // Production engine key, generated on 11/10/2026 (/etc/valorbrain/manifest-signing.key on the engine host).
+    '7a0a5e59c978f3f0': '4rKgPFpEgSudUlG1OT079j4mjmnJRxun7kCRvc6/c6Q=',
+});
 
 export const MANIFEST_SIGNATURE_DOMAIN = 'valorbrain-manifest-v1';
 const KEY_ID_HEADER = 'x-valorbrain-manifest-key-id';
