@@ -16,14 +16,20 @@ import { createHash, createPublicKey, verify } from 'node:crypto';
 
 /**
  * Production signing keys: kid → raw 32-byte ed25519 public key, base64.
- * The private half lives only on the engine host
+ * The ACTIVE key's private half lives only on the engine host
  * (VALORBRAIN_MANIFEST_SIGNING_KEY_FILE); its public half is also served at
- * GET /setup/manifest-keys and quoted in the docs. `npm publish` refuses an
- * empty set (prepublishOnly): a release that trusts nothing installs nothing.
+ * GET /setup/manifest-keys and quoted in the docs. The RESERVE key's private
+ * half is kept offline by the owner: if the active key is lost or leaks, the
+ * engine switches to the reserve and every client already trusting it keeps
+ * self-healing — the next release then drops the old key and adds a new
+ * reserve. `npm publish` refuses fewer than two keys (prepublishOnly): a
+ * release with one key cannot rotate without stranding installed clients.
  */
 export const MANIFEST_PUBLIC_KEYS = Object.freeze({
-    // Production engine key, generated on 11/10/2026 (/etc/valorbrain/manifest-signing.key on the engine host).
+    // Active engine key, generated on 11/10/2026 (/etc/valorbrain/manifest-signing.key on the engine host).
     '7a0a5e59c978f3f0': '4rKgPFpEgSudUlG1OT079j4mjmnJRxun7kCRvc6/c6Q=',
+    // Reserve key, generated on 11/10/2026; private half kept offline by the owner, never on a server.
+    '740a7527ff9447c2': 'kRXTTSwGPyBSYc0FugoKyRAE/QaNagJYp16akbY6sXo=',
 });
 
 export const MANIFEST_SIGNATURE_DOMAIN = 'valorbrain-manifest-v1';
