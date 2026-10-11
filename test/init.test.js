@@ -31,7 +31,7 @@ const SIGNUP = {
   message: "Surface to your human: claim with `valorbrain init --email <addr>`.",
 };
 
-async function fakeEngine(signupBody, { claim = { ok: true, emailed: true, expires_in_minutes: 15 } } = {}) {
+async function fakeEngine(signupBody, { claim = { ok: true, emailed: true, expires_in_minutes: 15 }, verify = { ok: true, tenant_id: signupBody.tenant_id } } = {}) {
   const calls = [];
   const server = createServer((req, res) => {
     let data = "";
@@ -44,7 +44,7 @@ async function fakeEngine(signupBody, { claim = { ok: true, emailed: true, expir
       };
       if (req.method === "POST" && req.url === "/api/v1/agents/signup") return send(201, signupBody);
       if (req.method === "POST" && req.url === "/api/v1/agents/claim") return send(200, claim);
-      if (req.method === "POST" && req.url === "/api/v1/agents/claim/verify") return send(200, { ok: true, tenant_id: signupBody.tenant_id });
+      if (req.method === "POST" && req.url === "/api/v1/agents/claim/verify") return send(200, verify);
       send(404, { error: "not found" });
     });
   });
@@ -273,6 +273,31 @@ test("init --email --otp verifies without asking the server to mail a new code",
     assert.deepEqual(engine.calls[0].body, { email: "a@example.com", otp: "123456" });
     assert.equal(readConfig(home).claimed, true);
     assert.equal(readConfig(home).mcp_token, MCP_TOKEN, "claim keeps the MCP token");
+  } finally {
+    await engine.close();
+  }
+});
+
+test("init --email prints the login_url the engine returns (PRD R9) and keeps it in --json", async () => {
+  const loginUrl = "https://valorbrain.valor.digital/claim/abc.def";
+  const engine = await fakeEngine(SIGNUP, { verify: { ok: true, tenant_id: SIGNUP.tenant_id, login_url: loginUrl } });
+  try {
+    const text = await run(["init", "--email", "a@example.com", "--otp", "123456"], { home: freshHome(SAVED), url: engine.url });
+    assert.equal(text.status, 0, text.stderr);
+    assert.ok(text.stdout.includes(`Open ${loginUrl} to create your app login`), text.stdout);
+    const json = await run(["init", "--email", "a@example.com", "--otp", "123456", "--json"], { home: freshHome(SAVED), url: engine.url });
+    assert.equal(JSON.parse(json.stdout.trim()).login_url, loginUrl);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("init --email without a login_url (self-hosted engine) prints no link", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  try {
+    const r = await run(["init", "--email", "a@example.com", "--otp", "123456"], { home: freshHome(SAVED), url: engine.url });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /login/);
   } finally {
     await engine.close();
   }
