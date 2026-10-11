@@ -20,6 +20,18 @@ Config via environment variables:
   VALORBRAIN_LLM_NO_THINK  — Append /no_think to remote prompts; false disables it for standard OpenAI models (optional)
   VALORBRAIN_RERANK_URL    — GPU reranker server URL (optional)
 
+What leaves the machine (PRD decision 18):
+  VALORBRAIN_SEND_PROMPT     — "off" stops sending the prompt of each turn: no per-turn
+                               recall (hook and REST fallback). Default on. Also:
+                               `npx -y @valorbrain/connect --harness hermes --prompt off`.
+  VALORBRAIN_SEND_TRANSCRIPT — hosted engine only: "on" uploads the session transcript to
+                               the extraction hooks (decisions, handoff, compaction).
+                               Default OFF: without it the transcript is neither written
+                               nor sent, and those hooks do not run. Also:
+                               `npx -y @valorbrain/connect --harness hermes --transcript on`.
+  The variable wins over the choice saved in ~/.valorbrain/connect.json (harnesses.hermes).
+  Self-hosted (local binary) keeps the transcript on the machine and always writes it.
+
 Agent-context isolation:
   Hermes ``run_agent.py`` passes ``agent_context`` to ``initialize()``
   with one of "primary", "subagent", "cron", or "flush". Per the
@@ -58,7 +70,7 @@ _CONTRACT_VERSION = "7"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.6.0"
+_PLUGIN_VERSION = "1.7.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -66,6 +78,31 @@ _HOOK_TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024
 _HOOK_TIMEOUT = 30  # seconds — fast hooks (bootstrap, lifecycle)
 _CONTEXT_SURFACING_TIMEOUT = 90  # seconds — retrieval hook can take ~60s on bench tenants
 _REST_TIMEOUT = 5.0  # seconds
+
+_FLAG_ON = ("on", "1", "true", "yes")
+_FLAG_OFF = ("off", "0", "false", "no")
+
+
+def _privacy_flag(env_name: str, key: str, default: bool) -> bool:
+    """One of the "what leaves the machine" switches (decision 18 of the PRD).
+
+    The env var wins; then the `hermes` entry of ~/.valorbrain/connect.json,
+    written by `npx -y @valorbrain/connect --harness hermes --prompt|--transcript`;
+    then the default. Read on every use so a change applies on the next turn.
+    """
+    raw = (os.environ.get(env_name) or "").strip().lower()
+    if raw in _FLAG_ON:
+        return True
+    if raw in _FLAG_OFF:
+        return False
+    try:
+        with open(Path.home() / ".valorbrain" / "connect.json", "r") as fh:
+            data = json.load(fh)
+        entry = ((data or {}).get("harnesses") or {}).get("hermes") or {}
+        value = entry.get(key) if isinstance(entry, dict) else None
+    except Exception:
+        value = None
+    return value if isinstance(value, bool) else default
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +821,11 @@ class ValorBrainProvider(MemoryProvider):
         """Hooks rodam local (binário) ou no engine via REST (hospedado)."""
         return bool(self._bin) or self._remote_engine()
 
+    def _transcript_enabled(self) -> bool:
+        """Write/use the session transcript: always with the local binary (it
+        never leaves the machine), opt-in when the hooks run in a hosted engine."""
+        return bool(self._bin) or _privacy_flag("VALORBRAIN_SEND_TRANSCRIPT", "send_transcript", False)
+
     def _invoke_hook(self, hook_name: str, hook_input: dict,
                      timeout: int = _HOOK_TIMEOUT) -> Optional[str]:
         """Roda um hook de ciclo de vida.
@@ -807,18 +849,19 @@ class ValorBrainProvider(MemoryProvider):
         try:
             payload: dict = {"hook": hook_name}
             inp: dict = {}
-            for src, dst in (
-                ("session_id", "sessionId"),
-                ("prompt", "prompt"),
-                ("hook_event_name", "hookEventName"),
-                ("working_dir", "workingDir"),
-            ):
+            fields = [("session_id", "sessionId"), ("hook_event_name", "hookEventName"), ("working_dir", "workingDir")]
+            if _privacy_flag("VALORBRAIN_SEND_PROMPT", "send_prompt", True):
+                fields.append(("prompt", "prompt"))
+            for src, dst in fields:
                 if hook_input.get(src) is not None:
                     inp[dst] = hook_input[src]
             if inp:
                 payload["input"] = inp
+            # Opt-in only (decision 18): the transcript holds every user and
+            # assistant message of the session.
             transcript_path = hook_input.get("transcript_path")
-            if transcript_path and os.path.isfile(transcript_path):
+            if (transcript_path and os.path.isfile(transcript_path)
+                    and _privacy_flag("VALORBRAIN_SEND_TRANSCRIPT", "send_transcript", False)):
                 with open(transcript_path, "r", errors="replace") as fh:
                     payload["transcript"] = fh.read(_HOOK_TRANSCRIPT_MAX_BYTES)
             data = _rest_call(
@@ -1067,6 +1110,9 @@ class ValorBrainProvider(MemoryProvider):
         self._maybe_heartbeat_runtime(session_id)
         if not query or len(query) < 5:
             return
+        # Prompt sharing off: no per-turn recall at all (the hook and the REST
+        # fallback both send the prompt). Session-start context still arrives.
+        share_prompt = _privacy_flag("VALORBRAIN_SEND_PROMPT", "send_prompt", True)
 
         # Sprint 11.5 — Setup-via-chat detection
         # Quando user/agent envia "Setup ValorBrain from <url>" ou "/vb-setup",
@@ -1121,13 +1167,13 @@ class ValorBrainProvider(MemoryProvider):
                 "context-surfacing",
                 hook_input,
                 timeout=_CONTEXT_SURFACING_TIMEOUT,
-            )
+            ) if share_prompt else None
             if output:
                 ctx = _extract_context(output)
                 if ctx:
                     parts.append(ctx)
 
-            if not parts:
+            if not parts and share_prompt:
                 # Fallback: REST memory_prepare se o hook não devolveu nada
                 # (sem binário e sem engine remoto, hook falhou, ou vazio).
                 # fast_mode: o funil por turno entregou docs=0 em 30/30 amostras
@@ -1171,7 +1217,7 @@ class ValorBrainProvider(MemoryProvider):
         """
         if self._agent_context != "primary":
             return
-        if not self._transcript_path:
+        if not self._transcript_path or not self._transcript_enabled():
             return
 
         try:
@@ -1210,7 +1256,7 @@ class ValorBrainProvider(MemoryProvider):
         """
         if self._agent_context != "primary":
             return
-        if not self._has_hooks() or not self._transcript_path:
+        if not self._has_hooks() or not self._transcript_path or not self._transcript_enabled():
             return
 
         hook_input = {
@@ -1288,7 +1334,7 @@ class ValorBrainProvider(MemoryProvider):
         """
         if self._agent_context != "primary":
             return ""
-        if not self._has_hooks() or not self._transcript_path:
+        if not self._has_hooks() or not self._transcript_path or not self._transcript_enabled():
             return ""
 
         hook_input = {

@@ -183,9 +183,49 @@ export function writeCreds(home, { api, token, harness, kiroEngine }) {
         // means legacy: connect 0.5.1 wrote that file BY DEFAULT, so its
         // existence proves nothing (VAL-224 S1). The default (v3) clears it.
         if (kiroEngine === 'legacy') entry.kiro_engine = 'legacy';
+        // A re-install or a token migration never undoes the person's choice
+        // about what leaves the machine (setPrivacy).
+        for (const k of PRIVACY_KEYS) {
+            if (typeof data.harnesses[id]?.[k] === 'boolean') entry[k] = data.harnesses[id][k];
+        }
         data.harnesses[id] = entry;
         return writeCredsFile(home, data);
     });
+}
+
+/**
+ * What leaves the machine, per harness (PRD decision 18): `send_prompt`
+ * (default true — the prompt of each turn goes to /api/v1/hooks/cue for recall)
+ * and `send_transcript` (default false — only the Hermes plugin has one to
+ * send). Kept in this harness's entry of connect.json, so `--prompt off` for
+ * Codex leaves Claude Code alone.
+ */
+export const PRIVACY_KEYS = ['send_prompt', 'send_transcript'];
+
+/** Set privacy switches for one harness; creates the entry if the harness has no token yet. */
+export function setPrivacy(home, harness, patch) {
+    const id = canonicalHarness(harness);
+    return withCredsLock(home, () => {
+        const data = readCredsFile(home);
+        const entry = { ...(data.harnesses[id] || {}) };
+        for (const k of PRIVACY_KEYS) {
+            if (typeof patch[k] === 'boolean') entry[k] = patch[k];
+        }
+        data.harnesses[id] = entry;
+        return writeCredsFile(home, data);
+    });
+}
+
+/**
+ * Whether this harness may send the prompt. VALORBRAIN_SEND_PROMPT=off|on wins
+ * (machine-wide; Gemini CLI strips env, so there the file is the switch), then
+ * the harness's `send_prompt`, then on.
+ */
+export function promptSharing(home, harness, env = {}) {
+    const v = str(env.VALORBRAIN_SEND_PROMPT).toLowerCase();
+    if (/^(off|0|false|no)$/.test(v)) return false;
+    if (/^(on|1|true|yes)$/.test(v)) return true;
+    return readCredsFile(home).harnesses[canonicalHarness(harness)]?.send_prompt !== false;
 }
 
 /** Drop one harness's entry (or all); the file goes when nothing is left. */
@@ -643,7 +683,7 @@ export async function runHook(argv, deps = {}) {
         const injectable = dialect !== 'grok' && !(dialect === 'cursor' && event === 'prompt');
         const duplicate = event === 'session_start' && typeof state.contextAt === 'number' && now - state.contextAt < 20_000;
         const prompt = event === 'prompt' ? readPrompt(payload) : '';
-        if (!injectable || duplicate || (event === 'prompt' && !prompt.trim())) {
+        if (!injectable || duplicate || (event === 'prompt' && (!prompt.trim() || !promptSharing(home, harness, env)))) {
             saveState(home, key, state, now);
             await heal;
             return emit(renderContext(dialect, event, '', payload));

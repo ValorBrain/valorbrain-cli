@@ -1,6 +1,6 @@
 {
   "name": "@valorbrain/connect",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Wire any CLI agent harness (Claude Code, Kiro, OpenCode, Codex, Grok, Gemini CLI, Cursor, OMP, Hermes) to hosted ValorBrain memory.",
   "type": "module",
   "bin": {
@@ -8,12 +8,14 @@
   },
   "main": "./index.mjs",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "node -e \"import('./manifest-signature.mjs').then((m) => { if (Object.keys(m.MANIFEST_PUBLIC_KEYS).length === 0) { console.error('MANIFEST_PUBLIC_KEYS is empty: add the production public key to manifest-signature.mjs before publishing (a release that trusts no key refuses every manifest)'); process.exit(1); } })\""
   },
   "files": [
     "index.mjs",
     "hook.mjs",
     "login.mjs",
+    "manifest-signature.mjs",
     "README.md"
   ],
   "dependencies": {
