@@ -21,13 +21,16 @@
  * republishing when the rules text changes.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
+import { createHash } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 import { parseDocument } from "yaml";
 import { spawn } from "node:child_process";
-import { HOOK_PROTOCOL, canonicalHarness, credsPath, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, writeCreds } from "./hook.mjs";
+import { HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, credsPath, listCreds, readCreds, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, setPrivacy, writeCreds } from "./hook.mjs";
 import { deviceLabel, deviceLogin, installId, isUnattended, resolveAppUrl } from "./login.mjs";
+import { trustedManifestKeys, verifyManifest } from "./manifest-signature.mjs";
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
@@ -41,10 +44,16 @@ const C = process.stdout.isTTY && !process.env.NO_COLOR
 // ── args ────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, relogin: false, scope: null, kiroEngine: "v3" };
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, relogin: false, scope: null, kiroEngine: "v3", force: false, privacy: {} };
+  const onOff = (v) => (v === "on" ? true : v === "off" ? false : v);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
+    else if (a === "--force") out.force = true;
+    else if (a === "--prompt") out.privacy.send_prompt = onOff(argv[++i]);
+    else if (a.startsWith("--prompt=")) out.privacy.send_prompt = onOff(a.slice(9));
+    else if (a === "--transcript") out.privacy.send_transcript = onOff(argv[++i]);
+    else if (a.startsWith("--transcript=")) out.privacy.send_transcript = onOff(a.slice(13));
     else if (a === "--remove") out.remove = true;
     else if (a === "--status") out.status = true;
     else if (a === "--no-backup") out.noBackup = true;
@@ -109,6 +118,15 @@ Options
                     together (a V3 session running the agent would fire every
                     event twice).
   --no-backup       skip .valorbrain-bak copies
+  --force           overwrite files you edited by hand without asking (by
+                    default a re-run shows what would change in them and asks;
+                    with nobody at the keyboard it keeps your edits)
+  --prompt on|off   send each prompt to your memory for recall (default on).
+                    Only changes ~/.valorbrain/connect.json for the harnesses
+                    named (or every one saved there) and exits.
+                    VALORBRAIN_SEND_PROMPT=off does the same for the whole machine.
+  --transcript on|off  Hermes only: upload the session transcript to the
+                    extraction hooks (default off).
 
 Writes, per harness: the MCP server entry (so the tools exist), an instructions
 file (so the agent knows to consult memory before answering) and, where the
@@ -117,6 +135,12 @@ and every few turns a short memory checkpoint the agent itself records through
 MCP. Hooks read the token from ~/.valorbrain/connect.json (0600) — never from
 the command line. Files you own are edited between ${BLOCK_BEGIN} markers;
 everything else is preserved.
+
+Every manifest the engine sends is checked against the ed25519 key built into
+this package before a single file is written; an unsigned or altered one is
+refused. Self-heal (run by the hooks, at most every 6h) never rewrites a file
+you changed by hand: it logs to ~/.valorbrain/connect.log and leaves it.
+What each hook sends: https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine
 `;
 
 // ── harness detection ───────────────────────────────────────────────────────
@@ -253,7 +277,11 @@ async function fetchManifest(api, harness) {
   const url = `${api.replace(/\/$/, "")}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}`;
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-  return res.json();
+  // Verified before anything is planned, so an unsigned or tampered manifest
+  // never reaches planFor — install, --remove, --status and self-heal alike.
+  const checked = verifyManifest({ body: await res.text(), headers: res.headers, harness, keys: trustedManifestKeys(process.env) });
+  if (checked.error) throw new Error(`${api}: ${checked.error}`);
+  return checked.manifest;
 }
 
 // ── scope: where harness-local files land ───────────────────────────────────
@@ -548,6 +576,11 @@ function apply(changes, { dryRun, noBackup }) {
       failed++;
       continue;
     }
+    if (c.kept) {
+      console.log(`  ${C.yellow}=${C.off} ${c.artifact.label} — kept your edits`);
+      console.log(`    ${C.dim}${c.path}${C.off}`);
+      continue;
+    }
     if (!c.changed) {
       console.log(`  ${C.dim}=${C.off} ${c.artifact.label} — already current${tag}`);
       continue;
@@ -572,6 +605,7 @@ function apply(changes, { dryRun, noBackup }) {
       wrote++;
     } catch (err) {
       console.log(`  ${C.red}✗${C.off} write failed: ${err.message}`);
+      c.failed = true;
       failed++;
     }
   }
@@ -749,6 +783,120 @@ function statusFor(manifest, home) {
   return rows;
 }
 
+// ── hand edits: never overwritten in silence (decision 17) ───────────────────
+
+/** Our hook entries in a hooks JSON file, as a stable string. Throws when the file is not JSON. */
+function ourHookEntries(raw) {
+  const cfg = JSON.parse(raw);
+  const hooks = cfg?.hooks;
+  if (Array.isArray(hooks)) return JSON.stringify(hooks.filter(isOurHookEntry)); // Kiro v1 file
+  if (!hooks || typeof hooks !== "object") return "";
+  const out = {};
+  for (const [event, entries] of Object.entries(hooks)) {
+    const mine = Array.isArray(entries) ? entries.filter(isOurHookEntry) : [];
+    if (mine.length) out[event] = mine;
+  }
+  return JSON.stringify(out);
+}
+
+/**
+ * Hash of the part of a file that is ours: our hook entries in a hooks JSON the
+ * customer shares with other tools, our marker block in a merged text file,
+ * the whole file when the file is ours. MCP entries are not tracked — they
+ * carry the token and self-heal never touches them. null = untracked or absent.
+ */
+function managedHash(artifact, path, raw) {
+  if (artifact.kind === "mcp" || raw === null) return null;
+  let view = raw;
+  if (artifact.kind === "hooks" && path.endsWith(".json") && !/valorbrain/i.test(path)) {
+    try { view = ourHookEntries(raw); } catch { view = raw; }
+  } else if (artifact.strategy === "merge") {
+    view = extractBlock(raw) ?? "";
+  }
+  return createHash("sha256").update(view).digest("hex");
+}
+
+/**
+ * True when applying `change` would overwrite a hand edit: the part of the file
+ * we manage is no longer what we last wrote there, or the file we wrote is
+ * gone. A file with no record (written before connect 0.8) is not flagged: the
+ * next write records it.
+ */
+export function handEdited(change, written) {
+  if (change.error || !change.changed || change.artifact.kind === "mcp") return false;
+  const recorded = written?.[change.path];
+  return Boolean(recorded) && managedHash(change.artifact, change.path, change.before) !== recorded;
+}
+
+/** Remember what we left in each managed file (connect-state.json `written`); `forget` after --remove. */
+function recordWritten(home, changes, { forget = false } = {}) {
+  const state = readHealState(home);
+  const written = { ...(state.written || {}) };
+  for (const c of changes) {
+    if (c.error || c.kept || c.failed || c.artifact.kind === "mcp") continue;
+    const hash = forget ? null : managedHash(c.artifact, c.path, c.after);
+    if (hash) written[c.path] = hash;
+    else delete written[c.path];
+  }
+  writeHealState(home, { ...state, written });
+}
+
+/** Changed lines between two texts (LCS on lines), as "- old" / "+ new". */
+export function lineDiff(before, after) {
+  const a = (before ?? "").split("\n");
+  const b = (after ?? "").split("\n");
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let ea = a.length, eb = b.length;
+  while (ea > s && eb > s && a[ea - 1] === b[eb - 1]) { ea--; eb--; }
+  const x = a.slice(s, ea), y = b.slice(s, eb);
+  if (x.length * y.length > 4_000_000) return [...x.map((l) => `- ${l}`), ...y.map((l) => `+ ${l}`)];
+  const lcs = Array.from({ length: x.length + 1 }, () => new Uint32Array(y.length + 1));
+  for (let i = x.length - 1; i >= 0; i--) {
+    for (let j = y.length - 1; j >= 0; j--) {
+      lcs[i][j] = x[i] === y[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < x.length && j < y.length) {
+    if (x[i] === y[j]) { i++; j++; }
+    else if (lcs[i + 1][j] >= lcs[i][j + 1]) out.push(`- ${x[i++]}`);
+    else out.push(`+ ${y[j++]}`);
+  }
+  while (i < x.length) out.push(`- ${x[i++]}`);
+  while (j < y.length) out.push(`+ ${y[j++]}`);
+  return out;
+}
+
+/**
+ * Before an explicit install overwrites a hand edit: show what changes and ask.
+ * With nobody at the keyboard the edit stays (rerun with --force). Declined
+ * changes are marked `kept`; apply() skips them.
+ */
+async function confirmHandEdits(changes, home, { force, dryRun }) {
+  const written = readHealState(home).written || {};
+  const edited = changes.filter((c) => handEdited(c, written));
+  if (edited.length === 0 || force) return;
+  const rl = !dryRun && !isUnattended() && process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  try {
+    for (const c of edited) {
+      console.log(`  ${C.yellow}!${C.off} ${c.path} was edited by hand; this update changes it:`);
+      const diff = lineDiff(c.before, c.after);
+      for (const line of diff.slice(0, 60)) console.log(`    ${C.dim}${line.replace(/vbm_[A-Za-z0-9_-]+/g, "vbm_…")}${C.off}`);
+      if (diff.length > 60) console.log(`    ${C.dim}… ${diff.length - 60} more line(s)${C.off}`);
+      if (dryRun) continue;
+      const yes = rl ? /^y(es)?$/i.test((await rl.question("    Overwrite your changes? [y/N] ")).trim()) : false;
+      if (!yes) {
+        c.kept = true;
+        if (!rl) console.log(`    ${C.dim}nobody here to confirm — kept; rerun with --force to overwrite${C.off}`);
+      }
+    }
+  } finally {
+    rl?.close();
+  }
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -765,6 +913,33 @@ async function main() {
   }
 
   const home = homedir();
+
+  // --prompt / --transcript only record a choice in connect.json and exit:
+  // no token, no network, no file other than that one.
+  const privacy = PRIVACY_KEYS.filter((k) => k in args.privacy);
+  if (privacy.length > 0) {
+    for (const k of privacy) {
+      if (typeof args.privacy[k] !== "boolean") {
+        console.error(`--${k === "send_prompt" ? "prompt" : "transcript"} must be "on" or "off"`);
+        return 2;
+      }
+    }
+    const ids = args.harnesses.length > 0 ? args.harnesses.map(canonicalHarness) : Object.keys(listCreds(home));
+    if (ids.length === 0) {
+      console.error("No connected agent in ~/.valorbrain/connect.json — name one: --harness claude-code|codex|gemini-cli|kiro|cursor|grok|opencode|hermes");
+      return 2;
+    }
+    for (const id of ids) {
+      setPrivacy(home, id, args.privacy);
+      const what = privacy.map((k) => `${k === "send_prompt" ? "prompt" : "transcript"} ${args.privacy[k] ? "on" : "off"}`).join(", ");
+      console.log(`${C.green}✓${C.off} ${id}: ${what} ${C.dim}(${credsPath(home).replace(home, "~")})${C.off}`);
+      if ("send_transcript" in args.privacy && id !== "hermes") {
+        console.log(`  ${C.dim}note: only the Hermes plugin has a transcript to send; ${id} never sends one${C.off}`);
+      }
+    }
+    return 0;
+  }
+
   const resolved = resolveInstallToken({ flag: args.token, env: process.env, home, install: !args.status && !args.remove });
   if (resolved.error) {
     console.error(`${C.red}✗${C.off} ${resolved.error}`);
@@ -985,7 +1160,9 @@ async function main() {
     }
 
     const changes = planFor(manifest, tokenFor(harness), home, args.remove);
+    if (!args.remove) await confirmHandEdits(changes, home, args);
     const res = apply(changes, args);
+    if (!args.dryRun) recordWritten(home, changes, { forget: args.remove });
     failed += res.failed;
     // kiro fires hooks from exactly one file kind per engine (scopedManifest
     // doc): a file of the other mode left on disk double-fires every event in
@@ -1065,7 +1242,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.7.0";
+const CLIENT_VERSION = "0.8.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -1177,7 +1354,7 @@ function applyQuiet(changes) {
       }
       wrote++;
     } catch {
-      /* fail-open por arquivo */
+      c.failed = true; // fail-open por arquivo; não entra no registro de escrita
     }
   }
   return wrote;
@@ -1272,8 +1449,9 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
     // token do heal — para dentro da mudança de hooks.
-    const planned = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
-      .filter((c) => c.changed && !c.error);
+    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
+      .filter((c) => !c.error);
+    const planned = plan.filter((c) => c.changed);
     // A guarda de segundo loader barra só a CRIAÇÃO do standalone em $HOME
     // (`before === null`): atualizar um standalone NOSSO que já existe é
     // migração, não segundo loader — o arquivo já é um loader; torná-lo v2
@@ -1290,8 +1468,18 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     const hooksOk = (c) => c.artifact.kind !== "hooks" || (canMigrateHooks && !(id === "codex" && !contractDrift));
     const changes = (contractDrift ? guarded : guarded.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
       .filter(hooksOk);
-    if (changes.length > 0) {
-      const wrote = applyQuiet(changes);
+    // Decision 17: a file the person edited by hand is never rewritten from
+    // here — the hook has nobody to ask. Logged; a re-run of the installer
+    // shows the diff and asks.
+    const kept = changes.filter((c) => handEdited(c, state.written));
+    for (const c of kept) {
+      const msg = `[valorbrain] ${c.path}: edited by hand — self-heal left it as is; review with: npx -y @valorbrain/connect --harness ${id}`;
+      console.error(msg);
+      try { appendFileSync(join(home, ".valorbrain", "connect.log"), `${new Date().toISOString()} ${msg}\n`); } catch { /* fail-open */ }
+    }
+    const safe = changes.filter((c) => !kept.includes(c));
+    if (safe.length > 0) {
+      const wrote = applyQuiet(safe);
       if (wrote > 0) {
         console.error(
           contractDrift
@@ -1300,6 +1488,9 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
         );
       }
     }
+    // Files already current are recorded too: from now on an edit to them is
+    // detected even if this install predates the record.
+    recordWritten(home, [...plan.filter((c) => !c.changed), ...safe]);
     // Poda em $HOME (cwd:home dedupa as raízes — projeto nunca é tocado),
     // consciente do engine que CHAMOU o hook — o heal nunca
     // remove o loader que pode ser o único do chamador:
@@ -1330,19 +1521,7 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
 function hookEntriesChanged(change) {
   if (change.before === null || change.after === null) return change.before !== change.after;
   try {
-    const ours = (raw) => {
-      const cfg = JSON.parse(raw);
-      const hooks = cfg?.hooks;
-      if (Array.isArray(hooks)) return JSON.stringify(hooks.filter(isOurHookEntry)); // Kiro v1 file
-      if (!hooks || typeof hooks !== "object") return "";
-      const out = {};
-      for (const [event, entries] of Object.entries(hooks)) {
-        const mine = Array.isArray(entries) ? entries.filter(isOurHookEntry) : [];
-        if (mine.length) out[event] = mine;
-      }
-      return JSON.stringify(out);
-    };
-    return ours(change.before) !== ours(change.after);
+    return ourHookEntries(change.before) !== ourHookEntries(change.after);
   } catch {
     // Not JSON (OpenCode plugin source): the file is ours, compare bytes.
     return change.before !== change.after;

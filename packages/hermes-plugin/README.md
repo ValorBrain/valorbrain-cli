@@ -33,9 +33,14 @@ env:
 ```
 
 Without a local binary the provider covers tools, registration, contract
-declaration **and the lifecycle hooks**: bootstrap, per-turn context and the
-Stop/PreCompact extraction run on the engine via `POST /api/v1/hooks/run` (the
-engine owns the code and the database; the client only ships the transcript).
+declaration **and the lifecycle hooks**: bootstrap and per-turn context run on
+the engine via `POST /api/v1/hooks/run`. The Stop/PreCompact extraction needs the
+session transcript, which is **opt-in**: with `VALORBRAIN_SEND_TRANSCRIPT=on` (or
+`npx -y @valorbrain/connect --harness hermes --transcript on`) the plugin keeps
+the transcript and ships it with those hooks; without it the transcript is not
+written, nothing is uploaded and the extraction does not run. The prompt of each
+turn is sent by default for recall; `VALORBRAIN_SEND_PROMPT=off` (or
+`--prompt off`) stops it.
 
 The three hooks that used to need the client's disk have their own hosted path:
 
@@ -71,6 +76,8 @@ hermes` writes the same artifacts from the engine — including this plugin.
 | `VALORBRAIN_API_TOKEN` | `vbm_` token (hosted) |
 | `VALORBRAIN_TENANT_ID` | optional; the engine derives the tenant from the token |
 | `VALORBRAIN_BIN` | path to the `valorbrain` binary (self-hosted; auto-detected on PATH) |
+| `VALORBRAIN_SEND_PROMPT` | `off` stops sending each turn's prompt (no per-turn recall). Default on |
+| `VALORBRAIN_SEND_TRANSCRIPT` | `on` uploads the session transcript to the hosted extraction hooks. Default off |
 | `VALORBRAIN_SERVE_PORT` | local engine port (default 7438) |
 
 ## Links

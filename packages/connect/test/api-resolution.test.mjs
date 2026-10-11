@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
+import { SIGNED_ENV, signedManifestHeaders } from './signed-stub.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'index.mjs');
 
@@ -30,9 +31,11 @@ function stubApi(handlers = {}) {
         const u = new URL(req.url, 'http://stub');
         paths.push(`${req.method} ${u.pathname}`);
         if (u.pathname === '/setup/artifacts') agents.push(u.searchParams.get('agent'));
-        res.writeHead(200, { 'content-type': 'application/json' });
         const h = handlers[u.pathname];
-        res.end(JSON.stringify(h ? h(u) : { name: 'Kiro', harness: 'kiro', contract_version: '2', artifacts: [] }));
+        const body = JSON.stringify(h ? h(u) : { name: 'Kiro', harness: 'kiro', contract_version: '2', artifacts: [] });
+        // The engine signs every manifest; connect ≥ 0.8 refuses unsigned ones.
+        res.writeHead(200, { 'content-type': 'application/json', ...(u.pathname === '/setup/artifacts' ? signedManifestHeaders(body) : {}) });
+        res.end(body);
     });
     return new Promise((resolve) => {
         server.listen(0, '127.0.0.1', () => resolve({
@@ -57,7 +60,7 @@ function homeWithCreds(apiUrl) {
 function runCli(args, h, { cwd, stdin = '' } = {}) {
     // Scrubbed env: no VALORBRAIN_API_URL/VALORBRAIN_TOKEN — resolution must
     // come from the saved credential, not the environment.
-    const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1' };
+    const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', ...SIGNED_ENV };
     return new Promise((resolve) => {
         const child = execFile(process.execPath, [CLI, ...args], { env, cwd, timeout: 20_000 }, (err, stdout, stderr) => {
             resolve({ code: err ? (err.code ?? 1) : 0, stdout, stderr });
@@ -96,7 +99,7 @@ test('self-heal never guesses a harness for a legacy hook without --harness (no 
     mkdirSync(join(h, '.claude'), { recursive: true });
     const legacy = JSON.stringify({ hooks: { UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: 'npx -y @valorbrain/connect hook context-surfacing --token=vbm_C' }] }] } });
     writeFileSync(join(h, '.claude', 'settings.json'), legacy);
-    const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', VALORBRAIN_API_URL: url };
+    const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', VALORBRAIN_API_URL: url, ...SIGNED_ENV };
     await new Promise((resolve) => {
         const child = execFile(process.execPath, [CLI, 'hook', 'context-surfacing', '--token=vbm_C'], { env, timeout: 20_000 }, () => resolve());
         child.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'status?' }));

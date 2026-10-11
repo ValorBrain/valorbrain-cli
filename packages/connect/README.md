@@ -5,16 +5,17 @@ MCP e grava os artefatos que o engine mandar (o engine é a fonte única — mud
 contrato no servidor, o próximo run instala).
 
 ```bash
-npx -y @valorbrain/connect@0.7                            # detecta, autoriza no navegador, conecta tudo
-npx -y @valorbrain/connect@0.7 --harness kiro             # um harness
-npx -y @valorbrain/connect@0.7 --token vbm_xxx            # com um token que você já tem (sem navegador)
-npx -y @valorbrain/connect@0.7 --token vbm_xxx --dry-run  # mostra o plano
-npx -y @valorbrain/connect@0.7 --status                   # o que está instalado
-npx -y @valorbrain/connect@0.7 --token vbm_xxx --remove   # desfaz
+npx -y @valorbrain/connect@0.8                            # detecta, autoriza no navegador, conecta tudo
+npx -y @valorbrain/connect@0.8 --harness kiro             # um harness
+npx -y @valorbrain/connect@0.8 --token vbm_xxx            # com um token que você já tem (sem navegador)
+npx -y @valorbrain/connect@0.8 --token vbm_xxx --dry-run  # mostra o plano
+npx -y @valorbrain/connect@0.8 --status                   # o que está instalado
+npx -y @valorbrain/connect@0.8 --token vbm_xxx --remove   # desfaz
+npx -y @valorbrain/connect@0.8 --harness codex --prompt off   # não envia o prompt (só muda a escolha)
 ```
 
-A 0.7 sai com a dist-tag `next` (o `latest` segue na 0.6.0 até a promoção),
-por isso os exemplos fixam `@0.7`.
+A 0.8 sai com a dist-tag `next` até o engine assinar os manifestos em
+produção; depois vira `latest`. Por isso os exemplos fixam `@0.8`.
 
 Sem Node.js instalado, o app serve um instalador de uma linha que confere o
 Node 18+ antes (no Windows, oferece instalar a LTS com o winget):
@@ -47,6 +48,53 @@ diz onde achar o token certo. A ordem:
 Os caminhos vêm do manifesto do servidor e só podem cair dentro da sua home ou
 do projeto atual (`--scope workspace`). Caminho com `..` ou absoluto fora dessas
 duas raízes é recusado e aparece como erro no plano — nada é escrito nele.
+
+## Manifesto assinado (0.8)
+
+Antes de escrever qualquer arquivo — instalação, `--remove`, `--status` e o
+self-heal — o connect confere a assinatura ed25519 do manifesto de
+`/setup/artifacts` com a chave pública embutida em `manifest-signature.mjs`.
+Manifesto sem assinatura, assinado por outra chave, alterado depois de assinado,
+de outro harness ou com data a mais de 7 dias do relógio da máquina é recusado
+e nada é escrito. A mesma chave pública está em
+`https://valorbrain-api.valor.digital/setup/manifest-keys`.
+
+Engine próprio (self-hosted): gere a chave do engine
+(`VALORBRAIN_MANIFEST_SIGNING_KEY_FILE`, ver `docs/guides/harness-integration.md`
+no engine) e confie nela aqui com
+`VALORBRAIN_MANIFEST_PUBLIC_KEYS=<chave pública em base64>` (várias, separadas
+por vírgula). Não há como desligar a verificação.
+
+## Arquivo editado à mão
+
+O connect lembra o que escreveu em cada arquivo que gerencia
+(`~/.valorbrain/connect-state.json`, campo `written`: o hash do bloco
+`valorbrain`, das nossas entradas de hook ou do arquivo inteiro quando ele é
+nosso). Se você mudou essa parte:
+
+- o **self-heal** (rodado pelos hooks) não regrava: escreve uma linha no stderr
+  e em `~/.valorbrain/connect.log` e deixa o arquivo como está;
+- **rodar o instalador** mostra o diff e pergunta antes de sobrescrever; sem
+  ninguém no terminal (CI, saída em pipe) mantém a sua versão. `--force`
+  sobrescreve sem perguntar.
+
+Instalações anteriores à 0.8 não têm registro: a primeira escrita da 0.8
+registra o estado e daí em diante a proteção vale.
+
+## O que sai da sua máquina
+
+Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine>.
+
+- **Prompt de cada turno** (até 8.000 caracteres, para buscar memória
+  relevante): ligado por padrão. Desliga por harness com
+  `npx -y @valorbrain/connect --harness <id> --prompt off` (grava
+  `send_prompt: false` na entrada do harness em `~/.valorbrain/connect.json`;
+  `--prompt on` volta), ou na máquina inteira com `VALORBRAIN_SEND_PROMPT=off` no
+  ambiente do harness. Desligado, o hook do prompt não faz chamada nenhuma; o
+  contexto de início de sessão e o checkpoint continuam.
+- **Transcript do Hermes**: só com opt-in,
+  `npx -y @valorbrain/connect --harness hermes --transcript on` (ou
+  `VALORBRAIN_SEND_TRANSCRIPT=on`). Os outros harnesses nunca enviam transcript.
 
 ## Login pelo navegador (0.6)
 
@@ -202,9 +250,10 @@ O Hermes recebe três coisas:
    comentários, é preservado);
 2. `env.VALORBRAIN_ENGINE_URL` + `env.VALORBRAIN_API_TOKEN` no mesmo arquivo,
    para o MemoryProvider funcionar sem binário local: tools, registro/declaração
-   **e os hooks de ciclo de vida** (bootstrap, contexto por turno e extração de
-   Stop/PreCompact rodam no engine via `POST /api/v1/hooks/run`; só injeção
-   local — postcompact/pretool/curator — não tem equivalente hospedado);
+   **e os hooks de ciclo de vida** (bootstrap e contexto por turno rodam no
+   engine via `POST /api/v1/hooks/run`; a extração de Stop/PreCompact precisa do
+   transcript da sessão e só roda com `--transcript on`; só injeção local —
+   postcompact/pretool/curator — não tem equivalente hospedado);
 3. o plugin MemoryProvider em `~/.hermes/plugins/valorbrain/__init__.py`.
 
 Depois, ative o provider:

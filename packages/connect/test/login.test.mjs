@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
+import { SIGNED_ENV, signedManifestHeaders } from './signed-stub.mjs';
 import { acceptableApiUrl, approvalUrl, browserCommand, deviceLabel, deviceLogin, isUnattended, resolveAppUrl } from '../login.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'index.mjs');
@@ -152,7 +153,9 @@ function stubAppAndEngine() {
                 return send(200, { access_token: `vbm_claude${sfx}`, tokens: { 'claude-code': `vbm_claude${sfx}`, codex: `vbm_codex${sfx}` }, tenant_id: 't1', valorbrain_url: `http://127.0.0.1:${server.address().port}` });
             }
             if (u.pathname === '/setup/artifacts') {
-                return send(200, u.searchParams.get('agent') === 'codex' ? codexManifest() : claudeManifest());
+                const manifest = JSON.stringify(u.searchParams.get('agent') === 'codex' ? codexManifest() : claudeManifest());
+                res.writeHead(200, { 'content-type': 'application/json', ...signedManifestHeaders(manifest) });
+                return res.end(manifest);
             }
             if (u.pathname === '/api/v1/runtimes/register') {
                 seen.registered.push({ agent: body?.agent_platform, auth: req.headers.authorization });
@@ -170,7 +173,9 @@ test('no --token: the CLI logs in through the browser flow and wires each harnes
     try {
         mkdirSync(join(h, '.claude'), { recursive: true });
         mkdirSync(join(h, '.codex'), { recursive: true });
-        const env = { PATH: process.env.PATH, HOME: h, USERPROFILE: h, NO_COLOR: '1', VALORBRAIN_APP_URL: url, VALORBRAIN_NO_BROWSER: '1' };
+        // VALORBRAIN_API_URL: the manifest is fetched BEFORE the login, from the
+        // default engine — without it this test read the production manifest.
+        const env = { PATH: process.env.PATH, HOME: h, USERPROFILE: h, NO_COLOR: '1', VALORBRAIN_APP_URL: url, VALORBRAIN_API_URL: url, VALORBRAIN_NO_BROWSER: '1', ...SIGNED_ENV };
         const { code, stdout, stderr } = await new Promise((resolve) => {
             const child = execFile(process.execPath, [CLI], { env, timeout: 30_000 }, (err, so, se) => resolve({ code: err ? (err.code ?? 1) : 0, stdout: so, stderr: se }));
             child.stdin.end('');
@@ -205,7 +210,7 @@ test('--dry-run without a token never opens a login', async () => {
     const h = mkdtempSync(join(tmpdir(), 'vb-connect-login-'));
     try {
         mkdirSync(join(h, '.claude'), { recursive: true });
-        const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', VALORBRAIN_APP_URL: 'http://127.0.0.1:9', VALORBRAIN_NO_BROWSER: '1' };
+        const env = { PATH: process.env.PATH, HOME: h, NO_COLOR: '1', VALORBRAIN_APP_URL: 'http://127.0.0.1:9', VALORBRAIN_NO_BROWSER: '1', ...SIGNED_ENV };
         const { code, stderr } = await new Promise((resolve) => {
             const child = execFile(process.execPath, [CLI, '--dry-run'], { env, timeout: 20_000 }, (err, so, se) => resolve({ code: err ? (err.code ?? 1) : 0, stdout: so, stderr: se }));
             child.stdin.end('');
@@ -271,7 +276,7 @@ test('login: an offered page on another host is replaced by the app page', async
 });
 
 function runCliIn(h, args, extraEnv = {}) {
-    const env = { PATH: process.env.PATH, HOME: h, USERPROFILE: h, NO_COLOR: '1', ...extraEnv };
+    const env = { PATH: process.env.PATH, HOME: h, USERPROFILE: h, NO_COLOR: '1', ...SIGNED_ENV, ...extraEnv };
     return new Promise((resolve) => {
         const child = execFile(process.execPath, [CLI, ...args], { env, timeout: 30_000 }, (err, so, se) => resolve({ code: err ? (err.code ?? 1) : 0, stdout: so, stderr: se }));
         child.stdin.end('');
@@ -297,7 +302,7 @@ test('a re-run keeps the agents already connected and only approves the new one'
     try {
         mkdirSync(join(h, '.claude'), { recursive: true });
         mkdirSync(join(h, '.codex'), { recursive: true });
-        const env = { VALORBRAIN_APP_URL: url, VALORBRAIN_NO_BROWSER: '1' };
+        const env = { VALORBRAIN_APP_URL: url, VALORBRAIN_API_URL: url, VALORBRAIN_NO_BROWSER: '1' };
         const first = await runCliIn(h, ['--harness', 'claude-code'], env);
         assert.equal(first.code, 0, first.stderr);
         assert.deepEqual(seen.code.harnesses, ['claude-code']);
