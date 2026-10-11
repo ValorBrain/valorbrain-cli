@@ -16,8 +16,8 @@ in `~/.valorbrain/config.json` (mode 0600) and work immediately:
 
 | Credential | Prefix | Works on |
 |---|---|---|
-| REST key (`api_key`) | `vb_agent_…` | the REST API (`https://valorbrain-api.valor.digital`) |
-| MCP token (`mcp_token`) | `vbm_…` | the hosted MCP server (`https://mcpbrain.valor.digital/mcp`) |
+| REST key (`api_key`) | `vb_agent_…` | the REST API (`https://valorbrain-api.valor.digital`) and the claim (`init --email`); legacy account key, refused by MCP |
+| MCP token (`mcp_token`) | `vbm_…` | the hosted MCP server (`https://mcpbrain.valor.digital/mcp`); the engine REST API accepts it too, but this CLI only sends it to MCP |
 
 The MCP token is shown once by the server — the config file is the only place
 it lives. `init --agent` prints both credentials, labeled, and the next step:
