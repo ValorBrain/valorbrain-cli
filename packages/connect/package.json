@@ -1,6 +1,6 @@
 {
   "name": "@valorbrain/connect",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Wire any CLI agent harness (Claude Code, Kiro, OpenCode, Codex, Grok, Gemini CLI, Cursor, OMP, Hermes) to hosted ValorBrain memory.",
   "type": "module",
   "bin": {
@@ -16,7 +16,8 @@
     "hook.mjs",
     "login.mjs",
     "manifest-signature.mjs",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "dependencies": {
     "yaml": "^2.9.0"

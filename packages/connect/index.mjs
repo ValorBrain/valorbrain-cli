@@ -40,20 +40,37 @@ const TOKEN_PLACEHOLDER = "vbm_<YOUR_TOKEN>";
 const C = process.stdout.isTTY && !process.env.NO_COLOR
   ? { dim: "\x1b[2m", green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m", bold: "\x1b[1m", off: "\x1b[0m" }
   : { dim: "", green: "", yellow: "", red: "", bold: "", off: "" };
+/** Warning marker for stderr, colored only when stderr itself is a terminal. */
+const WARN = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[33m!\x1b[0m" : "!";
 
 // ── args ────────────────────────────────────────────────────────────────────
 
-function parseArgs(argv) {
-  const out = { harnesses: [], dryRun: false, remove: false, status: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, relogin: false, scope: null, kiroEngine: "v3", force: false, privacy: {} };
+/** Flag each saved switch answers to (`--prompt off` → send_prompt). */
+const SWITCH_FLAGS = { send_prompt: "prompt", send_transcript: "transcript", checkpoint: "checkpoint" };
+
+/** Artifacts that act on every turn — what --mcp-only leaves out. */
+export const isPerTurn = (artifact) => artifact?.kind === "hooks";
+
+export function parseArgs(argv) {
+  const out = { harnesses: [], dryRun: false, remove: false, status: false, mcpOnly: false, api: null, app: null, token: null, noBackup: false, noBrowser: false, relogin: false, scope: null, kiroEngine: "v3", force: false, privacy: {}, unknown: [] };
   const onOff = (v) => (v === "on" ? true : v === "off" ? false : v);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
     else if (a === "--force") out.force = true;
+    else if (a === "--mcp-only") out.mcpOnly = true;
+    // `--mcp-only=true` must never fall through to a full install that sends
+    // every prompt: boolean spellings are honoured, anything else is refused.
+    else if (a.startsWith("--mcp-only=")) {
+      const v = a.slice(11).toLowerCase();
+      out.mcpOnly = /^(true|1|yes|on)$/.test(v) ? true : /^(false|0|no|off)$/.test(v) ? false : a.slice(11);
+    }
     else if (a === "--prompt") out.privacy.send_prompt = onOff(argv[++i]);
     else if (a.startsWith("--prompt=")) out.privacy.send_prompt = onOff(a.slice(9));
     else if (a === "--transcript") out.privacy.send_transcript = onOff(argv[++i]);
     else if (a.startsWith("--transcript=")) out.privacy.send_transcript = onOff(a.slice(13));
+    else if (a === "--checkpoint") out.privacy.checkpoint = onOff(argv[++i]);
+    else if (a.startsWith("--checkpoint=")) out.privacy.checkpoint = onOff(a.slice(13));
     else if (a === "--remove") out.remove = true;
     else if (a === "--status") out.status = true;
     else if (a === "--no-backup") out.noBackup = true;
@@ -73,6 +90,10 @@ function parseArgs(argv) {
     else if (a.startsWith("--app=")) out.app = a.slice(6);
     else if (a === "--help" || a === "-h") out.help = true;
     else if (!a.startsWith("-")) out.harnesses.push(a);
+    // Up to 0.8 an unknown flag was dropped in silence (`--mcp-only` on 0.8.1
+    // did a full install). Now it is named on stderr — never an error: scripts
+    // and docs in the field pass flags this version may not know.
+    else out.unknown.push(a);
   }
   return out;
 }
@@ -117,6 +138,15 @@ Options
                     mode removes the other's files — the two never fire
                     together (a V3 session running the agent would fire every
                     event twice).
+  --mcp-only        wire only the MCP server and the instructions block: no
+                    hooks, so no hook sends anything on each turn. On a
+                    harness already wired with hooks it removes them (hooks
+                    you edited by hand go only with --force or a yes at the
+                    prompt). A later run without --mcp-only adds the hooks
+                    back. Also --mcp-only=true|false. Not applied together
+                    with --prompt/--transcript/--checkpoint, which only save a
+                    choice and exit. (Hermes has no hooks: its memory plugin
+                    stays and still sends the prompt; use --prompt off there.)
   --no-backup       skip .valorbrain-bak copies
   --force           overwrite files you edited by hand without asking (by
                     default a re-run shows what would change in them and asks;
@@ -127,6 +157,12 @@ Options
                     VALORBRAIN_SEND_PROMPT=off does the same for the whole machine.
   --transcript on|off  Hermes only: upload the session transcript to the
                     extraction hooks (default off).
+  --checkpoint on|off  let the Stop hook ask the agent for a short memory
+                    checkpoint every few turns (default on). Saved like
+                    --prompt; VALORBRAIN_CHECKPOINT=off|on wins over it. Gemini
+                    CLI strips env from hooks, so there only this switch works.
+
+Unknown flags are named on stderr and ignored.
 
 Writes, per harness: the MCP server entry (so the tools exist), an instructions
 file (so the agent knows to consult memory before answering) and, where the
@@ -512,6 +548,11 @@ export function manifestTarget(rawPath, home, cwd = process.cwd()) {
   return { path };
 }
 
+/**
+ * `remove`: true takes every artifact out (--remove); a function picks the
+ * artifacts to take out and keeps the rest (--mcp-only drops the per-turn
+ * ones). A picked artifact with no file on disk is skipped, never created.
+ */
 function planFor(manifest, token, home, remove, cwd = process.cwd()) {
   const changes = [];
   // Two artifacts can share a file (Gemini keeps MCP servers and hooks in
@@ -527,6 +568,8 @@ function planFor(manifest, token, home, remove, cwd = process.cwd()) {
     const path = target.path;
     if (!path) continue;
     const before = planned.has(path) ? planned.get(path) : existsSync(path) ? readFileSync(path, "utf-8") : null;
+    const rm = typeof remove === "function" ? Boolean(remove(artifact)) : remove;
+    if (rm && before === null && remove !== true) continue;
     // Substitute the real token, and expand `~` inside file contents too
     // (OpenCode stores an absolute instructions path in its config).
     const rendered = artifact.contents
@@ -537,28 +580,31 @@ function planFor(manifest, token, home, remove, cwd = process.cwd()) {
     try {
       if (artifact.kind === "mcp" && /\.ya?ml$/.test(path)) {
         // Hermes: config.yaml é do cliente; mescla por chave, nunca overwrite.
-        after = mergeYaml(before, rendered, remove);
+        after = mergeYaml(before, rendered, rm);
       } else if (artifact.kind === "mcp" && path.endsWith(".toml")) {
-        after = mergeToml(before, rendered, remove);
+        after = mergeToml(before, rendered, rm);
       } else if (artifact.kind === "mcp") {
-        after = mergeJson(before ?? "{}", rendered, remove);
+        after = mergeJson(before ?? "{}", rendered, rm);
       } else if (artifact.kind === "hooks" && path.endsWith(".json") && !/valorbrain/i.test(path)) {
         // Arquivo COMPARTILHADO do cliente (ex.: ~/.claude/settings.json):
         // merge por evento, nunca overwrite. Arquivos nossos (valorbrain.json,
         // plugins/valorbrain.ts) seguem o caminho normal (write/delete).
-        after = mergeHooksJson(before ?? "", rendered, remove);
+        after = mergeHooksJson(before ?? "", rendered, rm);
       } else if (artifact.strategy === "merge") {
         const block = extractBlock(rendered);
         if (!block) throw new Error("server sent a merge artifact without markers");
-        after = remove ? removeBlock(before ?? "") : upsertBlock(before ?? "", block);
+        after = rm ? removeBlock(before ?? "") : upsertBlock(before ?? "", block);
       } else {
-        after = remove ? null : rendered;
+        after = rm ? null : rendered;
       }
     } catch (err) {
       changes.push({ artifact, path, before, after: before, changed: false, error: err.message });
       continue;
     }
-    if (remove && after !== null && after.trim() === "") after = null;
+    if (rm && after !== null && after.trim() === "") after = null;
+    // --mcp-only on a file holding none of our hook entries (Gemini keeps the
+    // MCP entry in the same settings.json): reformatting is not a change.
+    if (rm && remove !== true && before !== null && after !== null && !hookEntriesChanged({ before, after })) after = before;
     changes.push({ artifact, path, before, after, changed: after !== before });
     planned.set(path, after);
   }
@@ -901,8 +947,15 @@ async function confirmHandEdits(changes, home, { force, dryRun }) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.unknown.length > 0) {
+    console.error(`${WARN} warning: ignoring unknown flag(s): ${args.unknown.join(" ")} — this is @valorbrain/connect ${CLIENT_VERSION}; see --help`);
+  }
   if (args.help) { console.log(HELP); return 0; }
 
+  if (typeof args.mcpOnly !== "boolean") {
+    console.error(`--mcp-only takes no value, or one of true|false (got "${args.mcpOnly}")`);
+    return 2;
+  }
   if (args.scope != null && !SCOPES.has(args.scope)) {
     console.error(`--scope must be one of: ${[...SCOPES].join(", ")}`);
     return 2;
@@ -914,13 +967,13 @@ async function main() {
 
   const home = homedir();
 
-  // --prompt / --transcript only record a choice in connect.json and exit:
-  // no token, no network, no file other than that one.
+  // --prompt / --transcript / --checkpoint only record a choice in
+  // connect.json and exit: no token, no network, no file other than that one.
   const privacy = PRIVACY_KEYS.filter((k) => k in args.privacy);
   if (privacy.length > 0) {
     for (const k of privacy) {
       if (typeof args.privacy[k] !== "boolean") {
-        console.error(`--${k === "send_prompt" ? "prompt" : "transcript"} must be "on" or "off"`);
+        console.error(`--${SWITCH_FLAGS[k]} must be "on" or "off"`);
         return 2;
       }
     }
@@ -931,11 +984,16 @@ async function main() {
     }
     for (const id of ids) {
       setPrivacy(home, id, args.privacy);
-      const what = privacy.map((k) => `${k === "send_prompt" ? "prompt" : "transcript"} ${args.privacy[k] ? "on" : "off"}`).join(", ");
+      const what = privacy.map((k) => `${SWITCH_FLAGS[k]} ${args.privacy[k] ? "on" : "off"}`).join(", ");
       console.log(`${C.green}✓${C.off} ${id}: ${what} ${C.dim}(${credsPath(home).replace(home, "~")})${C.off}`);
       if ("send_transcript" in args.privacy && id !== "hermes") {
         console.log(`  ${C.dim}note: only the Hermes plugin has a transcript to send; ${id} never sends one${C.off}`);
       }
+    }
+    // The switches exit before any install: an --mcp-only next to them is not
+    // applied, and saying so beats a silent drop.
+    if (args.mcpOnly) {
+      console.error(`${WARN} --mcp-only was not applied: --${privacy.map((k) => SWITCH_FLAGS[k]).join("/--")} only record a choice and exit. Run the install with --mcp-only on its own.`);
     }
     return 0;
   }
@@ -1126,11 +1184,25 @@ async function main() {
         const mode = detectKiroMode(readCreds(home, harness));
         console.log(`  ${C.dim}on disk: ${mode === "legacy" ? "legacy (agent config)" : "v3 (standalone ~/.kiro/hooks)"} — switch with --kiro-engine=${mode === "legacy" ? "v3" : "legacy"}${C.off}`);
       }
-      for (const r of statusFor(manifest, home)) {
+      const saved = readCreds(home, harness);
+      const mcpOnly = saved?.mode === "mcp-only";
+      const raw = statusFor(manifest, home);
+      const hooked = raw.some((r) => r.kind === "hooks" && r.state !== "missing");
+      const rows = raw.map((r) => (mcpOnly && r.kind === "hooks" && r.state === "missing"
+        ? { ...r, state: "ok", detail: "none — installed with --mcp-only" }
+        : r));
+      if (manifest.artifacts.some(isPerTurn)) {
+        const mode = !mcpOnly
+          ? (hooked ? "hooks" : "hooks not installed")
+          : hooked
+            ? "mcp-only recorded, but valorbrain hooks are on disk and still send on each turn — run with --mcp-only --force to remove them (hooks you edited by hand go only with --force or a yes at the prompt)"
+            : "mcp-only — MCP tools + instructions, no hooks (nothing sent per turn); run again without --mcp-only to add them";
+        console.log(`  mode: ${mode}`);
+      }
+      for (const r of rows) {
         console.log(`  ${icon[r.state] ?? " "} ${r.kind.padEnd(5)} ${r.detail}`);
       }
       if (manifest.hooks_available) {
-        const saved = readCreds(home, harness);
         console.log(saved
           ? `  ${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
           : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until you run npx -y @valorbrain/connect`);
@@ -1139,18 +1211,24 @@ async function main() {
       continue;
     }
 
+    // --remove wins over --mcp-only: both take the hooks out.
+    const mcpOnly = args.mcpOnly && !args.remove;
+
     // Hooks read the token from this harness's entry (ADR-058), written before
     // any hook artifact so a freshly wired hook never runs without it. One
     // entry per harness: two harnesses may belong to two tenants.
     // Also saved for agents without hooks when the token came from a browser
     // login: a re-run then finds the agent connected and needs no approval.
     if (!args.remove && tokenFor(harness) && (manifest.hooks_available || (loginTokens && loginTokens[harness]))) {
+      // With --mcp-only no hook reads it: kept so --status knows the mode and
+      // a later plain run finds the agent connected (and adds the hooks).
+      const what = mcpOnly ? "credentials, mcp-only" : "hook credentials";
       if (args.dryRun) {
-        console.log(`  ${C.green}→${C.off} write hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+        console.log(`  ${C.green}→${C.off} write ${what} ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
       } else {
         try {
-          writeCreds(home, { api: apiFor(harness), token: tokenFor(harness), harness, kiroEngine: args.kiroEngine });
-          console.log(`  ${C.green}✓${C.off} hook credentials ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
+          writeCreds(home, { api: apiFor(harness), token: tokenFor(harness), harness, kiroEngine: args.kiroEngine, mcpOnly });
+          console.log(`  ${C.green}✓${C.off} ${what} ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
         } catch (err) {
           console.log(`  ${C.red}✗${C.off} hook credentials: ${err.message}`);
           failed++;
@@ -1159,7 +1237,7 @@ async function main() {
       }
     }
 
-    const changes = planFor(manifest, tokenFor(harness), home, args.remove);
+    const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove);
     if (!args.remove) await confirmHandEdits(changes, home, args);
     const res = apply(changes, args);
     if (!args.dryRun) recordWritten(home, changes, { forget: args.remove });
@@ -1171,7 +1249,7 @@ async function main() {
     // reported twice.
     if (harness === "kiro") {
       const handled = new Set(changes.map((c) => c.path));
-      const stale = args.remove
+      const stale = args.remove || mcpOnly
         ? [...staleKiroFiles({ home, kiroEngine: "v3" }), ...staleKiroFiles({ home, kiroEngine: "legacy" })]
         : staleKiroFiles({ home, kiroEngine: args.kiroEngine });
       for (const p of new Set(stale)) {
@@ -1201,8 +1279,20 @@ async function main() {
       if (!manifest.hooks_available) {
         console.log(`  ${C.dim}note: automatic context injection (hooks) needs a self-hosted engine; this install covers tools + instructions${C.off}`);
       }
-      for (const n of manifest.notes ?? []) console.log(`  ${C.dim}note: ${n}${C.off}`);
-      if (manifest.hooks_available && harness === "kiro") {
+      if (mcpOnly && !manifest.artifacts.some(isPerTurn)) {
+        console.log(`  ${C.dim}note: ${harness} gets no hooks from this engine — --mcp-only changes nothing here${harness === "hermes" ? "; the Hermes memory plugin stays installed and still sends the prompt of each turn (--prompt off stops that)" : ""}${C.off}`);
+      }
+      // Notes about hooks describe what --mcp-only just left out.
+      for (const n of manifest.notes ?? []) if (!(mcpOnly && /hook/i.test(n))) console.log(`  ${C.dim}note: ${n}${C.off}`);
+      if (mcpOnly && manifest.artifacts.some(isPerTurn)) {
+        // A hook file edited by hand that nobody confirmed overwriting stays —
+        // and keeps sending: say so instead of promising "nothing is sent".
+        const keptHooks = changes.filter((c) => c.kept && isPerTurn(c.artifact));
+        console.log(keptHooks.length > 0
+          ? `  ${C.yellow}!${C.off} --mcp-only: your hand-edited hooks were kept (${keptHooks.map((c) => c.path).join(", ")}) and still send on each turn. Run again with --mcp-only --force to remove them.`
+          : `  ${C.dim}note: --mcp-only — no hooks, so nothing is sent on each turn; the agent reaches memory through the MCP tools. Run again without --mcp-only to add the hooks.${C.off}`);
+      }
+      if (!mcpOnly && manifest.hooks_available && harness === "kiro") {
         const sub = args.kiroEngine === "legacy" ? "agents" : "hooks";
         const where = args.scope === "workspace"
           ? join(process.cwd(), ".kiro", sub, "valorbrain.json")
@@ -1242,7 +1332,7 @@ async function main() {
 // o cliente está velho; é o único canal que fecha o loop sem o cliente rodar
 // nada à mão. Tudo fail-open: hook que quebra o prompt é pior que hook inútil.
 
-const CLIENT_VERSION = "0.8.1";
+const CLIENT_VERSION = "0.9.0";
 const HEAL_INTERVAL_MS = Number(process.env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 3600 * 1000);
 const DECLARE_TIMEOUT_MS = 2500;
 /** Teto do self-heal no caminho do hook: nunca atrasa o prompt além disso. */
@@ -1449,7 +1539,9 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
     // token do heal — para dentro da mudança de hooks.
-    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp") }, token, home, false)
+    // Instalado com --mcp-only: o heal nunca traz hooks de volta.
+    const mcpOnly = readCreds(home, id)?.mode === "mcp-only";
+    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(mcpOnly && isPerTurn(a))) }, token, home, false)
       .filter((c) => !c.error);
     const planned = plan.filter((c) => c.changed);
     // A guarda de segundo loader barra só a CRIAÇÃO do standalone em $HOME
