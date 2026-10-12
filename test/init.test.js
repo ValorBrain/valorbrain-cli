@@ -141,11 +141,22 @@ test("init --agent --json lists the connect commands with the token, detected cl
     const { next_steps: next } = JSON.parse(r.stdout.trim());
     assert.equal(next.connect[0].client, "codex");
     assert.equal(next.connect[0].detected, true);
-    assert.ok(next.connect[0].command.includes(`VALORBRAIN_MCP_TOKEN=${MCP_TOKEN}`));
-    assert.ok(next.connect[0].command.includes(`--url ${SIGNUP.mcp_url}`));
+    // The fake engine is not the public default: connect must be told where the account lives.
+    assert.equal(next.connect[0].command, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness codex`);
+    assert.equal(next.connect[0].harness, "codex");
+    assert.match(next.connect[0].consent, /prompt of each turn/);
+    assert.match(next.connect[0].consent, /--harness codex --prompt off` and `--checkpoint off`.*VALORBRAIN_SEND_PROMPT=off.*only the hooks, re-run the install with --mcp-only; --remove undoes everything/);
+    assert.equal(next.connect[0].mcp_only, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness codex --mcp-only`);
+    assert.match(next.connect[0].consent, /what-leaves-your-machine/);
+    assert.ok(next.connect[0].mcp_manual.includes(`VALORBRAIN_MCP_TOKEN=${MCP_TOKEN}`));
+    assert.ok(next.connect[0].mcp_manual.includes(`--url ${SIGNUP.mcp_url}`));
+    const gemini = next.connect.find((c) => c.client === "gemini");
+    assert.equal(gemini.harness, "gemini-cli");
+    assert.ok(!gemini.consent.includes("VALORBRAIN_"), "Gemini CLI strips the env of its hooks");
+    assert.match(gemini.consent, /--prompt off` and `--checkpoint off`/);
     const claude = next.connect.find((c) => c.client === "claude-code");
     assert.equal(claude.detected, false);
-    assert.equal(claude.command,
+    assert.equal(claude.mcp_manual,
       `claude mcp add --transport http --scope user valorbrain ${SIGNUP.mcp_url} --header "Authorization: Bearer ${MCP_TOKEN}"`);
     assert.equal(next.stdio, "npx -y @valorbrain/cli mcp");
     assert.equal(next.doc, "https://valorbrain.com.br/connect.md");
@@ -154,6 +165,27 @@ test("init --agent --json lists the connect commands with the token, detected cl
   } finally {
     await engine.close();
   }
+});
+
+test("init --agent --url passes that engine to connect as --api", async () => {
+  const engine = await fakeEngine(SIGNUP);
+  const home = freshHome();
+  try {
+    const r = await run(["--url", `${engine.url}/`, "init", "--agent", "--json"], { home, url: "", path: fakeBin("claude") });
+    assert.equal(r.status, 0, r.stderr);
+    const claude = JSON.parse(r.stdout.trim()).next_steps.connect.find((c) => c.client === "claude-code");
+    assert.equal(claude.command, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness claude-code`);
+    assert.equal(claude.mcp_only, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness claude-code --mcp-only`);
+  } finally {
+    await engine.close();
+  }
+});
+
+test("on the public engine the connect command carries no --api", async () => {
+  const { connectCommands } = await import("../lib/next-steps.js");
+  const [claude] = connectCommands(MCP_TOKEN, SIGNUP.mcp_url, { PATH: "" });
+  assert.equal(claude.command, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --harness claude-code`);
+  assert.ok(!claude.mcp_only.includes("--api"));
 });
 
 test("init --agent prints both credentials labeled and the detected client's command", async () => {
@@ -167,6 +199,11 @@ test("init --agent prints both credentials labeled and the detected client's com
     assert.match(r.stdout, new RegExp(`MCP token:\\s+${MCP_TOKEN}`));
     assert.match(r.stdout, /vbm_, MCP only/);
     assert.match(r.stdout, /claude-code \(found on PATH\)/);
+    const install = r.stdout.indexOf(`npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness claude-code`);
+    assert.ok(install > 0, "the connect command is printed");
+    assert.ok(install < r.stdout.indexOf("claude mcp add"), "connect comes before the MCP-only command");
+    assert.ok(r.stdout.includes(`No hooks (MCP + rules): npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --api ${engine.url} --harness claude-code --mcp-only`));
+    assert.match(r.stdout, /Tell your human first: the hooks send the prompt of each turn/);
     assert.ok(r.stdout.includes(`--header "Authorization: Bearer ${MCP_TOKEN}"`));
     assert.ok(!r.stdout.includes("codex mcp add"), "only detected clients are listed when one is found");
     assert.match(r.stdout, /memory_prepare/);
