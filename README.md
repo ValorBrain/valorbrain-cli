@@ -20,9 +20,16 @@ in `~/.valorbrain/config.json` (mode 0600) and work immediately:
 | MCP token (`mcp_token`) | `vbm_…` | the hosted MCP server (`https://mcpbrain.valor.digital/mcp`); the engine REST API accepts it too, but this CLI only sends it to MCP |
 
 The MCP token is shown once by the server — the config file is the only place
-it lives. `init --agent` prints both credentials, labeled, and the next step:
-the connect command for the MCP clients it finds on `PATH` (`claude`, `codex`,
-`gemini`), the same commands as https://valorbrain.com.br/connect.md. With
+it lives. `init --agent` prints both credentials, labeled, and the next step
+for the clients it finds on `PATH` (`claude`, `codex`, `gemini`), the same
+commands as https://valorbrain.com.br/connect.md. These are CLIs with hooks, so
+the first command is the connect installer — `npx -y @valorbrain/connect@latest
+--token <mcp_token> --harness <claude-code|codex|gemini-cli>`, MCP + rules +
+hooks — followed by one consent line: the hooks send the prompt of each turn to
+your ValorBrain workspace; opt out with `--prompt off` (or
+`VALORBRAIN_SEND_PROMPT=off`, not on Gemini CLI) or uninstall with `--remove`
+([what leaves your machine](https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine)).
+The plain MCP command follows as the no-hooks path. With
 `--json` the same data comes as `next_steps`. `init --agent` refuses to replace
 an existing config (that would create a second account and drop both keys);
 pass `--force` to replace it, and a backup is written first.

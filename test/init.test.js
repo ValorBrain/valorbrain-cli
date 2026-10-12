@@ -141,11 +141,19 @@ test("init --agent --json lists the connect commands with the token, detected cl
     const { next_steps: next } = JSON.parse(r.stdout.trim());
     assert.equal(next.connect[0].client, "codex");
     assert.equal(next.connect[0].detected, true);
-    assert.ok(next.connect[0].command.includes(`VALORBRAIN_MCP_TOKEN=${MCP_TOKEN}`));
-    assert.ok(next.connect[0].command.includes(`--url ${SIGNUP.mcp_url}`));
+    assert.equal(next.connect[0].command, `npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --harness codex`);
+    assert.equal(next.connect[0].harness, "codex");
+    assert.match(next.connect[0].consent, /prompt of each turn/);
+    assert.match(next.connect[0].consent, /--harness codex --prompt off`.*VALORBRAIN_SEND_PROMPT=off.*--remove/);
+    assert.match(next.connect[0].consent, /what-leaves-your-machine/);
+    assert.ok(next.connect[0].mcp_only.includes(`VALORBRAIN_MCP_TOKEN=${MCP_TOKEN}`));
+    assert.ok(next.connect[0].mcp_only.includes(`--url ${SIGNUP.mcp_url}`));
+    const gemini = next.connect.find((c) => c.client === "gemini");
+    assert.equal(gemini.harness, "gemini-cli");
+    assert.ok(!gemini.consent.includes("VALORBRAIN_SEND_PROMPT"), "Gemini CLI strips the env of its hooks");
     const claude = next.connect.find((c) => c.client === "claude-code");
     assert.equal(claude.detected, false);
-    assert.equal(claude.command,
+    assert.equal(claude.mcp_only,
       `claude mcp add --transport http --scope user valorbrain ${SIGNUP.mcp_url} --header "Authorization: Bearer ${MCP_TOKEN}"`);
     assert.equal(next.stdio, "npx -y @valorbrain/cli mcp");
     assert.equal(next.doc, "https://valorbrain.com.br/connect.md");
@@ -167,6 +175,10 @@ test("init --agent prints both credentials labeled and the detected client's com
     assert.match(r.stdout, new RegExp(`MCP token:\\s+${MCP_TOKEN}`));
     assert.match(r.stdout, /vbm_, MCP only/);
     assert.match(r.stdout, /claude-code \(found on PATH\)/);
+    const install = r.stdout.indexOf(`npx -y @valorbrain/connect@latest --token ${MCP_TOKEN} --harness claude-code`);
+    assert.ok(install > 0, "the connect command is printed");
+    assert.ok(install < r.stdout.indexOf("claude mcp add"), "connect comes before the MCP-only command");
+    assert.match(r.stdout, /Tell your human first: the hooks send the prompt of each turn/);
     assert.ok(r.stdout.includes(`--header "Authorization: Bearer ${MCP_TOKEN}"`));
     assert.ok(!r.stdout.includes("codex mcp add"), "only detected clients are listed when one is found");
     assert.match(r.stdout, /memory_prepare/);
