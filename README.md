@@ -28,10 +28,13 @@ the first command is the connect installer — `npx -y @valorbrain/connect@lates
 hooks — followed by one consent line: the hooks send the prompt of each turn to
 your ValorBrain workspace; opt out with `--prompt off` and `--checkpoint off`
 (or `VALORBRAIN_SEND_PROMPT=off` / `VALORBRAIN_CHECKPOINT=off`, not on Gemini
-CLI) or uninstall with `--remove`
+CLI); to drop only the hooks, re-run the install with `--mcp-only`; `--remove`
+undoes everything (MCP entry, rules, hooks, saved credentials)
 ([what leaves your machine](https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine)).
 The no-hooks path follows: the same command with `--mcp-only` (MCP server +
-rules, nothing sent per turn), or the plain MCP command by hand. With
+rules, nothing sent per turn), or the plain MCP command by hand. When the
+account lives on an engine other than the public one (`--url`), the connect
+commands carry `--api <engine>` so connect talks to that engine. With
 `--json` the same data comes as `next_steps`. `init --agent` refuses to replace
 an existing config (that would create a second account and drop both keys);
 pass `--force` to replace it, and a backup is written first.
