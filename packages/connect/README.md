@@ -5,17 +5,20 @@ MCP e grava os artefatos que o engine mandar (o engine é a fonte única — mud
 contrato no servidor, o próximo run instala).
 
 ```bash
-npx -y @valorbrain/connect@0.8                            # detecta, autoriza no navegador, conecta tudo
-npx -y @valorbrain/connect@0.8 --harness kiro             # um harness
-npx -y @valorbrain/connect@0.8 --token vbm_xxx            # com um token que você já tem (sem navegador)
-npx -y @valorbrain/connect@0.8 --token vbm_xxx --dry-run  # mostra o plano
-npx -y @valorbrain/connect@0.8 --status                   # o que está instalado
-npx -y @valorbrain/connect@0.8 --token vbm_xxx --remove   # desfaz
-npx -y @valorbrain/connect@0.8 --harness codex --prompt off   # não envia o prompt (só muda a escolha)
+npx -y @valorbrain/connect@latest                            # detecta, autoriza no navegador, conecta tudo
+npx -y @valorbrain/connect@latest --harness kiro             # um harness
+npx -y @valorbrain/connect@latest --token vbm_xxx            # com um token que você já tem (sem navegador)
+npx -y @valorbrain/connect@latest --token vbm_xxx --dry-run  # mostra o plano
+npx -y @valorbrain/connect@latest --harness codex --mcp-only # só MCP + instruções, sem hooks
+npx -y @valorbrain/connect@latest --status                   # o que está instalado (e o modo)
+npx -y @valorbrain/connect@latest --token vbm_xxx --remove   # desfaz
+npx -y @valorbrain/connect@latest --harness codex --prompt off       # não envia o prompt (só muda a escolha)
+npx -y @valorbrain/connect@latest --harness gemini-cli --checkpoint off  # sem checkpoint (só muda a escolha)
 ```
 
-A 0.8 sai com a dist-tag `next` até o engine assinar os manifestos em
-produção; depois vira `latest`. Por isso os exemplos fixam `@0.8`.
+Flag que esta versão não conhece não derruba a instalação: o connect avisa no
+stderr (`warning: ignoring unknown flag(s): …`) e segue. Até a 0.8.1 ela era
+ignorada em silêncio — `--mcp-only` na 0.8.1 fazia a instalação completa.
 
 Sem Node.js instalado, o app serve um instalador de uma linha que confere o
 Node 18+ antes (no Windows, oferece instalar a LTS com o winget):
@@ -65,6 +68,25 @@ no engine) e confie nela aqui com
 `VALORBRAIN_MANIFEST_PUBLIC_KEYS=<chave pública em base64>` (várias, separadas
 por vírgula). Não há como desligar a verificação.
 
+## Só MCP, sem hooks (0.9)
+
+`--mcp-only` grava a entrada do servidor MCP e o bloco de instruções (texto
+local), e nenhum hook: nada é enviado a cada turno; o agente chega à memória
+pelas ferramentas MCP quando decide usá-las.
+
+- Num harness que já tinha hooks, `--mcp-only` tira as nossas entradas (as de
+  outras ferramentas no mesmo arquivo ficam).
+- O modo fica em `~/.valorbrain/connect.json` (`mode: "mcp-only"` na entrada
+  do harness, junto com o token, que nenhum hook lê) e aparece em `--status`
+  (`mode: mcp-only …` / `mode: hooks`).
+- Rodar de novo **sem** `--mcp-only` instala os hooks e apaga o registro do
+  modo. O self-heal nunca traz hooks de volta sozinho — sem hooks ele nem roda,
+  então o bloco de instruções só se atualiza quando você roda o instalador.
+- Harness sem hooks no manifesto (OMP, Hermes): a flag não muda nada. O plugin
+  de memória do Hermes continua; ali o que desliga o envio do prompt é
+  `--prompt off`.
+- `--remove` vence `--mcp-only`.
+
 ## Arquivo editado à mão
 
 O connect lembra o que escreveu em cada arquivo que gerencia
@@ -92,6 +114,13 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
   `--prompt on` volta), ou na máquina inteira com `VALORBRAIN_SEND_PROMPT=off` no
   ambiente do harness. Desligado, o hook do prompt não faz chamada nenhuma; o
   contexto de início de sessão e o checkpoint continuam.
+- **Checkpoint de memória** (o hook de Stop, a cada poucos turnos, pede ao
+  agente um registro curto pelo MCP): ligado por padrão. Desliga por harness com
+  `npx -y @valorbrain/connect --harness <id> --checkpoint off` (grava
+  `checkpoint: false` na entrada do harness; `--checkpoint on` volta), ou na
+  máquina inteira com `VALORBRAIN_CHECKPOINT=off` — que vence o arquivo nos dois
+  sentidos (`VALORBRAIN_CHECKPOINT=on` religa). No Gemini CLI, que roda os hooks
+  sem o ambiente, só o arquivo vale.
 - **Transcript do Hermes**: só com opt-in,
   `npx -y @valorbrain/connect --harness hermes --transcript on` (ou
   `VALORBRAIN_SEND_TRANSCRIPT=on`). Os outros harnesses nunca enviam transcript.
@@ -234,8 +263,10 @@ não grava nada.
   em `/hooks`; basta reinstalar.
 
 Estado local por sessão em `~/.valorbrain/state/hooks/` (apagado após 7 dias).
-Para desligar o checkpoint numa máquina, defina `VALORBRAIN_CHECKPOINT=off` no
-ambiente do harness. A mesma variável no engine desliga para todos.
+Para desligar o checkpoint de um harness, `--checkpoint off` (fica em
+`connect.json`; é o que vale no Gemini CLI, que roda os hooks sem o ambiente);
+numa máquina inteira, `VALORBRAIN_CHECKPOINT=off` no ambiente do harness, que
+vence o arquivo. A mesma variável no engine desliga para todos.
 
 ```bash
 npm test   # node --test, sem dependências além do yaml

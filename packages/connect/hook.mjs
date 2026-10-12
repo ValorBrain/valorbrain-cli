@@ -111,6 +111,7 @@ export function readCreds(home, harness) {
     if (!token) return null;
     const creds = { token, api: normalizeApi(e?.api_url) || null };
     if (e?.kiro_engine === 'legacy') creds.kiro_engine = 'legacy';
+    if (e?.mode === 'mcp-only') creds.mode = 'mcp-only';
     return creds;
 }
 
@@ -172,8 +173,12 @@ function writeCredsFile(home, data) {
     return path;
 }
 
-/** Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir. */
-export function writeCreds(home, { api, token, harness, kiroEngine }) {
+/**
+ * Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir.
+ * `mcpOnly` records an install without hooks (`--mcp-only`); any other
+ * install clears it, so a later plain run upgrades to hooks.
+ */
+export function writeCreds(home, { api, token, harness, kiroEngine, mcpOnly = false }) {
     if (!harness) throw new Error('writeCreds needs the harness id');
     const id = canonicalHarness(harness);
     return withCredsLock(home, () => {
@@ -183,6 +188,7 @@ export function writeCreds(home, { api, token, harness, kiroEngine }) {
         // means legacy: connect 0.5.1 wrote that file BY DEFAULT, so its
         // existence proves nothing (VAL-224 S1). The default (v3) clears it.
         if (kiroEngine === 'legacy') entry.kiro_engine = 'legacy';
+        if (mcpOnly) entry.mode = 'mcp-only';
         // A re-install or a token migration never undoes the person's choice
         // about what leaves the machine (setPrivacy).
         for (const k of PRIVACY_KEYS) {
@@ -195,12 +201,13 @@ export function writeCreds(home, { api, token, harness, kiroEngine }) {
 
 /**
  * What leaves the machine, per harness (PRD decision 18): `send_prompt`
- * (default true — the prompt of each turn goes to /api/v1/hooks/cue for recall)
- * and `send_transcript` (default false — only the Hermes plugin has one to
- * send). Kept in this harness's entry of connect.json, so `--prompt off` for
- * Codex leaves Claude Code alone.
+ * (default true — the prompt of each turn goes to /api/v1/hooks/cue for recall),
+ * `send_transcript` (default false — only the Hermes plugin has one to
+ * send) and `checkpoint` (default true — the Stop hook may ask the agent for a
+ * memory checkpoint). Kept in this harness's entry of connect.json, so
+ * `--prompt off` for Codex leaves Claude Code alone.
  */
-export const PRIVACY_KEYS = ['send_prompt', 'send_transcript'];
+export const PRIVACY_KEYS = ['send_prompt', 'send_transcript', 'checkpoint'];
 
 /** Set privacy switches for one harness; creates the entry if the harness has no token yet. */
 export function setPrivacy(home, harness, patch) {
@@ -226,6 +233,19 @@ export function promptSharing(home, harness, env = {}) {
     if (/^(off|0|false|no)$/.test(v)) return false;
     if (/^(on|1|true|yes)$/.test(v)) return true;
     return readCredsFile(home).harnesses[canonicalHarness(harness)]?.send_prompt !== false;
+}
+
+/**
+ * Whether the Stop hook may checkpoint for this harness. Same precedence as
+ * promptSharing: VALORBRAIN_CHECKPOINT=off|on (machine-wide), then the
+ * harness's `checkpoint` in connect.json (`--checkpoint off`; the only switch
+ * Gemini CLI sees, since it strips env from hooks), then on.
+ */
+export function checkpointEnabled(home, harness, env = {}) {
+    const v = str(env.VALORBRAIN_CHECKPOINT).toLowerCase();
+    if (/^(off|0|false|no)$/.test(v)) return false;
+    if (/^(on|1|true|yes)$/.test(v)) return true;
+    return readCredsFile(home).harnesses[canonicalHarness(harness)]?.checkpoint !== false;
 }
 
 /** Drop one harness's entry (or all); the file goes when nothing is left. */
@@ -741,10 +761,11 @@ export async function runHook(argv, deps = {}) {
     // stays silent and does not touch the state — counting it would count the
     // same turn twice.
     const silent = renderSilentStop(dialect);
-    // Machine-level opt-out (the engine has the same switch for everyone), and
-    // headless runs: an SDK-driven Claude Code session's final message is
-    // somebody's program output, never a place for a checkpoint.
-    if (/^(off|0|false)$/i.test(str(env.VALORBRAIN_CHECKPOINT)) || /^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) {
+    // Opt-out: VALORBRAIN_CHECKPOINT, then this harness's `checkpoint` in
+    // connect.json (the engine has its own switch for everyone). And headless
+    // runs: an SDK-driven Claude Code session's final message is somebody's
+    // program output, never a place for a checkpoint.
+    if (!checkpointEnabled(home, harness, env) || /^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) {
         await heal;
         return emit(silent);
     }
