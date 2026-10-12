@@ -40,6 +40,8 @@ const TOKEN_PLACEHOLDER = "vbm_<YOUR_TOKEN>";
 const C = process.stdout.isTTY && !process.env.NO_COLOR
   ? { dim: "\x1b[2m", green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m", bold: "\x1b[1m", off: "\x1b[0m" }
   : { dim: "", green: "", yellow: "", red: "", bold: "", off: "" };
+/** Warning marker for stderr, colored only when stderr itself is a terminal. */
+const WARN = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[33m!\x1b[0m" : "!";
 
 // ── args ────────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,12 @@ export function parseArgs(argv) {
     if (a === "--dry-run") out.dryRun = true;
     else if (a === "--force") out.force = true;
     else if (a === "--mcp-only") out.mcpOnly = true;
+    // `--mcp-only=true` must never fall through to a full install that sends
+    // every prompt: boolean spellings are honoured, anything else is refused.
+    else if (a.startsWith("--mcp-only=")) {
+      const v = a.slice(11).toLowerCase();
+      out.mcpOnly = /^(true|1|yes|on)$/.test(v) ? true : /^(false|0|no|off)$/.test(v) ? false : a.slice(11);
+    }
     else if (a === "--prompt") out.privacy.send_prompt = onOff(argv[++i]);
     else if (a.startsWith("--prompt=")) out.privacy.send_prompt = onOff(a.slice(9));
     else if (a === "--transcript") out.privacy.send_transcript = onOff(argv[++i]);
@@ -132,9 +140,13 @@ Options
                     event twice).
   --mcp-only        wire only the MCP server and the instructions block: no
                     hooks, so no hook sends anything on each turn. On a
-                    harness already wired with hooks it removes them. A later
-                    run without --mcp-only adds the hooks back. (Hermes has no
-                    hooks: its memory plugin stays; use --prompt off there.)
+                    harness already wired with hooks it removes them (hooks
+                    you edited by hand go only with --force or a yes at the
+                    prompt). A later run without --mcp-only adds the hooks
+                    back. Also --mcp-only=true|false. Not applied together
+                    with --prompt/--transcript/--checkpoint, which only save a
+                    choice and exit. (Hermes has no hooks: its memory plugin
+                    stays and still sends the prompt; use --prompt off there.)
   --no-backup       skip .valorbrain-bak copies
   --force           overwrite files you edited by hand without asking (by
                     default a re-run shows what would change in them and asks;
@@ -935,8 +947,15 @@ async function confirmHandEdits(changes, home, { force, dryRun }) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.unknown.length > 0) {
+    console.error(`${WARN} warning: ignoring unknown flag(s): ${args.unknown.join(" ")} — this is @valorbrain/connect ${CLIENT_VERSION}; see --help`);
+  }
   if (args.help) { console.log(HELP); return 0; }
 
+  if (typeof args.mcpOnly !== "boolean") {
+    console.error(`--mcp-only takes no value, or one of true|false (got "${args.mcpOnly}")`);
+    return 2;
+  }
   if (args.scope != null && !SCOPES.has(args.scope)) {
     console.error(`--scope must be one of: ${[...SCOPES].join(", ")}`);
     return 2;
@@ -947,10 +966,6 @@ async function main() {
   }
 
   const home = homedir();
-
-  if (args.unknown.length > 0) {
-    console.error(`${C.yellow}!${C.off} warning: ignoring unknown flag(s): ${args.unknown.join(" ")} — this is @valorbrain/connect ${CLIENT_VERSION}; see --help`);
-  }
 
   // --prompt / --transcript / --checkpoint only record a choice in
   // connect.json and exit: no token, no network, no file other than that one.
@@ -974,6 +989,11 @@ async function main() {
       if ("send_transcript" in args.privacy && id !== "hermes") {
         console.log(`  ${C.dim}note: only the Hermes plugin has a transcript to send; ${id} never sends one${C.off}`);
       }
+    }
+    // The switches exit before any install: an --mcp-only next to them is not
+    // applied, and saying so beats a silent drop.
+    if (args.mcpOnly) {
+      console.error(`${WARN} --mcp-only was not applied: --${privacy.map((k) => SWITCH_FLAGS[k]).join("/--")} only record a choice and exit. Run the install with --mcp-only on its own.`);
     }
     return 0;
   }
@@ -1175,7 +1195,7 @@ async function main() {
         const mode = !mcpOnly
           ? (hooked ? "hooks" : "hooks not installed")
           : hooked
-            ? "mcp-only recorded, but valorbrain hooks are on disk — run with --mcp-only again to remove them"
+            ? "mcp-only recorded, but valorbrain hooks are on disk and still send on each turn — run with --mcp-only --force to remove them (hooks you edited by hand go only with --force or a yes at the prompt)"
             : "mcp-only — MCP tools + instructions, no hooks (nothing sent per turn); run again without --mcp-only to add them";
         console.log(`  mode: ${mode}`);
       }
@@ -1259,13 +1279,18 @@ async function main() {
       if (!manifest.hooks_available) {
         console.log(`  ${C.dim}note: automatic context injection (hooks) needs a self-hosted engine; this install covers tools + instructions${C.off}`);
       }
-      if (args.mcpOnly && !manifest.artifacts.some(isPerTurn)) {
-        console.log(`  ${C.dim}note: ${harness} gets no hooks from this engine — --mcp-only changes nothing here${harness === "hermes" ? " (the memory plugin stays; --prompt off stops sending prompts)" : ""}${C.off}`);
+      if (mcpOnly && !manifest.artifacts.some(isPerTurn)) {
+        console.log(`  ${C.dim}note: ${harness} gets no hooks from this engine — --mcp-only changes nothing here${harness === "hermes" ? "; the Hermes memory plugin stays installed and still sends the prompt of each turn (--prompt off stops that)" : ""}${C.off}`);
       }
       // Notes about hooks describe what --mcp-only just left out.
       for (const n of manifest.notes ?? []) if (!(mcpOnly && /hook/i.test(n))) console.log(`  ${C.dim}note: ${n}${C.off}`);
       if (mcpOnly && manifest.artifacts.some(isPerTurn)) {
-        console.log(`  ${C.dim}note: --mcp-only — no hooks, so nothing is sent on each turn; the agent reaches memory through the MCP tools. Run again without --mcp-only to add the hooks.${C.off}`);
+        // A hook file edited by hand that nobody confirmed overwriting stays —
+        // and keeps sending: say so instead of promising "nothing is sent".
+        const keptHooks = changes.filter((c) => c.kept && isPerTurn(c.artifact));
+        console.log(keptHooks.length > 0
+          ? `  ${C.yellow}!${C.off} --mcp-only: your hand-edited hooks were kept (${keptHooks.map((c) => c.path).join(", ")}) and still send on each turn. Run again with --mcp-only --force to remove them.`
+          : `  ${C.dim}note: --mcp-only — no hooks, so nothing is sent on each turn; the agent reaches memory through the MCP tools. Run again without --mcp-only to add the hooks.${C.off}`);
       }
       if (!mcpOnly && manifest.hooks_available && harness === "kiro") {
         const sub = args.kiroEngine === "legacy" ? "agents" : "hooks";

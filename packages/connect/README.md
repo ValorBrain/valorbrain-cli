@@ -75,7 +75,10 @@ local), e nenhum hook: nada é enviado a cada turno; o agente chega à memória
 pelas ferramentas MCP quando decide usá-las.
 
 - Num harness que já tinha hooks, `--mcp-only` tira as nossas entradas (as de
-  outras ferramentas no mesmo arquivo ficam).
+  outras ferramentas no mesmo arquivo ficam). Hook que você editou à mão segue
+  a regra de [arquivo editado à mão](#arquivo-editado-à-mão): sem ninguém no
+  terminal ele fica — e continua enviando; o instalador diz isso e o `--status`
+  também. `--mcp-only --force` tira.
 - O modo fica em `~/.valorbrain/connect.json` (`mode: "mcp-only"` na entrada
   do harness, junto com o token, que nenhum hook lê) e aparece em `--status`
   (`mode: mcp-only …` / `mode: hooks`).
@@ -83,9 +86,14 @@ pelas ferramentas MCP quando decide usá-las.
   modo. O self-heal nunca traz hooks de volta sozinho — sem hooks ele nem roda,
   então o bloco de instruções só se atualiza quando você roda o instalador.
 - Harness sem hooks no manifesto (OMP, Hermes): a flag não muda nada. O plugin
-  de memória do Hermes continua; ali o que desliga o envio do prompt é
-  `--prompt off`.
+  de memória do Hermes continua instalado e envia o prompt de cada turno; ali o
+  que desliga isso é `--prompt off`.
 - `--remove` vence `--mcp-only`.
+- Também aceita `--mcp-only=true|1|yes|on` (e `=false|0|no|off`, instalação
+  normal); outro valor sai com código 2 — nunca vira instalação completa.
+- Junto com `--prompt`, `--transcript` ou `--checkpoint`, que só gravam a
+  escolha e saem, o `--mcp-only` não é aplicado: o connect avisa no stderr e
+  você roda a instalação com `--mcp-only` separada.
 
 ## Arquivo editado à mão
 

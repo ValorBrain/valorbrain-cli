@@ -101,6 +101,13 @@ test('an unknown flag is named on stderr and the install still runs in full', as
     assert.match(readFileSync(join(h, '.claude', 'CLAUDE.md'), 'utf-8'), /contract: v7/);
 });
 
+test('the unknown-flag warning comes out even with --help', async () => {
+    const r = await cli(home(), 'http://127.0.0.1:9', ['--help', '--bogus']);
+    assert.equal(r.code, 0);
+    assert.match(r.stderr, /warning: ignoring unknown flag\(s\): --bogus/);
+    assert.match(r.stdout, /--mcp-only/);
+});
+
 // ── --mcp-only ──────────────────────────────────────────────────────────────
 
 test('--mcp-only writes MCP + instructions, no hooks; --status reports it; a plain run upgrades; --mcp-only again downgrades', async () => {
@@ -186,6 +193,66 @@ test('--mcp-only on Gemini (MCP and hooks share settings.json): the hooks step i
     assert.match(mcp.after, /Bearer vbm_g/);
     assert.equal(hooks.changed, false);
     assert.equal(hooks.after, mcp.after);
+});
+
+test('--mcp-only=VALUE: boolean spellings honoured, anything else exits 2 and writes nothing', async () => {
+    for (const v of ['true', '1', 'YES', 'on']) assert.equal(parseArgs([`--mcp-only=${v}`]).mcpOnly, true, v);
+    for (const v of ['false', '0', 'no', 'OFF']) assert.equal(parseArgs([`--mcp-only=${v}`]).mcpOnly, false, v);
+    assert.equal(parseArgs(['--mcp-only=maybe']).mcpOnly, 'maybe');
+    assert.deepEqual(parseArgs(['--mcp-only=true']).unknown, []);
+
+    const { server, url } = await stubEngine();
+    const bad = home();
+    const r = await install(bad, url, ['--mcp-only=maybe']);
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /--mcp-only takes no value, or one of true\|false \(got "maybe"\)/);
+    assert.equal(existsSync(join(bad, '.claude.json')), false);
+    assert.equal(existsSync(join(bad, '.valorbrain', 'connect.json')), false);
+
+    const yes = home();
+    const ok = await install(yes, url, ['--mcp-only=true']);
+    const no = home();
+    const full = await install(no, url, ['--mcp-only=false']);
+    server.close();
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.doesNotMatch(ok.stderr, /unknown flag/);
+    assert.equal(ourHooks(yes), false);
+    assert.equal(savedEntry(yes).mode, 'mcp-only');
+    assert.equal(full.code, 0, full.stderr);
+    assert.equal(ourHooks(no), true);
+});
+
+test('--mcp-only next to --checkpoint/--prompt: the switch is saved, --mcp-only is named as not applied', async () => {
+    const h = home();
+    const r = await cli(h, 'http://127.0.0.1:9', ['--harness', 'claude-code', '--checkpoint', 'off', '--prompt', 'off', '--mcp-only']);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /claude-code: prompt off, checkpoint off/);
+    assert.match(r.stderr, /--mcp-only was not applied: --prompt\/--checkpoint only record a choice and exit/);
+    assert.equal(existsSync(join(h, '.claude.json')), false);
+    assert.equal(savedEntry(h).mode, undefined);
+});
+
+test('--mcp-only with our hooks edited by hand and nobody at the keyboard: kept, and said to still send; --force removes them', async () => {
+    const { server, url } = await stubEngine();
+    const h = home();
+    assert.equal((await install(h, url)).code, 0);
+    const cfg = JSON.parse(readFileSync(settings(h), 'utf-8'));
+    cfg.hooks.UserPromptSubmit[0].hooks[0].timeout = 30; // the person's own tweak
+    writeFileSync(settings(h), JSON.stringify(cfg, null, 2));
+
+    const kept = await install(h, url, ['--mcp-only']);
+    assert.equal(kept.code, 0, kept.stderr);
+    assert.equal(ourHooks(h), true);
+    assert.match(kept.stdout, /your hand-edited hooks were kept \(.*settings\.json\) and still send on each turn\. Run again with --mcp-only --force/);
+    assert.doesNotMatch(kept.stdout, /no hooks, so nothing is sent/);
+    const st = await cli(h, url, ['--status', '--harness', 'claude-code']);
+    assert.match(st.stdout, /mode: mcp-only recorded, but valorbrain hooks are on disk and still send on each turn — run with --mcp-only --force/);
+
+    const forced = await install(h, url, ['--mcp-only', '--force']);
+    server.close();
+    assert.equal(forced.code, 0, forced.stderr);
+    assert.equal(ourHooks(h), false);
+    assert.match(forced.stdout, /no hooks, so nothing is sent on each turn/);
 });
 
 // ── --checkpoint ────────────────────────────────────────────────────────────
