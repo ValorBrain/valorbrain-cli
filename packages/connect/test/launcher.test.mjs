@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -88,7 +88,7 @@ function manifest(harness, { launcher, pin, integrity, tarball, scope }) {
 }
 
 function stubEngine() {
-    const state = { pin: CLIENT_VERSION, scope: 1, tarballs: {}, badIntegrity: false, clientPin: null, requests: [] };
+    const state = { pin: CLIENT_VERSION, scope: 1, tarballs: {}, badIntegrity: false, clientPin: null, requests: [], tarballDelayMs: 0 };
     const server = createServer((req, res) => {
         const u = new URL(req.url, 'http://stub');
         let body = '';
@@ -112,7 +112,7 @@ function stubEngine() {
                 const v = /connect-(.+)\.tgz$/.exec(u.pathname)[1];
                 if (!state.tarballs[v]) { res.writeHead(404); return res.end(); }
                 res.writeHead(200, { 'content-type': 'application/octet-stream' });
-                return res.end(state.tarballs[v]);
+                return setTimeout(() => res.end(state.tarballs[v]), state.tarballDelayMs);
             }
             res.writeHead(200, { 'content-type': 'application/json' });
             if (u.pathname === '/api/v1/hooks/cue') {
@@ -545,4 +545,94 @@ test('`launcher heal --harness=omp|hermes`: bridge and plugin files follow the s
     server.close();
     assert.equal(readFileSync(bridge, 'utf-8'), '// @valorbrain/connect bridge v2\n// mine\n');
     assert.match(readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8'), /valorbrain\.ts: edited by hand/);
+});
+
+// ── review notes on #26: directory chain, download cap, racing heals ────────
+
+test('directory chain: install takes group/other write off ~/.valorbrain and bin/; the launcher refuses a writable or foreign ancestor', async () => {
+    const { server, url } = await stubEngine();
+    const h = home();
+    mkdirSync(join(h, '.valorbrain', 'bin'), { recursive: true });
+    chmodSync(join(h, '.valorbrain'), 0o777);
+    chmodSync(join(h, '.valorbrain', 'bin'), 0o777);
+    assert.equal((await install(h, url)).code, 0);
+    assert.equal(statSync(join(h, '.valorbrain')).mode & 0o777, 0o755);
+    assert.equal(statSync(join(h, '.valorbrain', 'bin')).mode & 0o777, 0o755);
+    assert.equal(statSync(join(h, '.valorbrain', 'bin', 'connect')).mode & 0o777, 0o700);
+    writeHealState(h, { ...readHealState(h), lastHealAt: Date.now() });
+    for (const dir of [join(h, '.valorbrain'), join(h, '.valorbrain', 'bin')]) {
+        chmodSync(dir, 0o777);
+        const r = await launch(h, url, ['hook', 'prompt', '--harness=gemini-cli'], { stdin: PAYLOAD });
+        assert.equal(r.code, 0);
+        assert.equal(r.stdout.trim(), '{}');
+        assert.match(r.stderr, new RegExp(`${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is writable by others`));
+        assert.equal(r.stderr.trim().split('\n').length, 1);
+        chmodSync(dir, 0o755);
+    }
+    if (process.getuid?.() === 0) {
+        // Someone else's bin/: the heal refuses to install there and logs why, once.
+        chownSync(join(h, '.valorbrain', 'bin'), 65534, 65534);
+        assert.match((await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD })).stderr, /belongs to another user/);
+        await cli(h, url, ['heal', '--harness=claude-code']);
+        assert.match(readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8'), /unsafe client directory: .*bin belongs to another user/);
+        chownSync(join(h, '.valorbrain', 'bin'), 0, 0);
+    }
+    server.close();
+});
+
+test('download cap: a declared Content-Length over the cap is refused before reading; a stream without one is cut at the cap', async () => {
+    const h = home();
+    const integrity = integrityOf(Buffer.from('x'));
+    let pulled = 0;
+    let cancelled = false;
+    const endless = () => new Response(new ReadableStream({
+        pull(c) { pulled += 64 * 1024; c.enqueue(new Uint8Array(64 * 1024)); },
+        cancel() { cancelled = true; },
+    }));
+    await assert.rejects(downloadClientVersion(h, { version: NEXT, tarball: 'https://x/t.tgz', integrity }, { fetchImpl: async () => endless(), maxBytes: 1024 * 1024 }), /tarball too large/);
+    assert.ok(pulled <= 1024 * 1024 + 3 * 64 * 1024, `read ${pulled} bytes past a 1 MiB cap`);
+    pulled = 0;
+    const declared = async () => new Response(new ReadableStream({ pull(c) { pulled += 1; c.enqueue(new Uint8Array(1)); } }), { headers: { 'content-length': String(50 * 1024 * 1024) } });
+    await assert.rejects(downloadClientVersion(h, { version: NEXT, tarball: 'https://x/t.tgz', integrity }, { fetchImpl: declared }), /tarball too large/);
+    assert.ok(pulled <= 1, `read ${pulled} chunks of a body declared too large`);
+    assert.equal(existsSync(join(h, '.valorbrain', 'bin', 'connect', NEXT)), false);
+    assert.equal(cancelled, true, 'the endless stream was cancelled, not drained');
+});
+
+test('racing heals: two at once place the version once; current.json never names a missing directory', async () => {
+    const { server, state, url } = await stubEngine();
+    const h = home();
+    assert.equal((await install(h, url)).code, 0);
+    state.tarballs[NEXT] = packageAt(NEXT);
+    state.pin = NEXT;
+    state.tarballDelayMs = 300;
+    const root = join(h, '.valorbrain', 'bin', 'connect');
+    let violations = 0;
+    let checks = 0;
+    let done = false;
+    const heals = Promise.all([0, 1, 2].map(() => launch(h, url, ['heal', '--harness=claude-code']))).then((r) => { done = true; return r; });
+    while (!done) {
+        const v = readCurrent(h)?.version;
+        if (v) {
+            checks++;
+            if (!existsSync(join(root, v, 'hook.mjs'))) violations++;
+        }
+        await new Promise((r) => setImmediate(r));
+    }
+    const results = await heals;
+    server.close();
+    for (const r of results) assert.equal(r.code, 0, r.stderr);
+    assert.ok(checks > 50, `only ${checks} checks`);
+    assert.equal(violations, 0);
+    assert.equal(readCurrent(h).version, NEXT);
+    assert.ok(existsSync(join(root, NEXT, 'hook.mjs')));
+    assert.deepEqual(readdirSync(root).filter((f) => f.startsWith('.tmp-') || f.startsWith('.lock-')), []);
+    // In process too: four placers of one version, one directory, no leftovers.
+    const g = home();
+    const tar = state.tarballs[NEXT];
+    const fetchImpl = async () => new Response(tar);
+    await Promise.all([0, 1, 2, 3].map(() => downloadClientVersion(g, { version: NEXT, tarball: 'https://x/t.tgz', integrity: integrityOf(tar) }, { fetchImpl })));
+    const groot = join(g, '.valorbrain', 'bin', 'connect');
+    assert.ok(existsSync(join(groot, NEXT, 'hook.mjs')));
+    assert.deepEqual(readdirSync(groot).filter((f) => f.startsWith('.')), []);
 });

@@ -21,7 +21,7 @@
  * the version directory is missing, unreadable or unsafe it writes one line to
  * stderr, prints the harness's empty answer and exits 0.
  */
-import { lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -29,13 +29,19 @@ const root = dirname(fileURLToPath(import.meta.url));
 const [command] = process.argv.slice(2);
 const harness = (process.argv.find((a) => a.startsWith('--harness=')) || '').slice(10);
 
-/** A directory or file only this user can change (not a symlink, our uid, not group/world-writable). */
-function safe(path, kind) {
-    const st = lstatSync(path);
+/**
+ * A directory or file only this user can change: not a symlink, our uid, not
+ * group/world-writable. `follow` checks a symlink's target instead (only
+ * ~/.valorbrain, which a person may link from their dotfiles). Windows has no
+ * uid or mode bits to check (ACLs): there only the type and symlink checks run.
+ */
+function safe(path, kind, follow = false) {
+    const st = follow ? statSync(path) : lstatSync(path);
     if (st.isSymbolicLink()) return `${path} is a symlink`;
     if (kind === 'dir' ? !st.isDirectory() : !st.isFile()) return `${path} is not a ${kind === 'dir' ? 'directory' : 'file'}`;
+    if (process.platform === 'win32') return '';
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return `${path} belongs to another user`;
-    if (process.platform !== 'win32' && (st.mode & 0o022) !== 0) return `${path} is writable by others`;
+    if ((st.mode & 0o022) !== 0) return `${path} is writable by others`;
     return '';
 }
 
@@ -52,7 +58,8 @@ function resolveEntry() {
     const dir = join(root, version);
     const entry = join(dir, command === 'heal' ? 'index.mjs' : 'hook.mjs');
     try {
-        const reason = safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
+        // The whole chain from ~/.valorbrain down: a writable parent lets someone swap the directory below it.
+        const reason = safe(dirname(dirname(root)), 'dir', true) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
         if (reason) return { error: `refusing to run ${version}: ${reason}` };
     } catch {
         return { error: `version ${version} is not installed` };

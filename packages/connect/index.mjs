@@ -22,7 +22,7 @@
  * republishing when the rules text changes.
  */
 
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { createHash } from "node:crypto";
@@ -197,7 +197,10 @@ hook …, on every system; updates swap the version it runs under
 ~/.valorbrain/bin/connect/ (signed pin, sha512-checked tarball) and never
 touch the harness files again. An update that would collect more by default
 than you installed under waits for you to run this installer.
-VALORBRAIN_HOOK_CLIENT=npx keeps the npx command.
+VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
+launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version
+it runs are yours and not writable by others; on Windows only the symlink and
+type checks apply (there are no uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
 this package before a single file is written; an unsigned or altered one is
@@ -396,23 +399,35 @@ const MAX_TARBALL_BYTES = 10 * 1024 * 1024;
 const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
 
 /**
- * Create ~/.valorbrain/bin/connect (0700) and refuse it when it is not ours: a
- * directory someone else owns or links would hand them the code every hook
- * runs. Paths a shell or a JSON string would have to escape are refused too —
- * the launcher path is substituted into hook commands as plain text.
+ * Create ~/.valorbrain/bin/connect and make the whole chain ours: every hook
+ * runs code from there, so a directory on the way that another user owns or
+ * can write to would let them swap `connect/` for their own. `.valorbrain`
+ * and `bin` lose group/other write, `connect` is 0700; anything not ours, a
+ * symlink for `bin` or `connect`, or still writable by others is refused —
+ * '' when safe, else the reason. Paths a shell or a JSON string would have to
+ * escape are refused too (the launcher path is substituted as plain text).
+ * Windows: no uid or mode bits to check (ACLs), only type and symlink.
  */
-function ensureClientRoot(home) {
-  if (/["'`$%!\\\r\n]/.test(launcherPath(home))) return false;
+export function ensureClientRoot(home) {
+  if (/["'`$%!\\\r\n]/.test(launcherPath(home))) return "the path needs quoting";
+  const posix = process.platform !== "win32" && typeof process.getuid === "function";
   try {
-    for (const d of [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)]) {
+    const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
+    for (const [i, d] of chain.entries()) {
       mkdirSync(d, { recursive: true, mode: 0o700 });
-      const st = lstatSync(d);
-      if (!st.isDirectory() || (typeof process.getuid === "function" && st.uid !== process.getuid())) return false;
-      if (d !== join(home, ".valorbrain")) chmodSync(d, 0o700);
+      // ~/.valorbrain may be a symlink the person made (dotfiles); its target is checked.
+      const st = i === 0 ? statSync(d) : lstatSync(d);
+      if (st.isSymbolicLink()) return `${d} is a symlink`;
+      if (!st.isDirectory()) return `${d} is not a directory`;
+      if (!posix) continue;
+      if (st.uid !== process.getuid()) return `${d} belongs to another user`;
+      const mode = i === chain.length - 1 ? 0o700 : st.mode & 0o755;
+      if ((st.mode & 0o777) !== mode) chmodSync(d, mode);
+      if ((statSync(d).mode & 0o022) !== 0) return `${d} is writable by others`;
     }
-    return true;
-  } catch {
-    return false;
+    return "";
+  } catch (err) {
+    return err?.code || "not creatable";
   }
 }
 
@@ -491,19 +506,78 @@ function tarballUrlAllowed(url) {
   }
 }
 
-/** Move a filled temp dir into <version>/ (a concurrent heal that got there first wins; ours is dropped). */
-function placeVersion(home, version, fill) {
-  const tmp = join(clientRoot(home), `.tmp-${version}-${process.pid}-${Date.now()}`);
-  mkdirSync(tmp, { mode: 0o700 });
+/** A lock file under the client root: one placer per version at a time; a lock older than this is a crashed heal. */
+const PLACE_LOCK_STALE_MS = 120_000;
+
+function tryLock(path) {
   try {
+    closeSync(openSync(path, "wx", 0o600));
+    return true;
+  } catch {
+    try {
+      if (Date.now() - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) {
+        unlinkSync(path);
+        closeSync(openSync(path, "wx", 0o600));
+        return true;
+      }
+    } catch { /* lost the race */ }
+    return false;
+  }
+}
+
+/**
+ * Fill a temp dir and move it into <version>/, under a per-version lock: two
+ * heals racing never remove what the other placed. Whoever finds the version
+ * already complete under the lock stops there (same pin, same signed bytes);
+ * a broken <version>/ is replaced only by the lock holder. current.json is
+ * written only after this returns with the version complete, so it never
+ * names a missing directory.
+ */
+async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
+  const lock = join(clientRoot(home), `.lock-${version}`);
+  const until = Date.now() + waitMs;
+  while (!tryLock(lock)) {
+    if (Date.now() > until) throw new Error(`another heal holds ${version}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const dest = join(clientRoot(home), version);
+  const tmp = join(clientRoot(home), `.tmp-${version}-${process.pid}-${Date.now()}`);
+  try {
+    if (versionInstalled(home, version)) return;
+    mkdirSync(tmp, { mode: 0o700 });
     fill(tmp);
     chmodSync(tmp, 0o700);
-    if (versionInstalled(home, version)) return;
-    rmSync(join(clientRoot(home), version), { recursive: true, force: true });
-    renameSync(tmp, join(clientRoot(home), version));
+    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true }); // incomplete or unsafe; only the lock holder gets here
+    renameSync(tmp, dest);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+    try { unlinkSync(lock); } catch { /* already gone */ }
   }
+}
+
+/**
+ * The tarball body, at most `maxBytes`: refused up front by Content-Length and
+ * aborted mid-stream as soon as it grows past the cap, so a hostile or broken
+ * server can never make a heal hold more than that in memory.
+ */
+async function readCapped(res, maxBytes, abort) {
+  const declared = Number(res.headers?.get?.("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    abort();
+    throw new Error("tarball too large");
+  }
+  if (!res.body) return Buffer.from(await res.arrayBuffer());
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of res.body) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      abort();
+      throw new Error("tarball too large");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 /**
@@ -511,22 +585,29 @@ function placeVersion(home, version, fill) {
  * (sha512, npm `dist.integrity`) before unpacking anything, and place it at
  * <version>/. Throws with a short reason; writes nothing on any mismatch.
  */
-export async function downloadClientVersion(home, { version, tarball, integrity }, { fetchImpl = (u, i) => fetch(u, i) } = {}) {
+export async function downloadClientVersion(home, { version, tarball, integrity }, { fetchImpl = (u, i) => fetch(u, i), maxBytes = MAX_TARBALL_BYTES } = {}) {
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) throw new Error("no exact version");
   const expected = sha512Of(integrity);
   if (!expected) throw new Error("no sha512 integrity");
   if (!tarballUrlAllowed(tarball)) throw new Error("tarball URL is not https");
-  if (!ensureClientRoot(home)) throw new Error("unsafe client directory");
-  const res = await fetchImpl(tarball, { signal: AbortSignal.timeout(60_000) });
-  if (!res.ok) throw new Error(`tarball HTTP ${res.status}`);
-  const gz = Buffer.from(await res.arrayBuffer());
-  if (gz.length > MAX_TARBALL_BYTES) throw new Error("tarball too large");
+  const unsafe = ensureClientRoot(home);
+  if (unsafe) throw new Error(`unsafe client directory: ${unsafe}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  let gz;
+  try {
+    const res = await fetchImpl(tarball, { signal: controller.signal });
+    if (!res.ok) throw new Error(`tarball HTTP ${res.status}`);
+    gz = await readCapped(res, maxBytes, () => controller.abort());
+  } finally {
+    clearTimeout(timer);
+  }
   const got = `sha512-${createHash("sha512").update(gz).digest("base64")}`;
   if (got !== expected) throw new Error("tarball integrity mismatch");
   const files = untarPackage(gz);
   const pkg = JSON.parse(files.find((f) => f.name === "package.json")?.data.toString("utf-8") ?? "{}");
   if (pkg.name !== "@valorbrain/connect" || pkg.version !== version) throw new Error(`tarball is ${pkg.name}@${pkg.version}, not @valorbrain/connect@${version}`);
-  placeVersion(home, version, (tmp) => {
+  await placeVersion(home, version, (tmp) => {
     for (const f of files) {
       const dest = join(tmp, ...f.name.split("/"));
       mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
@@ -546,11 +627,12 @@ export async function downloadClientVersion(home, { version, tarball, integrity 
 export async function ensureLauncher(home, manifest, { fetchImpl, selfDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
   const version = launcherPin(manifest?.hook_client_version);
   if (manifest?.hook_client !== "launcher" || !version) return { error: "the manifest names no launcher version" };
-  if (!ensureClientRoot(home)) return { error: "unsafe client directory" };
+  const unsafe = ensureClientRoot(home);
+  if (unsafe) return { error: `unsafe client directory: ${unsafe}` };
   try {
     if (!versionInstalled(home, version)) {
       if (version === CLIENT_VERSION) {
-        placeVersion(home, version, (tmp) => {
+        await placeVersion(home, version, (tmp) => {
           for (const name of SELF_FILES) writeFileSync(join(tmp, name), readFileSync(join(selfDir, name)), { mode: 0o644 });
         });
         if (!versionInstalled(home, version)) return { error: "could not copy this package" };

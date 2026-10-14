@@ -11,12 +11,20 @@
     indicada ali, uma cópia completa do pacote que não precisa de
     `npm install`. O `yaml` passou a ser carregado só quando é preciso.
   - Se faltar o arquivo ou a pasta, o launcher escreve uma linha no stderr,
-    devolve a resposta vazia e sai com 0. Ele recusa uma pasta que seja
-    symlink, de outro usuário ou gravável por outros.
+    devolve a resposta vazia e sai com 0.
+  - O launcher confere toda a cadeia, de `~/.valorbrain` até o arquivo que
+    roda, e recusa symlink, dono diferente ou permissão de escrita para
+    grupo/outros. Instalação e heal tiram essa permissão de `~/.valorbrain` e
+    `bin/` e deixam `connect/` em 0700. No Windows só valem as checagens de
+    tipo e symlink (não há uid nem bits de modo).
 - **Atualização sem npx e sem tocar no harness.**
   - O heal baixa o tarball que o manifesto assinado nomeia, confere o sha512
     assinado, descompacta com um leitor de tar próprio numa pasta temporária,
     renomeia e troca o `current.json` (e o `launcher.mjs`, se mudou).
+  - O download é cortado em 10 MB: pelo Content-Length antes de ler e, sem
+    ele, no meio do stream.
+  - Um lock por versão impede que dois heals simultâneos apaguem o que o outro
+    instalou. O `current.json` só aponta para uma pasta já completa.
   - Roda a cada 6 h e também na hora em que o engine responde com outro
     `client_pin`, uma vez por versão. Sempre em segundo plano.
   - Nunca roda tag, faixa de versões, versão < 0.11.0 nem sha512 diferente.
