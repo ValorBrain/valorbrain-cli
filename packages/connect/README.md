@@ -111,6 +111,31 @@ nosso). Se você mudou essa parte:
 Instalações anteriores à 0.8 não têm registro: a primeira escrita da 0.8
 registra o estado e daí em diante a proteção vale.
 
+## Saindo dos hooks self-hosted (0.10)
+
+Numa máquina que rodava os hooks do engine local (`valorbrain hook …`,
+`/usr/local/libexec/valorbrain-hook-env hook …`, `vbhook …`, `clawmem hook …`),
+a **instalação explícita** troca esses hooks pelos hospedados, nos mesmos
+arquivos que ela escreve:
+
+- O plano lista o que sai, por exemplo
+  `replaces 8 self-hosted ValorBrain hook(s): context-surfacing, …`, e o
+  `--dry-run` mostra a mesma lista sem escrever nada. A cópia
+  `.valorbrain-bak` permite desfazer.
+- Hooks de terceiros no mesmo arquivo (rtk, codedb, herdr…) ficam, mesmo
+  quando dividem o grupo com um hook self-hosted.
+- No Kiro, o `~/.kiro/hooks/valorbrain.json` self-hosted é substituído inteiro.
+  Com `--kiro-engine=legacy`, ele é apagado (com backup) ao lado do agent
+  config, para não virar um segundo loader.
+- Entradas nossas editadas à mão seguem a regra de edição manual: sem
+  confirmação, o arquivo inteiro fica como está.
+
+O **self-heal nunca remove hooks self-hosted**. Se ele encontra hooks
+hospedados e self-hosted no mesmo arquivo, escreve uma linha por heal em
+`~/.valorbrain/connect.log` com os nomes e o comando que resolve
+(`npx -y @valorbrain/connect --harness <id>`). Um arquivo de hooks só
+self-hosted não é tocado pelo heal nem apagado por `--remove`/`--mcp-only`.
+
 ## O que sai da sua máquina
 
 Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine>.

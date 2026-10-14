@@ -30,7 +30,7 @@ import { parseDocument } from "yaml";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  CLIENT_VERSION, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, credsPath, healPin, kiroEngineFromPayload, listCreds,
+  CLIENT_VERSION, HEAL_NPX_FLAGS, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, credsPath, healPin, kiroEngineFromPayload, listCreds,
   manifestHealPin, readCreds, readHealState, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, setPrivacy,
   spawnDetached, writeCreds, writeHealState,
 } from "./hook.mjs";
@@ -408,18 +408,24 @@ export function hookClientVersions(text) {
 }
 
 /**
- * Record which local client versions this harness's hook files run (read back
- * from disk: a hand edit the heal kept counts), in connect-state.json
- * `hook_clients`. `null` paths forget the harness (--remove).
+ * Record which local client versions each of this harness's hook files runs
+ * (read back from disk: a hand edit the heal kept counts), in connect-state.json
+ * `hook_clients: { <harness>: { <path>: [versions] } }`. Only the paths given
+ * change: the same harness installed in another scope (a project's
+ * `.kiro/hooks`) keeps its versions. A path with none (removed, back to npx)
+ * is dropped.
  */
-function recordHookClients(home, harness, paths) {
-  const versions = new Set();
-  for (const p of paths ?? []) {
-    try { for (const v of hookClientVersions(readFileSync(p, "utf-8"))) versions.add(v); } catch { /* absent */ }
-  }
+export function recordHookClients(home, harness, paths) {
   const state = readHealState(home);
+  const byPath = { ...(state.hook_clients?.[harness] || {}) };
+  for (const p of paths) {
+    let versions = [];
+    try { versions = [...new Set(hookClientVersions(readFileSync(p, "utf-8")))]; } catch { /* absent */ }
+    if (versions.length > 0) byPath[p] = versions;
+    else delete byPath[p];
+  }
   const clients = { ...(state.hook_clients || {}) };
-  if (versions.size > 0) clients[harness] = [...versions];
+  if (Object.keys(byPath).length > 0) clients[harness] = byPath;
   else delete clients[harness];
   writeHealState(home, { ...state, hook_clients: clients });
 }
@@ -437,7 +443,7 @@ export function gcLocalClients(home, { now = Date.now(), graceMs = LOCAL_CLIENT_
   let entries = [];
   try { entries = readdirSync(root); } catch { return []; }
   const state = readHealState(home);
-  const used = new Set(Object.values(state.hook_clients || {}).flat());
+  const used = new Set(Object.values(state.hook_clients || {}).flatMap((byPath) => Object.values(byPath || {}).flat()));
   if (keep) used.add(keep);
   const unused = { ...(state.hook_clients_unused_since || {}) };
   const deleted = [];
@@ -692,8 +698,12 @@ export function manifestTarget(rawPath, home, cwd = process.cwd()) {
  * ones). A picked artifact with no file on disk is skipped, never created.
  * `hookClient`: the installed local hook client, substituted for
  * HOOK_CLIENT_PLACEHOLDER (client=local manifests only).
+ * `migrateSelfHosted` (explicit install only): self-hosted ValorBrain hook
+ * entries in the same hook files are replaced, and listed in the change's
+ * `replacesSelfHosted`. Without it (self-heal) they are never touched: a
+ * whole hook file of ours holding them is left as is (`selfHostedKept`).
  */
-function planFor(manifest, token, home, remove, cwd = process.cwd(), hookClient = null) {
+function planFor(manifest, token, home, remove, cwd = process.cwd(), { hookClient = null, migrateSelfHosted = false } = {}) {
   const changes = [];
   // Two artifacts can share a file (Gemini keeps MCP servers and hooks in
   // settings.json): each must build on what the previous one will write, or
@@ -718,6 +728,7 @@ function planFor(manifest, token, home, remove, cwd = process.cwd(), hookClient 
       .split('"~/').join(`"${home}/`);
 
     let after;
+    let selfHostedKept = false;
     try {
       // A hook that names the placeholder would only ever run its npx fallback.
       if (!rm && rendered.includes(HOOK_CLIENT_PLACEHOLDER)) throw new Error("the local hook client is not installed — refusing to write its placeholder");
@@ -732,11 +743,16 @@ function planFor(manifest, token, home, remove, cwd = process.cwd(), hookClient 
         // Arquivo COMPARTILHADO do cliente (ex.: ~/.claude/settings.json):
         // merge por evento, nunca overwrite. Arquivos nossos (valorbrain.json,
         // plugins/valorbrain.ts) seguem o caminho normal (write/delete).
-        after = mergeHooksJson(before ?? "", rendered, rm);
+        after = mergeHooksJson(before ?? "", rendered, rm, { migrate: migrateSelfHosted });
       } else if (artifact.strategy === "merge") {
         const block = extractBlock(rendered);
         if (!block) throw new Error("server sent a merge artifact without markers");
         after = rm ? removeBlock(before ?? "") : upsertBlock(before ?? "", block);
+      } else if (artifact.kind === "hooks" && before !== null && selfHostedHookCommands(before).length > 0 && (rm ? !isConnectHookEntry(before) : !migrateSelfHosted)) {
+        // A ValorBrain hook file the self-hosted engine wrote: never replaced by
+        // a heal, never deleted by --remove/--mcp-only (it is not connect's).
+        after = before;
+        selfHostedKept = true;
       } else {
         after = rm ? null : rendered;
       }
@@ -748,7 +764,10 @@ function planFor(manifest, token, home, remove, cwd = process.cwd(), hookClient 
     // --mcp-only on a file holding none of our hook entries (Gemini keeps the
     // MCP entry in the same settings.json): reformatting is not a change.
     if (rm && remove !== true && before !== null && after !== null && !hookEntriesChanged({ before, after })) after = before;
-    changes.push({ artifact, path, before, after, changed: after !== before });
+    const replacesSelfHosted = artifact.kind === "hooks" && !rm
+      ? selfHostedHookCommands(before).filter((c) => !selfHostedHookCommands(after).includes(c)).map(selfHostedHookName)
+      : [];
+    changes.push({ artifact, path, before, after, changed: after !== before, ...(replacesSelfHosted.length ? { replacesSelfHosted } : {}), ...(selfHostedKept ? { selfHostedKept } : {}) });
     planned.set(path, after);
   }
   return changes;
@@ -771,12 +790,17 @@ function apply(changes, { dryRun, noBackup }) {
       continue;
     }
     if (!c.changed) {
-      console.log(`  ${C.dim}=${C.off} ${c.artifact.label} — already current${tag}`);
+      console.log(c.selfHostedKept
+        ? `  ${C.yellow}=${C.off} ${c.artifact.label} — self-hosted ValorBrain hooks, left as they are\n    ${C.dim}${c.path}${C.off}`
+        : `  ${C.dim}=${C.off} ${c.artifact.label} — already current${tag}`);
       continue;
     }
     const verb = c.after === null ? "delete" : c.before === null ? "create" : "update";
     console.log(`  ${C.green}${dryRun ? "→" : "✓"}${C.off} ${verb} ${c.artifact.label}${tag}`);
     console.log(`    ${C.dim}${c.path}${C.off}`);
+    if (c.replacesSelfHosted) {
+      console.log(`    ${C.yellow}replaces ${c.replacesSelfHosted.length} self-hosted ValorBrain hook(s): ${c.replacesSelfHosted.join(", ")}${C.off}${noBackup ? "" : ` ${C.dim}(backup: ${c.path}.valorbrain-bak)${C.off}`}`);
+    }
     if (dryRun) continue;
     try {
       // Once per file: a chained change's `before` is the previous change's
@@ -882,10 +906,90 @@ function writeBackup(path, contents) {
   try { chmodSync(bak, 0o600); } catch { /* not supported on this fs */ }
 }
 
-/** True when a hook entry was written by us (hosted client or local binary). */
+/**
+ * True when a hook entry was written by us (hosted client or local binary).
+ * Defines the part of a shared file that is "ours" for hand-edit hashes
+ * (decision 17) and harness detection; which entries a merge REPLACES is
+ * isConnectHookEntry (+ isSelfHostedHookCommand on an explicit install).
+ */
 function isOurHookEntry(entry) {
   const s = JSON.stringify(entry ?? "");
   return s.includes("@valorbrain/connect") || s.includes("valorbrain hook") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0;
+}
+
+/** A hook entry connect wrote: npx @valorbrain/connect, the 0.1.x bin, or the local client. */
+function isConnectHookEntry(entry) {
+  const s = JSON.stringify(entry ?? "");
+  return s.includes("@valorbrain/connect") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0;
+}
+
+/**
+ * Self-hosted ValorBrain hook commands, as the engine's self-hosted adapters
+ * render them (`<bin> hook <name>`, with `hookBinPath` the host wrapper) plus
+ * the older wrappers: `…/valorbrain[.exe] hook <name>`,
+ * `…/valorbrain-hook-env hook <name>`, `…/vbhook <name>`, `clawmem hook <name>`.
+ */
+const SELF_HOSTED_HOOK_RE = /(?:^|[\s"'/\\])(?:(?:valorbrain|clawmem)(?:\.exe)?|valorbrain-hook-env)["']?\s+hook\s+([\w-]+)|(?:^|[\s"'/\\])vbhook(?:\.exe)?["']?\s+([\w-]+)/;
+
+export function isSelfHostedHookCommand(command) {
+  return typeof command === "string" && SELF_HOSTED_HOOK_RE.test(command) && !isConnectHookEntry(command);
+}
+
+/** Every `command` string in a hooks file (Claude/Codex/Gemini groups, Cursor's flat list, Kiro v1 `action`). */
+function hookCommands(value, out = []) {
+  if (Array.isArray(value)) for (const v of value) hookCommands(v, out);
+  else if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "command" && typeof v === "string") out.push(v);
+      else hookCommands(v, out);
+    }
+  }
+  return out;
+}
+
+/** The self-hosted ValorBrain hook commands in a hooks file (not JSON → none). */
+export function selfHostedHookCommands(raw) {
+  if (raw == null) return [];
+  try {
+    return hookCommands(JSON.parse(raw)).filter(isSelfHostedHookCommand);
+  } catch {
+    return [];
+  }
+}
+
+/** `context-surfacing` from `/usr/local/libexec/valorbrain-hook-env hook context-surfacing --harness=…`. */
+function selfHostedHookName(command) {
+  const m = SELF_HOSTED_HOOK_RE.exec(command);
+  return m?.[1] || m?.[2] || command;
+}
+
+/** Drop self-hosted commands from one event's entries; a group left empty goes, third-party commands stay. */
+function withoutSelfHosted(entries) {
+  return entries.flatMap((e) => {
+    if (typeof e?.command === "string") return isSelfHostedHookCommand(e.command) ? [] : [e];
+    if (!Array.isArray(e?.hooks)) return [e];
+    const hooks = e.hooks.filter((h) => !isSelfHostedHookCommand(h?.command));
+    if (hooks.length === e.hooks.length) return [e];
+    return hooks.length > 0 ? [{ ...e, hooks }] : [];
+  });
+}
+
+/**
+ * Kiro standalone hook files (`.kiro/hooks/valorbrain.json` under each root)
+ * holding only self-hosted hooks — a legacy-engine install replaces them.
+ */
+export function selfHostedKiroStandalones({ home, cwd = home }) {
+  const found = [];
+  for (const root of new Set([home, cwd])) {
+    const path = join(root, ".kiro", "hooks", "valorbrain.json");
+    try {
+      const raw = readFileSync(path, "utf-8");
+      const all = hookCommands(JSON.parse(raw));
+      const selfHosted = all.filter(isSelfHostedHookCommand);
+      if (selfHosted.length > 0 && selfHosted.length === all.length) found.push({ path, names: selfHosted.map(selfHostedHookName) });
+    } catch { /* absent or not JSON */ }
+  }
+  return found;
 }
 
 /**
@@ -895,7 +999,7 @@ function isOurHookEntry(entry) {
  * pego ao planejar o heal do Erick/Evous, 2026-09-21). Preserva tudo; troca
  * apenas as entradas que são nossas, por evento.
  */
-function mergeHooksJson(existingRaw, renderedRaw, remove) {
+function mergeHooksJson(existingRaw, renderedRaw, remove, { migrate = false } = {}) {
   let existing;
   try {
     existing = existingRaw && existingRaw.trim() ? JSON.parse(existingRaw) : {};
@@ -908,6 +1012,17 @@ function mergeHooksJson(existingRaw, renderedRaw, remove) {
     return JSON.stringify(rendered, null, 2);
   }
   if (!existing.hooks || typeof existing.hooks !== "object") existing.hooks = {};
+  // Explicit install from a self-hosted setup: its entries go from every event
+  // (PreCompact included, which hosted does not wire), or the prompt would get
+  // context twice and Stop would run both extractors and the checkpoint.
+  if (migrate && !remove) {
+    for (const [event, entries] of Object.entries(existing.hooks)) {
+      if (!Array.isArray(entries)) continue;
+      const kept = withoutSelfHosted(entries);
+      if (kept.length > 0) existing.hooks[event] = kept;
+      else delete existing.hooks[event];
+    }
+  }
   // Top-level keys the harness schema requires (Cursor's `version: 1`) come
   // with the rendered file; never overwrite the customer's own value.
   if (!remove) {
@@ -917,7 +1032,7 @@ function mergeHooksJson(existingRaw, renderedRaw, remove) {
   }
   for (const [event, entries] of Object.entries(renderedHooks)) {
     const kept = Array.isArray(existing.hooks[event])
-      ? existing.hooks[event].filter((e) => !isOurHookEntry(e))
+      ? existing.hooks[event].filter((e) => !isConnectHookEntry(e))
       : [];
     if (remove) {
       if (kept.length > 0) existing.hooks[event] = kept;
@@ -1420,7 +1535,9 @@ async function main() {
         console.log(`  ${C.dim}note: hooks run npx @valorbrain/connect@${pin} — ${why}${C.off}`);
       }
     }
-    const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove, process.cwd(), hookClient);
+    // An explicit install replaces self-hosted ValorBrain hooks in the same
+    // files (listed in the plan); --mcp-only and --remove never touch them.
+    const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove, process.cwd(), { hookClient, migrateSelfHosted: !args.remove && !mcpOnly });
     if (!args.remove) await confirmHandEdits(changes, home, args);
     const res = apply(changes, args);
     if (!args.dryRun) recordWritten(home, changes, { forget: args.remove });
@@ -1430,21 +1547,35 @@ async function main() {
     // a V3 session running the agent. Only OUR files go; paths planFor just
     // handled (this mode's artifact, or --remove's whole manifest) are not
     // reported twice.
+    const pruned = [];
     if (harness === "kiro") {
       const handled = new Set(changes.map((c) => c.path));
       const stale = args.remove || mcpOnly
         ? [...staleKiroFiles({ home, kiroEngine: "v3" }), ...staleKiroFiles({ home, kiroEngine: "legacy" })]
         : staleKiroFiles({ home, kiroEngine: args.kiroEngine });
-      for (const p of new Set(stale)) {
+      // Installing the legacy engine's agent config: a self-hosted standalone
+      // (`valorbrain hook …` in ~/.kiro/hooks/valorbrain.json) would keep firing
+      // beside it in V3 sessions. An explicit install replaces it, as the v3
+      // install replaces it by writing the same path.
+      const selfHosted = !args.remove && !mcpOnly && args.kiroEngine === "legacy"
+        ? selfHostedKiroStandalones({ home, cwd: args.scope === "workspace" ? process.cwd() : home })
+        : [];
+      for (const p of new Set([...stale, ...selfHosted.map((s) => s.path)])) {
         if (handled.has(p)) continue;
+        const replaced = selfHosted.find((s) => s.path === p);
+        const what = replaced
+          ? `delete self-hosted kiro hook file — replaces ${replaced.names.length} self-hosted hook(s): ${replaced.names.join(", ")}`
+          : "delete stale kiro hook file (the other engine mode must not stay active)";
         if (args.dryRun) {
-          console.log(`  ${C.green}→${C.off} delete stale kiro hook file (the other engine mode must not stay active)`);
+          console.log(`  ${C.green}→${C.off} ${what}`);
           console.log(`    ${C.dim}${p}${C.off}`);
           continue;
         }
         try {
+          if (replaced && !args.noBackup) writeBackup(p, readFileSync(p, "utf-8"));
           unlinkSync(p);
-          console.log(`  ${C.green}✓${C.off} delete stale kiro hook file (the other engine mode must not stay active)`);
+          pruned.push(p);
+          console.log(`  ${C.green}✓${C.off} ${what}`);
           console.log(`    ${C.dim}${p}${C.off}`);
         } catch { /* fail-open */ }
       }
@@ -1452,7 +1583,7 @@ async function main() {
     if (!args.dryRun) {
       // Which local client versions this harness now runs; versions nobody
       // runs go (--remove: at once).
-      recordHookClients(home, harness, args.remove ? null : changes.filter((c) => isPerTurn(c.artifact)).map((c) => c.path));
+      recordHookClients(home, harness, [...changes.filter((c) => isPerTurn(c.artifact)).map((c) => c.path), ...pruned]);
       gcLocalClients(home, args.remove ? { graceMs: 0 } : { keep: hookClient ? CLIENT_VERSION : null });
     }
     if (args.remove && !args.dryRun && removeCreds(home, harness)) {
@@ -1713,7 +1844,7 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
       if (pin && pin !== CLIENT_VERSION) {
         // Only the version the engine pins may run the hooks: it heals with
         // its own local client. This one writes nothing.
-        spawnDetached("npx", ["-y", `@valorbrain/connect@${pin}`, "heal", `--harness=${id}`, ...(engineHint ? [`--caller-engine=${engineHint}`] : [])]);
+        spawnDetached("npx", [...HEAL_NPX_FLAGS, "-y", `@valorbrain/connect@${pin}`, "heal", `--harness=${id}`, ...(engineHint ? [`--caller-engine=${engineHint}`] : [])]);
         return;
       }
       hookClient = pin ? installLocalClient(home) : null;
@@ -1725,7 +1856,7 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
     // token do heal — para dentro da mudança de hooks.
-    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(mcpOnly && isPerTurn(a))) }, token, home, false, process.cwd(), hookClient)
+    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(mcpOnly && isPerTurn(a))) }, token, home, false, process.cwd(), { hookClient })
       .filter((c) => !c.error);
     const planned = plan.filter((c) => c.changed);
     // A guarda de segundo loader barra só a CRIAÇÃO do standalone em $HOME
@@ -1770,6 +1901,17 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     // Read back from disk: a hook file kept (hand edit, Codex) still runs what it ran.
     recordHookClients(home, id, plan.filter((c) => isPerTurn(c.artifact)).map((c) => c.path));
     gcLocalClients(home, { keep: hookClient ? CLIENT_VERSION : null });
+    // Hosted and self-hosted hooks in one file both fire on every event. The
+    // heal never removes the self-hosted ones (nobody to ask); it says so once
+    // per heal, in the log, with the command that replaces them.
+    for (const c of plan.filter((c) => isPerTurn(c.artifact))) {
+      let commands = [];
+      try { commands = hookCommands(JSON.parse(readFileSync(c.path, "utf-8"))); } catch { continue; }
+      const selfHosted = commands.filter(isSelfHostedHookCommand);
+      if (selfHosted.length === 0 || !commands.some(isConnectHookEntry)) continue;
+      const msg = `[valorbrain] ${c.path}: hosted hooks run beside ${selfHosted.length} self-hosted ValorBrain hook(s) (${selfHosted.map(selfHostedHookName).join(", ")}) — both fire on every event; replace them with: npx -y @valorbrain/connect --harness ${id}`;
+      try { appendFileSync(join(home, ".valorbrain", "connect.log"), `${new Date().toISOString()} ${msg}\n`); } catch { /* fail-open */ }
+    }
     // Poda em $HOME (cwd:home dedupa as raízes — projeto nunca é tocado),
     // consciente do engine que CHAMOU o hook — o heal nunca
     // remove o loader que pode ser o único do chamador:

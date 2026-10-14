@@ -129,7 +129,7 @@ test('a fresh install asks for client=local, installs the local client and wires
         assert.equal(statSync(d).mode & 0o777, 0o700, d);
     }
     assert.match(r.stdout, /local hook client 0\.10\.0/);
-    assert.deepEqual(readHealState(h).hook_clients, { 'claude-code': [CLIENT_VERSION] });
+    assert.deepEqual(readHealState(h).hook_clients, { 'claude-code': { [join(h, '.claude', 'settings.json')]: [CLIENT_VERSION] } });
 });
 
 test('an engine without client=local keeps the npx hooks and writes no local client', async () => {
@@ -189,10 +189,10 @@ test('placeholder substitution happens in planFor, after the signature check; ne
     const h = home();
     const m = claudeManifest({ pin: CLIENT_VERSION, local: true });
     const file = localClientFile(h);
-    const [, hooks] = planFor(m, 'vbm_x', h, false, h, file);
+    const [, hooks] = planFor(m, 'vbm_x', h, false, h, { hookClient: file });
     assert.ok(hooks.after.includes(`node \\"${file}\\" hook stop --harness=claude-code ||`));
     assert.ok(!hooks.after.includes(PH));
-    const [, refused] = planFor(m, 'vbm_x', h, false, h, null);
+    const [, refused] = planFor(m, 'vbm_x', h, false, h, { hookClient: null });
     assert.match(refused.error, /local hook client is not installed/);
     assert.equal(refused.changed, false);
 });
@@ -250,7 +250,7 @@ test('a due heal is spawned detached: the hook returns before it finishes, pinne
     assert.ok(r.ms < 1500, `hook took ${r.ms}ms`);
     const logged = await waitFor(() => existsSync(npx.log) && readFileSync(npx.log, 'utf-8'));
     server.close();
-    assert.equal(logged.trim(), '-y @valorbrain/connect@0.10.7 heal --harness=claude-code');
+    assert.equal(logged.trim(), '--no-update-notifier --loglevel=warn -y @valorbrain/connect@0.10.7 heal --harness=claude-code');
     // The throttle was claimed by the hook itself.
     assert.ok(Date.now() - readHealState(h).lastHealAt < 30_000);
 });
@@ -294,7 +294,7 @@ test('heal-dispatch runs only a pin the signed manifest names (≥ 0.10.0, exact
     };
     const deps = (fetchImpl) => ({ env: { HOME: h, ...SIGNED_ENV }, home: h, fetchImpl, spawnImpl });
     assert.equal(await healDispatch(['--harness=claude-code', '--caller-engine=v3'], deps(serve(claudeManifest({ pin: '0.10.4', local: true })))), '0.10.4');
-    assert.deepEqual(spawned.pop(), ['npx', '-y', '@valorbrain/connect@0.10.4', 'heal', '--harness=claude-code', '--caller-engine=v3']);
+    assert.deepEqual(spawned.pop(), ['npx', '--no-update-notifier', '--loglevel=warn', '-y', '@valorbrain/connect@0.10.4', 'heal', '--harness=claude-code', '--caller-engine=v3']);
     // Unsigned, a tag, or no harness: nothing runs.
     assert.equal(await healDispatch(['--harness=claude-code'], deps(serve(claudeManifest({ pin: '0.10.4', local: true }), false))), null);
     assert.equal(await healDispatch(['--harness=claude-code'], deps(serve({ ...claudeManifest({ pin: 'latest', local: true }), artifacts: [] }))), null);
@@ -345,7 +345,7 @@ test('`heal` installs the pinned local client and rewrites hooks; another pin is
     await cli(h, url, ['heal', '--harness=claude-code'], { env: npx.env });
     const logged = await waitFor(() => existsSync(npx.log) && readFileSync(npx.log, 'utf-8'));
     server.close();
-    assert.equal(logged.trim(), '-y @valorbrain/connect@0.10.5 heal --harness=claude-code');
+    assert.equal(logged.trim(), '--no-update-notifier --loglevel=warn -y @valorbrain/connect@0.10.5 heal --harness=claude-code');
     assert.equal(readFileSync(join(h, '.claude', 'settings.json'), 'utf-8'), before, '0.10.0 writes nothing for a 0.10.5 pin');
 });
 
@@ -402,7 +402,7 @@ test('GC: an unused version goes after a grace period, a used or kept one stays'
         mkdirSync(join(root, v), { recursive: true });
         writeFileSync(join(root, v, 'hook.mjs'), '');
     }
-    writeHealState(h, { hook_clients: { 'claude-code': ['0.10.1'] } });
+    writeHealState(h, { hook_clients: { 'claude-code': { '/h/.claude/settings.json': ['0.10.1'] } } });
     const t = Date.now();
     // First sight of an unused version only starts its clock (a running session may still run it).
     assert.deepEqual(gcLocalClients(h, { now: t, keep: '0.10.2' }), []);
@@ -420,7 +420,7 @@ test('--remove deletes the local client once no harness references it', async ()
     const h = home();
     assert.equal((await install(h, url)).code, 0);
     // A second harness running the same version keeps it alive.
-    writeHealState(h, { ...readHealState(h), hook_clients: { ...readHealState(h).hook_clients, cursor: [CLIENT_VERSION] } });
+    writeHealState(h, { ...readHealState(h), hook_clients: { ...readHealState(h).hook_clients, cursor: { '/h/.cursor/hooks.json': [CLIENT_VERSION] } } });
     assert.equal((await cli(h, url, ['--remove', '--harness', 'claude-code'])).code, 0);
     assert.ok(existsSync(localClientFile(h)));
     writeHealState(h, { ...readHealState(h), hook_clients: {} });
