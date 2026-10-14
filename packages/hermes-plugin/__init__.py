@@ -81,7 +81,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.8.0"
+_PLUGIN_VERSION = "1.9.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -115,6 +115,166 @@ def _privacy_flag(env_name: str, key: str, default: bool) -> bool:
         value = None
     return value if isinstance(value, bool) else default
 
+
+# ---------------------------------------------------------------------------
+# Identidade do cliente e auto-atualização (contrato "hooks que evoluem", C e D)
+# ---------------------------------------------------------------------------
+
+# Disparo do heal por tempo: o mesmo throttle do connect.
+_HEAL_INTERVAL_S = 6 * 60 * 60
+# Quantos pins já disparados o plugin lembra (um disparo por pin visto).
+_HEAL_PIN_MEMORY = 8
+# Rotas que levam os cabeçalhos D (contrato D).
+_CLIENT_HEADER_PATHS = ("/api/v1/hooks/run", "/api/v1/runtimes/register")
+
+_plugin_state_lock = threading.Lock()
+_own_install_id: Optional[str] = None
+_warned_no_launcher = False
+# Filhos do heal ficam referenciados: o Popen coletado com o processo vivo só
+# geraria ResourceWarning — o heal é destacado e ninguém espera por ele.
+_heal_children: list = []
+
+
+def _is_install_id(value: Any) -> bool:
+    """`install_id` do contrato: 32 hex minúsculos, aleatório, sem PII."""
+    return (
+        isinstance(value, str) and len(value) == 32
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def _plugin_state_path() -> Path:
+    """Estado do próprio plugin (0600). O connect lê `install_id` daqui na migração."""
+    return Path.home() / ".hermes" / "valorbrain-plugin-state.json"
+
+
+def _read_plugin_state() -> dict:
+    try:
+        with open(_plugin_state_path(), "r") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_plugin_state(state: dict) -> None:
+    path = _plugin_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh)
+        os.replace(str(tmp), str(path))
+    except Exception as e:
+        logger.debug("valorbrain: plugin state not writable: %s", e)
+
+
+def _install_id() -> str:
+    """install_id do contrato D: a entrada `hermes` do connect.json; sem ela, o
+    do próprio plugin (gerado uma vez). O connect.json nunca é escrito daqui."""
+    global _own_install_id
+    try:
+        with open(Path.home() / ".valorbrain" / "connect.json", "r") as fh:
+            data = json.load(fh)
+        entry = ((data or {}).get("harnesses") or {}).get("hermes") or {}
+        value = entry.get("install_id") if isinstance(entry, dict) else None
+        if _is_install_id(value):
+            return value
+    except Exception:
+        pass
+    with _plugin_state_lock:
+        if _own_install_id:
+            return _own_install_id
+        state = _read_plugin_state()
+        if _is_install_id(state.get("install_id")):
+            _own_install_id = state["install_id"]
+            return _own_install_id
+        import secrets
+        _own_install_id = secrets.token_hex(16)
+        state["install_id"] = _own_install_id
+        _write_plugin_state(state)
+        return _own_install_id
+
+
+def _client_headers() -> dict:
+    """Cabeçalhos D: quem é o cliente, para o engine registrar o que observa."""
+    try:
+        return {
+            "X-ValorBrain-Client": f"hermes-plugin/{_PLUGIN_VERSION}",
+            "X-ValorBrain-Harness": "hermes",
+            "X-ValorBrain-Install": _install_id(),
+        }
+    except Exception:
+        return {}
+
+
+def _heal_reason(state: dict, pin: Any, current: Any, now: float) -> Optional[str]:
+    """Por que disparar o heal: um pin anunciado diferente do launcher
+    instalado (uma vez por pin) ou 6 h desde o último disparo; senão None."""
+    healed = state.get("healed_pins") if isinstance(state.get("healed_pins"), list) else []
+    if isinstance(pin, str) and pin and pin != current and pin not in healed:
+        return "pin"
+    last = state.get("last_heal_at")
+    if not isinstance(last, (int, float)) or now - last >= _HEAL_INTERVAL_S:
+        return "interval"
+    return None
+
+
+def _record_heal(state: dict, reason: str, pin: Any, now: float) -> dict:
+    nxt = dict(state)
+    nxt["last_heal_at"] = now
+    if reason == "pin" and isinstance(pin, str):
+        seen = [p for p in (nxt.get("healed_pins") or []) if isinstance(p, str) and p != pin]
+        nxt["healed_pins"] = (seen + [pin])[-_HEAL_PIN_MEMORY:]
+    return nxt
+
+
+def _maybe_heal(response: Any) -> None:
+    """Auto-atualização (contrato C). Com `node` (ou `bun`) no PATH e o launcher
+    do connect instalado, um pin novo na resposta ou 6 h disparam
+    `launcher.mjs heal --harness=hermes`, destacado: o connect reescreve o
+    plugin a partir do manifesto assinado e o Hermes carrega a versão nova no
+    próximo início. Sem runtime ou sem launcher, nada: o plugin segue
+    reportando a versão (o engine o mostra como atrasado)."""
+    global _warned_no_launcher
+    try:
+        pin = None
+        if isinstance(response, dict) and isinstance(response.get("client_pin"), dict):
+            pin = response["client_pin"].get("version")
+        connect_dir = Path.home() / ".valorbrain" / "bin" / "connect"
+        try:
+            with open(connect_dir / "current.json", "r") as fh:
+                current = (json.load(fh) or {}).get("version")
+        except Exception:
+            current = None
+        now = time.time()
+        with _plugin_state_lock:
+            state = _read_plugin_state()
+            reason = _heal_reason(state, pin, current, now)
+            if not reason:
+                return
+            launcher = connect_dir / "launcher.mjs"
+            runtime = shutil.which("node") or shutil.which("bun")
+            if not runtime or not launcher.is_file():
+                if not _warned_no_launcher:
+                    _warned_no_launcher = True
+                    logger.info(
+                        "valorbrain: auto-update skipped (%s) — run: npx -y @valorbrain/connect --harness hermes",
+                        "no node/bun on PATH" if not runtime else "no launcher at ~/.valorbrain/bin/connect",
+                    )
+                return
+            # Recolhe os que já terminaram (poll() lê o código de saída).
+            _heal_children[:] = [c for c in _heal_children if c.poll() is None]
+            _heal_children.append(subprocess.Popen(
+                [runtime, str(launcher), "heal", "--harness=hermes"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
+            ))
+            _write_plugin_state(_record_heal(state, reason, pin, now))
+        logger.info("valorbrain: auto-update heal spawned (%s%s)", reason, f" pin={str(pin)[:32]}" if reason == "pin" else "")
+    except Exception as e:
+        logger.debug("valorbrain: auto-update heal failed: %s", e)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -411,6 +571,10 @@ def _rest_call(port: int, method: str, path: str,
 
     source_system = os.environ.get("VALORBRAIN_SOURCE_SYSTEM", "hermes")
     headers["X-Source-System"] = source_system
+
+    # Contrato D: hooks/run e runtimes/register dizem quem é o cliente.
+    if path.split("?", 1)[0] in _CLIENT_HEADER_PATHS:
+        headers.update(_client_headers())
 
     base = _engine_base_url(port)
 
@@ -947,6 +1111,8 @@ class ValorBrainProvider(MemoryProvider):
             data = _rest_call(
                 self._port, "POST", "/api/v1/hooks/run", payload, timeout=float(timeout)
             )
+            # Hospedado (este caminho só roda sem binário): pin novo ou 6 h → heal.
+            _maybe_heal(data)
             if not isinstance(data, dict) or not data.get("ok"):
                 return None
             context = data.get("context") or ""
@@ -992,6 +1158,8 @@ class ValorBrainProvider(MemoryProvider):
             "config_health": config_health,
         }
         res = _rest_call(self._port, "POST", "/api/v1/runtimes/register", payload, timeout=8.0)
+        if not self._bin:
+            _maybe_heal(res)
         if res and res.get("runtime", {}).get("id"):
             self._runtime_id = res["runtime"]["id"]
             logger.info("valorbrain: hermes runtime registered (%s)", self._runtime_id)

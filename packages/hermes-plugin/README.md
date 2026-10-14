@@ -89,7 +89,8 @@ the binary runs the hooks; without one, they go to `VALORBRAIN_ENGINE_URL`.
    `npx @valorbrain/connect --token vbm_xxx --harness hermes` writes the first
    three keys for you; the removals are manual.
 3. Make sure `~/.hermes/plugins/valorbrain/__init__.py` is plugin 1.8.0 or later
-   (`_PLUGIN_VERSION`); older plugins ignore the switch.
+   (`_PLUGIN_VERSION`); older plugins ignore the switch. From 1.9.0 the plugin
+   updates itself through the connect launcher (see "Automatic updates").
 4. Restart the Hermes gateway (for a systemd install:
    `systemctl restart hermes-gateway`); the plugin reads the env at startup.
 5. Check: the gateway log shows `valorbrain: modo hospedado — hooks via POST
@@ -110,6 +111,30 @@ gateway again.
   the local binary in self-hosted mode.
 - **Contract declaration**: the plugin reports the contract version it ships
   with, so the ValorBrain dashboard shows adoption per harness.
+- **Client identity (1.9.0)**: every `POST /api/v1/hooks/run` and
+  `POST /api/v1/runtimes/register` carries `X-ValorBrain-Client:
+  hermes-plugin/<version>`, `X-ValorBrain-Harness: hermes` and
+  `X-ValorBrain-Install: <install_id>`. The install id is 32 random hex
+  characters with no hostname, path or other personal data. It comes from the
+  `hermes` entry of `~/.valorbrain/connect.json`; when that entry has none, the
+  plugin generates one and keeps it in `~/.hermes/valorbrain-plugin-state.json`
+  (0600). The plugin never writes `connect.json`. The engine uses these headers
+  to show which plugin version each install is really running.
+
+## Automatic updates (1.9.0, hosted mode)
+
+When the engine's answer names a newer client pin (`client_pin.version`
+different from `~/.valorbrain/bin/connect/current.json`), or 6 h have passed
+since the last attempt, the plugin starts
+`node ~/.valorbrain/bin/connect/launcher.mjs heal --harness=hermes` (or `bun`
+when there is no `node`) in the background and moves on. That needs
+`@valorbrain/connect` ≥ 0.11.0 to have installed its launcher. The heal checks
+the signed manifest and rewrites this plugin only when its bytes differ, and the
+Hermes gateway loads the new version at its next start. Each announced pin
+triggers one heal. Without `node`/`bun` on `PATH` or without the launcher,
+nothing runs: the plugin keeps reporting its version and the engine shows the
+install as behind. With the local binary (self-hosted) the plugin never
+triggers a heal.
 
 ## Environment
 
