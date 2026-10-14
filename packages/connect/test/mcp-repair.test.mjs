@@ -212,6 +212,8 @@ function stubEngine() {
             res.end(JSON.stringify({ ok: true }));
         });
     });
+    // unref: a failed assertion before server.close() must not hang the run.
+    server.unref();
     return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}` })));
 }
 
