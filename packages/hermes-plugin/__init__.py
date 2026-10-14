@@ -81,7 +81,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.9.0"
+_PLUGIN_VERSION = "1.10.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -373,6 +373,26 @@ def _slugify_agent(name: str) -> str:
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
     return (s[:64] if s else "agent")
+
+
+def _session_source(platform: str) -> str:
+    """Hermes' label for who drives this session (``agent/session_source.py``):
+    ``oneshot`` for ``hermes chat -q``/``-z``, ``cron``, ``telegram``, ``cli``, ...
+
+    The engine's decision extractor writes a keyed fact only from a person's
+    session (FB-0205, ``src/hooks/run-authorship.ts``); this is the signal that
+    tells a one-shot run, whose "user" turn is somebody's program, from a chat.
+    A Hermes without the helper gets the same rule over the env it reads.
+    """
+    try:
+        from agent.session_source import session_source_for  # type: ignore[import-not-found]
+        return str(session_source_for(platform) or "")
+    except Exception:
+        pass
+    source = (os.environ.get("HERMES_SESSION_SOURCE") or "").strip()
+    if os.environ.get("HERMES_SINGLE_QUERY_SESSION") == "1" and not source and (platform or "cli") == "cli":
+        return "oneshot"
+    return source or platform or ""
 
 
 def _resolve_source_agent() -> str:
@@ -874,6 +894,9 @@ class ValorBrainProvider(MemoryProvider):
         # ("subagent", "cron", "flush") = reads OK, writes suppressed. See file
         # docstring for the ABC contract this implements.
         self._agent_context: str = "primary"
+        # Hermes session source (`_session_source`), sent with the extraction
+        # hooks so the engine can tell a person's session from a one-shot run.
+        self._session_source: str = ""
 
         # Prefetch state (generation counter prevents stale overwrites)
         self._prefetch_result: str = ""
@@ -1014,6 +1037,7 @@ class ValorBrainProvider(MemoryProvider):
         self._serve_mode = os.environ.get("VALORBRAIN_SERVE_MODE", "external")
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
         self._agent_context = str(kwargs.get("agent_context", "primary") or "primary")
+        self._session_source = _session_source(str(kwargs.get("platform") or ""))
         if self._agent_context != "primary":
             logger.info(
                 "valorbrain: agent_context=%s — reads enabled, writes suppressed",
@@ -1142,7 +1166,10 @@ class ValorBrainProvider(MemoryProvider):
         try:
             payload: dict = {"hook": hook_name}
             inp: dict = {}
-            fields = [("session_id", "sessionId"), ("hook_event_name", "hookEventName"), ("working_dir", "workingDir")]
+            fields = [
+                ("session_id", "sessionId"), ("hook_event_name", "hookEventName"), ("working_dir", "workingDir"),
+                ("agent_context", "agentContext"), ("session_source", "sessionSource"),
+            ]
             if _privacy_flag("VALORBRAIN_SEND_PROMPT", "send_prompt", True):
                 fields.append(("prompt", "prompt"))
             for src, dst in fields:
@@ -1560,6 +1587,8 @@ class ValorBrainProvider(MemoryProvider):
             "session_id": self._session_id,
             "transcript_path": self._transcript_path,
             "hook_event_name": "Stop",
+            "agent_context": self._agent_context,
+            "session_source": self._session_source or None,
         }
 
         threads = []
