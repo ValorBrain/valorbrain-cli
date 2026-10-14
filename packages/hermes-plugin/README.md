@@ -133,7 +133,8 @@ the signed manifest and rewrites this plugin only when its bytes differ, and the
 Hermes gateway loads the new version at its next start. Each announced pin
 triggers one heal. Without `node`/`bun` on `PATH` or without the launcher,
 nothing runs: the plugin keeps reporting its version and the engine shows the
-install as behind. With the local binary (self-hosted) the plugin never
+install as behind. The plugin heals only with `VALORBRAIN_HOOKS_MODE=hosted`:
+self-hosted (the local binary, or a remote engine without that switch) never
 triggers a heal.
 
 ## Environment

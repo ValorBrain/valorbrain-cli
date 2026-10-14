@@ -133,6 +133,10 @@ _warned_no_launcher = False
 # Filhos do heal ficam referenciados: o Popen coletado com o processo vivo só
 # geraria ResourceWarning — o heal é destacado e ninguém espera por ele.
 _heal_children: list = []
+# Throttle do heal também na memória: com o estado não gravável, o arquivo
+# não segura nada e cada resposta dispararia um heal.
+_heal_mem: dict = {}
+_warned_state_unwritable = False
 
 
 def _is_install_id(value: Any) -> bool:
@@ -157,7 +161,20 @@ def _read_plugin_state() -> dict:
         return {}
 
 
-def _write_plugin_state(state: dict) -> None:
+def _salvage_install_id() -> Optional[str]:
+    """Estado corrompido mas com o id legível: guarda o id (senão o engine
+    veria uma instalação nova e duplicada)."""
+    import re
+    try:
+        raw = _plugin_state_path().read_text(errors="replace")
+    except Exception:
+        return None
+    m = re.search(r'"install_id"\s*:\s*"([0-9a-f]{32})"', raw)
+    return m.group(1) if m else None
+
+
+def _write_plugin_state(state: dict) -> bool:
+    global _warned_state_unwritable
     path = _plugin_state_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,8 +183,12 @@ def _write_plugin_state(state: dict) -> None:
         with os.fdopen(fd, "w") as fh:
             json.dump(state, fh)
         os.replace(str(tmp), str(path))
+        return True
     except Exception as e:
-        logger.debug("valorbrain: plugin state not writable: %s", e)
+        if not _warned_state_unwritable:
+            _warned_state_unwritable = True
+            logger.info("valorbrain: plugin state not writable (%s); keeping it in memory", e)
+        return False
 
 
 def _install_id() -> str:
@@ -189,6 +210,13 @@ def _install_id() -> str:
         state = _read_plugin_state()
         if _is_install_id(state.get("install_id")):
             _own_install_id = state["install_id"]
+            return _own_install_id
+        salvaged = _salvage_install_id()
+        if salvaged:
+            logger.info("valorbrain: plugin state unreadable; kept its install_id")
+            _own_install_id = salvaged
+            state["install_id"] = salvaged
+            _write_plugin_state(state)
             return _own_install_id
         import secrets
         _own_install_id = secrets.token_hex(16)
@@ -230,14 +258,33 @@ def _record_heal(state: dict, reason: str, pin: Any, now: float) -> dict:
     return nxt
 
 
+def _merge_heal(file_state: dict, mem: dict) -> dict:
+    """O estado do arquivo com o throttle da memória por cima: vale o disparo
+    mais recente e a união dos pins já disparados."""
+    out = dict(file_state)
+    last_f, last_m = file_state.get("last_heal_at"), mem.get("last_heal_at")
+    nums = [v for v in (last_f, last_m) if isinstance(v, (int, float))]
+    if nums:
+        out["last_heal_at"] = max(nums)
+    pins = [p for p in (file_state.get("healed_pins") or []) if isinstance(p, str)]
+    pins += [p for p in (mem.get("healed_pins") or []) if isinstance(p, str) and p not in pins]
+    if pins:
+        out["healed_pins"] = pins[-_HEAL_PIN_MEMORY:]
+    return out
+
+
 def _maybe_heal(response: Any) -> None:
     """Auto-atualização (contrato C). Com `node` (ou `bun`) no PATH e o launcher
     do connect instalado, um pin novo na resposta ou 6 h disparam
     `launcher.mjs heal --harness=hermes`, destacado: o connect reescreve o
     plugin a partir do manifesto assinado e o Hermes carrega a versão nova no
     próximo início. Sem runtime ou sem launcher, nada: o plugin segue
-    reportando a versão (o engine o mostra como atrasado)."""
-    global _warned_no_launcher
+    reportando a versão (o engine o mostra como atrasado). Só no modo
+    hospedado (VALORBRAIN_HOOKS_MODE=hosted): um plugin self-hosted contra um
+    engine remoto não recebe o manifesto hospedado."""
+    global _warned_no_launcher, _heal_mem
+    if not _hosted_mode():
+        return
     try:
         pin = None
         if isinstance(response, dict) and isinstance(response.get("client_pin"), dict):
@@ -250,7 +297,7 @@ def _maybe_heal(response: Any) -> None:
             current = None
         now = time.time()
         with _plugin_state_lock:
-            state = _read_plugin_state()
+            state = _merge_heal(_read_plugin_state(), _heal_mem)
             reason = _heal_reason(state, pin, current, now)
             if not reason:
                 return
@@ -271,7 +318,9 @@ def _maybe_heal(response: Any) -> None:
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             ))
-            _write_plugin_state(_record_heal(state, reason, pin, now))
+            nxt = _record_heal(state, reason, pin, now)
+            _heal_mem = {"last_heal_at": nxt["last_heal_at"], "healed_pins": list(nxt.get("healed_pins") or [])}
+            _write_plugin_state(nxt)
         logger.info("valorbrain: auto-update heal spawned (%s%s)", reason, f" pin={str(pin)[:32]}" if reason == "pin" else "")
     except Exception as e:
         logger.debug("valorbrain: auto-update heal failed: %s", e)
