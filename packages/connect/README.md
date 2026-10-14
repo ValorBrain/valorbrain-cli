@@ -289,7 +289,8 @@ O checkpoint chega pelo mecanismo de continuação do próprio harness:
 
 | harness | mecanismo |
 |---|---|
-| Claude, Codex, Kiro, Grok | `decision:block` |
+| Claude | `hookSpecificOutput.additionalContext` no `Stop` (aparece como "Stop hook feedback", não como erro) |
+| Codex, Kiro, Grok | `decision:block` |
 | Gemini | `deny` |
 | Cursor | `followup_message` |
 
