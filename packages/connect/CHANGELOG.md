@@ -1,5 +1,37 @@
 # Changelog — @valorbrain/connect
 
+## 0.10.0 — 2026-10-14
+
+- **Hooks sem npx a cada evento.** A instalação pede ao engine o manifesto
+  `client=local` (`/setup/artifacts?…&hooks=2&client=local`), copia `hook.mjs`
+  e `manifest-signature.mjs` para `~/.valorbrain/bin/connect/0.10.0/` (pasta
+  0700, arquivos 0644, tmp + rename) e grava
+  `node "<caminho>" hook <evento> --harness=<id> || npx -y @valorbrain/connect@<pin> hook …`.
+  - Medido num servidor Linux: 650–700 ms por evento com npx aquecido, contra
+    27–55 ms com o cliente local.
+  - Se o arquivo faltar, o npx fixado atende o evento com o mesmo stdin.
+  - Windows continua no npx por padrão (o Windows PowerShell 5.1 do Gemini CLI
+    não aceita `||`). `VALORBRAIN_HOOK_CLIENT=local|npx` escolhe o modo.
+  - Engine que não conhece `client=local`, ou que fixa outra versão, recebe os
+    hooks npx como antes.
+- **Self-heal fora do caminho do hook.** O cliente local nunca espera o heal.
+  Quando ele vence (6 h), o cliente dispara em segundo plano um processo que
+  confere a assinatura do manifesto e roda
+  `npx -y @valorbrain/connect@<hook_client_version> heal --harness=<id>` (novo
+  subcomando `heal`). Nunca roda versão que o manifesto assinado não fixa, nem
+  versão anterior à 0.10.0. Pelo npx, o heal continua no processo, como antes.
+  - Um hook npx da 0.10 cujo cliente local nunca foi tentado faz o heal no
+    primeiro evento, uma vez por versão. É assim que uma instalação 0.9 sai do
+    npx depois que o engine fixa a 0.10.
+  - Um heal de versão diferente da fixada não escreve nada e passa a vez à
+    versão fixada.
+- `--status` mostra `client: local <versão>` ou `client: npx <versão>` em cada
+  arquivo de hooks.
+- Versões locais que nenhum hook usa são apagadas 24 h depois. `--remove`
+  apaga na hora quando nenhum harness usa mais a versão.
+- `CLIENT_VERSION` e o estado do heal (`connect-state.json`) passaram para o
+  `hook.mjs`, que roda sozinho como cliente local.
+
 ## 0.9.0 — 2026-10-12
 
 - `--mcp-only`: grava o servidor MCP e o bloco de instruções, sem hooks — nada é

@@ -27,14 +27,29 @@
  *   - Silence is the failure mode: every error path exits 0 with the dialect's
  *     empty answer and at most one line on stderr. A hook that breaks a prompt
  *     is worse than a hook that adds nothing.
+ *
+ * Two ways to run it, same code:
+ *   - `npx -y @valorbrain/connect@<pin> hook <name>` → index.mjs, which lends
+ *     its (awaited, ≤2.5s) self-heal;
+ *   - `node ~/.valorbrain/bin/connect/<version>/hook.mjs hook <name>` — the
+ *     LOCAL copy connect ≥ 0.10 installs (no npx resolution per event). Its
+ *     self-heal never runs in the hook: when due (6h throttle) it spawns a
+ *     detached `heal-dispatch` and returns. That one reads the pin from the
+ *     signed manifest and runs `npx -y @valorbrain/connect@<pin> heal`.
  */
 
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-    chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync,
-    readdirSync, renameSync, statSync, unlinkSync, writeFileSync,
+    appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync,
+    readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { trustedManifestKeys, verifyManifest } from './manifest-signature.mjs';
+
+/** This package's version. Also the directory name of the local hook client. */
+export const CLIENT_VERSION = '0.10.0';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
@@ -868,6 +883,154 @@ export async function runHook(argv, deps = {}) {
     }
 }
 
+// ─── self-heal off the hot path ──────────────────────────────────────────────
+//
+// The local client never awaits a heal. When one is due it claims the 6h
+// throttle, spawns `heal-dispatch` detached and exits; the dispatcher reads the
+// pin from the SIGNED manifest and runs that exact version's `heal`, which
+// needs index.mjs (and its `yaml`): `npx -y @valorbrain/connect@<pin> heal`.
+// A pin bump on the engine thus propagates: old local client → npx @<new pin>
+// heal → new local client.
+
+export function healStatePath(home) {
+    return join(home, '.valorbrain', 'connect-state.json');
+}
+
+export function readHealState(home) {
+    return readJson(healStatePath(home)) || {};
+}
+
+export function writeHealState(home, state) {
+    try {
+        mkdirSync(dirname(healStatePath(home)), { recursive: true });
+        writeFileSync(healStatePath(home), JSON.stringify(state));
+    } catch {
+        /* fail-open */
+    }
+}
+
+export function healIntervalMs(env = {}) {
+    return Number(env.VALORBRAIN_HEAL_INTERVAL_MS || 6 * 60 * MIN);
+}
+
+/**
+ * The self-heal throttle (`lastHealAt` in connect-state.json). True when a heal
+ * is due — and then the attempt is recorded at once: a heal that fails is not
+ * retried on every prompt. `force` skips the check, never the record.
+ */
+export function claimHeal(home, { now = Date.now(), env = {}, force = false, patch = {} } = {}) {
+    const state = readHealState(home);
+    if (!force && state.lastHealAt && now - state.lastHealAt < healIntervalMs(env)) return false;
+    writeHealState(home, { ...state, ...patch, lastHealAt: now });
+    return true;
+}
+
+/**
+ * Start a process that outlives this one and is never waited for: no shared
+ * stdio (the harness waits on our pipes, not on it), its own process group (a
+ * harness that kills the hook's group on timeout leaves it alone), no console
+ * window on Windows, where `npx` is a .cmd shim only a shell runs. False when
+ * it could not start.
+ */
+export function spawnDetached(command, args, { env = process.env, spawnImpl = spawn } = {}) {
+    try {
+        const shim = process.platform === 'win32' && command !== process.execPath && !/\.exe$/i.test(command);
+        const child = spawnImpl(command, args, { detached: true, stdio: 'ignore', windowsHide: true, shell: shim, env });
+        child.on?.('error', () => {});
+        child.unref?.();
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * A version this client may run `heal` from: exact semver, 0.10.0 or later. A
+ * tag or a range is never run, and an older release would read `heal` as an
+ * install.
+ */
+export function healPin(version) {
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(String(version ?? ''));
+    return m && (Number(m[1]) > 0 || Number(m[2]) >= 10) ? m[0] : null;
+}
+
+/**
+ * The pin a signed manifest names: `hook_client_version` (client=local), or —
+ * from an engine that stopped serving the local client — the version its npx
+ * hook command runs, so that heal can move the hooks back to npx.
+ */
+export function manifestHealPin(manifest) {
+    const declared = healPin(manifest?.hook_client_version);
+    if (declared) return declared;
+    for (const a of manifest?.artifacts || []) {
+        if (a?.kind !== 'hooks' || typeof a.contents !== 'string') continue;
+        const m = /@valorbrain\/connect@([^\s"'\\]+)\s+hook\b/.exec(a.contents);
+        if (m) return healPin(m[1]);
+    }
+    return null;
+}
+
+/**
+ * Which kiro engine CALLED this hook, from the payload's own casing — verified
+ * live (VAL-224 R2): the V3 engine sends hook_event_name in PascalCase
+ * (SessionStart / UserPromptSubmit / Stop), the legacy one in camelCase
+ * (agentSpawn / userPromptSubmit / stop). Unknown or foreign-dialect names
+ * return null: with no signal, the heal protects both sides.
+ */
+export function kiroEngineFromPayload(payload) {
+    const ev = String(payload?.hook_event_name || '');
+    if (ev === 'SessionStart' || ev === 'UserPromptSubmit' || ev === 'Stop') return 'v3';
+    if (ev === 'agentSpawn' || ev === 'userPromptSubmit' || ev === 'stop') return 'legacy';
+    return null;
+}
+
+function harnessArg(argv, env = {}) {
+    return canonicalHarness(argv.find((a) => a.startsWith('--harness='))?.slice(10) || str(env.VALORBRAIN_HARNESS));
+}
+
+/**
+ * Local client, after its output: when a heal is due, spawn `heal-dispatch`
+ * detached and return. True when one was started.
+ */
+export function kickLocalHeal(argv, payload, deps = {}) {
+    const env = deps.env ?? process.env;
+    const home = deps.home ?? env.HOME ?? '';
+    const harness = harnessArg(argv, env);
+    if (!harness || !resolveCredentials({ argv, env, home, harness }).token) return false;
+    if (!claimHeal(home, { now: deps.now ?? Date.now(), env })) return false;
+    const engine = harness === 'kiro' ? kiroEngineFromPayload(payload) : null;
+    const self = deps.self ?? fileURLToPath(import.meta.url);
+    return spawnDetached(process.execPath, [self, 'heal-dispatch', `--harness=${harness}`, ...(engine ? [`--caller-engine=${engine}`] : [])], { env, spawnImpl: deps.spawnImpl });
+}
+
+/**
+ * Detached: fetch and verify the manifest, then run the pinned version's heal
+ * (`npx -y @valorbrain/connect@<pin> heal --harness=<id>`). Returns the pin
+ * started, or null. Never runs a version the signed manifest does not name.
+ */
+export async function healDispatch(argv, deps = {}) {
+    const env = deps.env ?? process.env;
+    const home = deps.home ?? env.HOME ?? '';
+    const fetchImpl = deps.fetchImpl ?? ((u, i) => fetch(u, i));
+    const harness = harnessArg(argv);
+    if (!harness) return null;
+    const creds = resolveCredentials({ argv: [], env, home, harness });
+    if (!creds.token) return null;
+    const url = `${creds.api}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}&client=local`;
+    const res = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) return null;
+    const checked = verifyManifest({ body: await res.text(), headers: res.headers, harness, keys: trustedManifestKeys(env) });
+    if (checked.error) {
+        try { appendFileSync(join(home, '.valorbrain', 'connect.log'), `${new Date().toISOString()} [valorbrain] heal ${harness}: ${checked.error}\n`); } catch { /* fail-open */ }
+        return null;
+    }
+    const pin = manifestHealPin(checked.manifest);
+    if (!pin) return null;
+    const engine = argv.find((a) => /^--caller-engine=(v3|legacy)$/.test(a));
+    const args = ['-y', `@valorbrain/connect@${pin}`, 'heal', `--harness=${harness}`, ...(engine ? [engine] : [])];
+    return spawnDetached('npx', args, { env, spawnImpl: deps.spawnImpl }) ? pin : null;
+}
+
 /** Parse the harness payload from stdin ('' or invalid JSON → {}). */
 export async function readStdinPayload(stdin = process.stdin) {
     if (stdin.isTTY) return {};
@@ -880,5 +1043,37 @@ export async function readStdinPayload(stdin = process.stdin) {
         return v && typeof v === 'object' ? v : {};
     } catch {
         return {};
+    }
+}
+
+// ─── local client entry point ────────────────────────────────────────────────
+// `node <this file> hook <name> --harness=<id>` (the local copy) or
+// `node <this file> heal-dispatch --harness=<id>` (spawned by it). Imported by
+// index.mjs or the tests, none of this runs.
+
+function invokedDirectly() {
+    try {
+        return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+}
+
+if (invokedDirectly()) {
+    const [command, ...rest] = process.argv.slice(2);
+    if (command === 'hook') {
+        readStdinPayload()
+            .then(async (payload) => {
+                const code = await runHook(rest, { payload, clientVersion: CLIENT_VERSION });
+                try { kickLocalHeal(rest, payload); } catch { /* fail-open */ }
+                return code;
+            })
+            .then((code) => process.exit(code))
+            .catch(() => process.exit(0));
+    } else if (command === 'heal-dispatch') {
+        healDispatch(rest).catch(() => null).finally(() => process.exit(0));
+    } else {
+        process.stderr.write('usage: node hook.mjs hook <session-start|prompt|stop> --harness=<id>\n');
+        process.exitCode = 2;
     }
 }
