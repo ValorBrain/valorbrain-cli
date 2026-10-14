@@ -83,7 +83,16 @@ test('context rendering per dialect', () => {
 });
 
 test('checkpoint rendering per dialect', () => {
-    assert.deepEqual(JSON.parse(renderCheckpoint('claude', 'CUE')), { decision: 'block', reason: 'CUE' });
+    // Claude Code: the non-error channel ("Stop hook feedback"), never decision:block ("Stop hook error").
+    assert.deepEqual(JSON.parse(renderCheckpoint('claude', 'CUE', { hook_event_name: 'Stop' })),
+        { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CUE' } });
+    assert.deepEqual(JSON.parse(renderCheckpoint('claude', 'CUE')),
+        { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CUE' } });
+    // hookEventName must match the event that ran, or Claude Code rejects the output.
+    assert.deepEqual(JSON.parse(renderCheckpoint('claude', 'CUE', { hook_event_name: 'SubagentStop' })),
+        { hookSpecificOutput: { hookEventName: 'SubagentStop', additionalContext: 'CUE' } });
+    assert.deepEqual(JSON.parse(renderCheckpoint('codex', 'CUE')), { decision: 'block', reason: 'CUE' });
+    assert.deepEqual(JSON.parse(renderCheckpoint('grok', 'CUE')), { decision: 'block', reason: 'CUE' });
     assert.deepEqual(JSON.parse(renderCheckpoint('kiro', 'CUE')), { decision: 'block', reason: 'CUE' });
     assert.deepEqual(JSON.parse(renderCheckpoint('gemini', 'CUE')), { decision: 'deny', reason: 'CUE' });
     assert.deepEqual(JSON.parse(renderCheckpoint('cursor', 'CUE')), { followup_message: 'CUE' });
@@ -234,7 +243,7 @@ test('a one-shot run never ends in a checkpoint, however long; two long turns do
     assert.equal(one.out, ''); // `claude -p "…"`: its final message is somebody's output
     await run(['prompt', '--harness=claude-code'], { h, fake, payload: prompt, now: T0 + 31 * MIN });
     const two = await run(['stop', '--harness=claude-code'], { h, fake, payload: stop, now: T0 + 40 * MIN });
-    assert.deepEqual(JSON.parse(two.out), { decision: 'block', reason: 'CUE' });
+    assert.deepEqual(JSON.parse(two.out), { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CUE' } });
 });
 
 test('SDK-driven Claude Code (headless): stop stays silent', async () => {
@@ -293,7 +302,7 @@ test('network failure at stop: silent, counters kept for the next stop', async (
     assert.equal(a.err.length, 1);
     fail = false;
     const b = await run(['stop', '--harness=claude-code'], { h, fake, payload: p, now: T0 + 12 * MIN });
-    assert.deepEqual(JSON.parse(b.out), { decision: 'block', reason: 'CUE' });
+    assert.deepEqual(JSON.parse(b.out), { hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'CUE' } });
 });
 
 test('cursor: followup_message; aborted turns and duplicate deliveries do not count', async () => {

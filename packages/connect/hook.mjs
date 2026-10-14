@@ -467,16 +467,31 @@ export function renderContext(dialect, event, context, payload = {}) {
     }
 }
 
-/** stdout that makes the harness continue with `cue` as the next instruction. */
-export function renderCheckpoint(dialect, cue) {
+/**
+ * stdout that makes the harness continue with `cue` as the next instruction.
+ *
+ * Claude Code continues the turn on `decision:block` too, but renders the
+ * reason as "Stop hook error: …" with a "Stop hook error occurred" notice.
+ * `hookSpecificOutput.additionalContext` on Stop/SubagentStop continues the
+ * same way (same `stop_hook_active` guard and continuation cap) and is shown
+ * as "Stop hook feedback: …". Its `hookEventName` must be the event the hook
+ * ran for, or Claude Code rejects the output. Needs Claude Code >= 2.1.163
+ * (older builds drop it silently); the hook cannot see the version, so there
+ * is no decision:block fallback.
+ */
+export function renderCheckpoint(dialect, cue, payload = {}) {
     switch (dialect) {
+        case 'claude': {
+            const hookEventName = payload?.hook_event_name === 'SubagentStop' ? 'SubagentStop' : 'Stop';
+            return JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: cue } });
+        }
         case 'cursor':
             return JSON.stringify({ followup_message: cue });
         case 'gemini':
             return JSON.stringify({ decision: 'deny', reason: cue });
         case 'text':
             return ''; // no continuation mechanism (OpenCode plugin, legacy text)
-        default: // claude, codex, kiro, grok
+        default: // codex, kiro, grok
             return JSON.stringify({ decision: 'block', reason: cue });
     }
 }
@@ -989,7 +1004,7 @@ export async function runHook(argv, deps = {}) {
             st.busyMs = 0;
             st.awaiting = true;
             st.awaitingAt = now;
-            return renderCheckpoint(dialect, cue);
+            return renderCheckpoint(dialect, cue, payload);
         }
         if (reset) {
             // The agent recorded memory on its own since the last checkpoint:

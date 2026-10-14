@@ -1,5 +1,21 @@
 # Changelog — @valorbrain/connect
 
+## [Unreleased]
+
+- **Checkpoint no Claude Code sem "Stop hook error".** O checkpoint de memória
+  saía como `{"decision":"block","reason"}`, que o Claude Code mostra como
+  `Stop hook error: …` e com o aviso "Stop hook error occurred". Agora, no
+  Claude Code, sai em `hookSpecificOutput.additionalContext` com
+  `hookEventName` igual ao evento que rodou (`Stop` ou `SubagentStop`). O
+  turno continua do mesmo jeito, com a mesma proteção de laço
+  (`stop_hook_active`), e o texto aparece como `Stop hook feedback: …`.
+  Codex, Kiro e Grok continuam com `decision:block`.
+- **Claude Code mínimo para o checkpoint: 2.1.163.** É a primeira versão em
+  que o `Stop` aceita `additionalContext` (CHANGELOG do Claude Code, 2.1.163).
+  Numa versão anterior, a saída é descartada sem aviso e o checkpoint daquele
+  turno se perde. Não há fallback para `decision:block`: o hook não recebe a
+  versão do Claude Code, nem no payload nem no ambiente.
+
 ## 0.11.1 — 2026-10-14
 
 Pequena, e também é a prova de que uma versão nova chega a todas as
