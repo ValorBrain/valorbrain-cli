@@ -31,25 +31,23 @@
  * Two ways to run it, same code:
  *   - `npx -y @valorbrain/connect@<pin> hook <name>` → index.mjs, which lends
  *     its (awaited, ≤2.5s) self-heal;
- *   - `node ~/.valorbrain/bin/connect/<version>/hook.mjs hook <name>` — the
- *     LOCAL copy connect ≥ 0.10 installs (no npx resolution per event). Its
- *     self-heal never runs in the hook: when due (6h throttle) it spawns a
- *     detached `heal-dispatch` and returns. That one reads the pin from the
- *     signed manifest and runs `npx -y @valorbrain/connect@<pin> heal`.
+ *   - `node ~/.valorbrain/bin/connect/launcher.mjs hook <name>` (connect ≥
+ *     0.11): the launcher runs `<current version>/hook.mjs` directly. Its
+ *     self-heal never runs in the hook: when due (6h throttle, or a cue
+ *     naming another pin) it spawns the sibling `index.mjs heal` detached.
  */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
     appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync,
     readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { trustedManifestKeys, verifyManifest } from './manifest-signature.mjs';
 
-/** This package's version. Also the directory name of the local hook client. */
-export const CLIENT_VERSION = '0.10.1';
+/** This package's version. Also its directory name under ~/.valorbrain/bin/connect/. */
+export const CLIENT_VERSION = '0.11.0';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
@@ -192,12 +190,15 @@ function writeCredsFile(home, data) {
  * Atomic read-modify-write of this harness's entry; 0600 file in a 0700 dir.
  * `mcpOnly` records an install without hooks (`--mcp-only`); any other
  * install clears it, so a later plain run upgrades to hooks.
+ * `consentedScope`: the manifest `data_scope` a person installed under (only
+ * an install run by hand passes it); otherwise the entry keeps its own, or 1.
  */
-export function writeCreds(home, { api, token, harness, kiroEngine, mcpOnly = false }) {
+export function writeCreds(home, { api, token, harness, kiroEngine, mcpOnly = false, consentedScope }) {
     if (!harness) throw new Error('writeCreds needs the harness id');
     const id = canonicalHarness(harness);
     return withCredsLock(home, () => {
         const data = readCredsFile(home); // re-read under the lock
+        const prev = data.harnesses[id] || {};
         const entry = { api_url: normalizeApi(api) || DEFAULT_API, token, updated_at: new Date().toISOString() };
         // The engine opt-in is the ONLY record that "agent config in $HOME"
         // means legacy: connect 0.5.1 wrote that file BY DEFAULT, so its
@@ -207,11 +208,56 @@ export function writeCreds(home, { api, token, harness, kiroEngine, mcpOnly = fa
         // A re-install or a token migration never undoes the person's choice
         // about what leaves the machine (setPrivacy).
         for (const k of PRIVACY_KEYS) {
-            if (typeof data.harnesses[id]?.[k] === 'boolean') entry[k] = data.harnesses[id][k];
+            if (typeof prev[k] === 'boolean') entry[k] = prev[k];
         }
+        entry.install_id = INSTALL_ID.test(String(prev.install_id ?? '')) ? prev.install_id : adoptedInstallId(home, id) || newInstallId();
+        entry.consented_scope = Number.isInteger(consentedScope) ? consentedScope : Number.isInteger(prev.consented_scope) ? prev.consented_scope : 1;
         data.harnesses[id] = entry;
         return writeCredsFile(home, data);
     });
+}
+
+/** `X-ValorBrain-Install` (contract D): 32 lowercase hex, random, once per machine user and harness. */
+export const INSTALL_ID = /^[0-9a-f]{32}$/;
+
+function newInstallId() {
+    return randomBytes(16).toString('hex');
+}
+
+/** Where the omp bridge and the Hermes plugin keep the install id they generated before connect.json had one. */
+const PLUGIN_STATE_FILES = { omp: ['.omp', 'agent', 'valorbrain-bridge-state.json'], hermes: ['.hermes', 'valorbrain-plugin-state.json'] };
+
+/** The id the omp bridge / Hermes plugin already reports, so adopting it does not create a second install row. */
+function adoptedInstallId(home, harness) {
+    const rel = PLUGIN_STATE_FILES[harness];
+    const id = rel ? readJson(join(home, ...rel))?.install_id : null;
+    return INSTALL_ID.test(String(id ?? '')) ? id : null;
+}
+
+/**
+ * Migration to 0.11 (contract C): every entry of connect.json gets an
+ * `install_id` and `consented_scope: 1` (the scope every install so far ran
+ * under). Idempotent; true when the file changed.
+ */
+export function ensureInstallIds(home) {
+    if (!existsSync(credsPath(home))) return false;
+    return withCredsLock(home, () => {
+        const data = readCredsFile(home);
+        let changed = false;
+        for (const [id, entry] of Object.entries(data.harnesses)) {
+            if (!entry || typeof entry !== 'object') continue;
+            if (!INSTALL_ID.test(String(entry.install_id ?? ''))) { entry.install_id = adoptedInstallId(home, id) || newInstallId(); changed = true; }
+            if (!Number.isInteger(entry.consented_scope)) { entry.consented_scope = 1; changed = true; }
+        }
+        if (changed) writeCredsFile(home, data);
+        return changed;
+    });
+}
+
+/** The data_scope this harness's person consented to (contract C); 1 when nothing is recorded. */
+export function consentedScope(home, harness) {
+    const v = readCredsFile(home).harnesses[canonicalHarness(harness)]?.consented_scope;
+    return Number.isInteger(v) ? v : 1;
 }
 
 /**
@@ -585,10 +631,10 @@ function writeCaps(home, api, patch) {
 
 // ─── network ─────────────────────────────────────────────────────────────────
 
-async function postCue(api, token, body, timeoutMs, fetchImpl) {
+async function postCue(api, token, body, timeoutMs, fetchImpl, headers = {}) {
     const res = await fetchImpl(`${api}/api/v1/hooks/cue`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        headers: { ...headers, 'content-type': 'application/json', authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(timeoutMs),
     });
@@ -671,7 +717,7 @@ export function readTranscriptCapped(path, max = MAX_TRANSCRIPT_BYTES) {
  * Legacy explicit extraction hooks (uploads the transcript to /api/v1/hooks/run).
  * `withTranscript: false` (an explicit `send_transcript` off) never reads it.
  */
-async function runExtraction(api, token, name, payload, fetchImpl, { withTranscript = true } = {}) {
+async function runExtraction(api, token, name, payload, fetchImpl, { withTranscript = true, headers = {} } = {}) {
     const input = {
         sessionId: payload?.session_id || payload?.sessionId,
         prompt: payload?.prompt,
@@ -686,7 +732,7 @@ async function runExtraction(api, token, name, payload, fetchImpl, { withTranscr
     }
     const res = await fetchImpl(`${api}/api/v1/hooks/run`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        headers: { ...headers, 'content-type': 'application/json', authorization: `Bearer ${token}` },
         body: JSON.stringify({ hook: name, input, transcript }),
         signal: AbortSignal.timeout(20_000),
     });
@@ -706,7 +752,8 @@ function readPrompt(p) {
  * Run one hook. Returns the exit code (always 0 — silence is the failure mode).
  *
  * `deps` makes it testable and lets the installer plug in its self-heal:
- *   env, home, payload (parsed stdin), fetchImpl, now, heal, out, err, clientVersion
+ *   env, home, payload (parsed stdin), fetchImpl, now, heal, out, err, clientVersion,
+ *   onPinHint (called with a cue response's `client_pin`)
  */
 export async function runHook(argv, deps = {}) {
     const env = deps.env ?? process.env;
@@ -739,6 +786,16 @@ export async function runHook(argv, deps = {}) {
             new Promise((r) => setTimeout(r, 2500)),
         ]).catch(() => {})
         : Promise.resolve();
+    // Contract D: every hosted request says which client, harness and install it is.
+    const headers = clientHeaders(home, harness || dialect);
+    /** POST the cue; a `client_pin` naming another version starts a detached heal (deps.onPinHint). */
+    const sendCue = async (body) => {
+        const r = await postCue(creds.api, creds.token, body, requestTimeoutMs(event, env), fetchImpl, headers);
+        if (r.json?.client_pin && typeof deps.onPinHint === 'function') {
+            try { deps.onPinHint(r.json.client_pin); } catch { /* fail-open */ }
+        }
+        return r;
+    };
 
     if (EXTRACTION_HOOKS.has(name)) {
         // Wiring an extraction hook by hand is itself the opt-in (as in 0.9),
@@ -750,7 +807,7 @@ export async function runHook(argv, deps = {}) {
             await heal;
             return 0;
         }
-        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript }).catch(() => false), heal]);
+        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript, headers }).catch(() => false), heal]);
         return 0;
     }
     if (!event) {
@@ -793,13 +850,13 @@ export async function runHook(argv, deps = {}) {
         try {
             let served = false;
             if (!cueKnownMissing) {
-                const r = await postCue(creds.api, creds.token, {
+                const r = await sendCue({
                     ...base, event,
                     // The engine keeps 8k chars and caps the body at 64 KB: a
                     // pasted log must not become a 413 and lose recall.
                     ...(event === 'prompt' ? { prompt: prompt.slice(0, 8_000) } : {}),
                     ...(typeof payload.source === 'string' ? { source: payload.source } : {}),
-                }, timeoutMs, fetchImpl);
+                });
                 if (r.status === 404 || r.status === 405) writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
                 else if (r.status === 403) {
                     // An engine that predates the cue treats this POST as a
@@ -896,7 +953,7 @@ export async function runHook(argv, deps = {}) {
             cue = fallbackCue(toolPrefixFor(dialect));
         } else {
             try {
-                const r = await postCue(creds.api, creds.token, {
+                const r = await sendCue({
                     ...base, event: 'stop',
                     state: {
                         turns: st.turns,
@@ -905,7 +962,7 @@ export async function runHook(argv, deps = {}) {
                         session_started_at: st.createdAt,
                         last_checkpoint_at: st.lastCheckpointAt,
                     },
-                }, timeoutMs, fetchImpl);
+                });
                 if (r.status === 404 || r.status === 405) {
                     writeCaps(home, creds.api, { cue: false, cueCheckedAt: now });
                     cue = fallbackCue(toolPrefixFor(dialect));
@@ -947,12 +1004,12 @@ export async function runHook(argv, deps = {}) {
 
 // ─── self-heal off the hot path ──────────────────────────────────────────────
 //
-// The local client never awaits a heal. When one is due it claims the 6h
-// throttle, spawns `heal-dispatch` detached and exits; the dispatcher reads the
-// pin from the SIGNED manifest and runs that exact version's `heal`, which
-// needs index.mjs (and its `yaml`): `npx -y @valorbrain/connect@<pin> heal`.
-// A pin bump on the engine thus propagates: old local client → npx @<new pin>
-// heal → new local client.
+// Run directly (`node <dir>/hook.mjs`, which is how launcher.mjs runs it), the
+// hook never awaits a heal. When one is due — the 6h throttle, or a cue
+// response whose `client_pin` names another version — it spawns its sibling
+// `index.mjs heal` detached and exits. That heal reads the SIGNED manifest and,
+// for a new pin, downloads the tarball, checks its sha512 against the signed
+// integrity and switches current.json (index.mjs, contract C). No npx.
 
 export function healStatePath(home) {
     return join(home, '.valorbrain', 'connect-state.json');
@@ -1015,29 +1072,14 @@ export function spawnDetached(command, args, { env = process.env, spawnImpl = sp
 }
 
 /**
- * A version this client may run `heal` from: exact semver, 0.10.0 or later. A
- * tag or a range is never run, and an older release would read `heal` as an
- * install.
+ * A version the launcher may run: exact semver, 0.11.0 or later. A tag or a
+ * range is never run, and earlier releases have no launcher.
  */
-export function healPin(version) {
-    const m = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/.exec(String(version ?? ''));
-    return m && (Number(m[1]) > 0 || Number(m[2]) >= 10) ? m[0] : null;
-}
-
-/**
- * The pin a signed manifest names: `hook_client_version` (client=local), or —
- * from an engine that stopped serving the local client — the version its npx
- * hook command runs, so that heal can move the hooks back to npx.
- */
-export function manifestHealPin(manifest) {
-    const declared = healPin(manifest?.hook_client_version);
-    if (declared) return declared;
-    for (const a of manifest?.artifacts || []) {
-        if (a?.kind !== 'hooks' || typeof a.contents !== 'string') continue;
-        const m = /@valorbrain\/connect@([^\s"'\\]+)\s+hook\b/.exec(a.contents);
-        if (m) return healPin(m[1]);
-    }
-    return null;
+export function launcherPin(version) {
+    const v = String(version ?? '');
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v)) return null;
+    const [major, minor] = v.split('.').map(Number);
+    return major > 0 || minor >= 11 ? v : null;
 }
 
 /**
@@ -1059,55 +1101,61 @@ function harnessArg(argv, env = {}) {
 }
 
 /**
- * Local client, after its output: when a heal is due, spawn `heal-dispatch`
- * detached and return. True when one was started.
+ * After the hook's output: when a heal is due (or `force`), spawn the sibling
+ * `index.mjs heal --harness=<id>` detached and return. True when one started.
  */
-export function kickLocalHeal(argv, payload, deps = {}) {
+export function kickHeal(argv, payload, deps = {}) {
     const env = deps.env ?? process.env;
     const home = deps.home ?? env.HOME ?? '';
     const harness = harnessArg(argv, env);
     if (!harness || !resolveCredentials({ argv, env, home, harness }).token) return false;
-    if (!claimHeal(home, { now: deps.now ?? Date.now(), env })) return false;
+    if (!claimHeal(home, { now: deps.now ?? Date.now(), env, force: deps.force === true })) return false;
     const engine = harness === 'kiro' ? kiroEngineFromPayload(payload) : null;
     const self = deps.self ?? fileURLToPath(import.meta.url);
-    return spawnDetached(process.execPath, [self, 'heal-dispatch', `--harness=${harness}`, ...(engine ? [`--caller-engine=${engine}`] : [])], { env, spawnImpl: deps.spawnImpl });
+    return spawnDetached(process.execPath, [join(dirname(self), 'index.mjs'), 'heal', `--harness=${harness}`, ...(engine ? [`--caller-engine=${engine}`] : [])], { env, spawnImpl: deps.spawnImpl });
 }
 
 /**
- * npx flags for `npx … @<pin> heal`: no update notice, no `npm notice run`
- * lines (verified on npm 12.0.2; errors still print). Never `--prefer-offline`:
- * this runs right after a pin bump, when the cached packument predates the new
- * pin — npm would trust it and fail ETARGET, and the bump would never land.
- * Off the hot path, a revalidating npx costs nothing anyone waits for.
+ * A cue or hooks/run response named the engine's pin (`client_pin`). When it is
+ * not this version, heal now instead of in up to 6h — once per pin per harness
+ * (`pin_hints` in connect-state.json), so a pin that cannot install never loops.
  */
-export const HEAL_NPX_FLAGS = ['--no-update-notifier', '--loglevel=warn'];
-
-/**
- * Detached: fetch and verify the manifest, then run the pinned version's heal
- * (`npx -y @valorbrain/connect@<pin> heal --harness=<id>`). Returns the pin
- * started, or null. Never runs a version the signed manifest does not name.
- */
-export async function healDispatch(argv, deps = {}) {
+export function noticePin(pin, argv, payload, deps = {}) {
     const env = deps.env ?? process.env;
     const home = deps.home ?? env.HOME ?? '';
-    const fetchImpl = deps.fetchImpl ?? ((u, i) => fetch(u, i));
-    const harness = harnessArg(argv);
-    if (!harness) return null;
-    const creds = resolveCredentials({ argv: [], env, home, harness });
-    if (!creds.token) return null;
-    const url = `${creds.api}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}&client=local`;
-    const res = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) return null;
-    const checked = verifyManifest({ body: await res.text(), headers: res.headers, harness, keys: trustedManifestKeys(env) });
-    if (checked.error) {
-        try { appendFileSync(join(home, '.valorbrain', 'connect.log'), `${new Date().toISOString()} [valorbrain] heal ${harness}: ${checked.error}\n`); } catch { /* fail-open */ }
-        return null;
-    }
-    const pin = manifestHealPin(checked.manifest);
-    if (!pin) return null;
-    const engine = argv.find((a) => /^--caller-engine=(v3|legacy)$/.test(a));
-    const args = [...HEAL_NPX_FLAGS, '-y', `@valorbrain/connect@${pin}`, 'heal', `--harness=${harness}`, ...(engine ? [engine] : [])];
-    return spawnDetached('npx', args, { env, spawnImpl: deps.spawnImpl }) ? pin : null;
+    const harness = harnessArg(argv, env);
+    const version = launcherPin(pin?.version);
+    if (!harness || !version || version === CLIENT_VERSION) return false;
+    const state = readHealState(home);
+    if (state.pin_hints?.[harness] === version) return false;
+    writeHealState(home, { ...state, pin_hints: { ...(state.pin_hints || {}), [harness]: version } });
+    return kickHeal(argv, payload, { ...deps, force: true });
+}
+
+// ─── request identity (contract D) ───────────────────────────────────────────
+
+/** `X-ValorBrain-Client-State`: what this install knows it is stuck on ('' when nothing). */
+function clientState(home, harness) {
+    const s = readHealState(home);
+    const blocked = s.update_blocked?.[harness];
+    if (blocked && Number.isInteger(blocked.scope)) return `blocked-scope=${blocked.scope}`;
+    return s.needs_reinstall?.[harness] ? 'needs-reinstall' : '';
+}
+
+/**
+ * Headers every hosted request carries: client and version, harness, install
+ * id (from this harness's connect.json entry) and, when stuck, the client
+ * state. No hostname, path or anything personal. Never used for auth.
+ */
+export function clientHeaders(home, harness, version = CLIENT_VERSION) {
+    const id = canonicalHarness(harness);
+    const headers = { 'x-valorbrain-client': `connect/${version}` };
+    if (id) headers['x-valorbrain-harness'] = id;
+    const install = readCredsFile(home).harnesses[id]?.install_id;
+    if (INSTALL_ID.test(String(install ?? ''))) headers['x-valorbrain-install'] = install;
+    const state = id ? clientState(home, id) : '';
+    if (state) headers['x-valorbrain-client-state'] = state;
+    return headers;
 }
 
 // ─── transcript upload (opt-in, decision 18) ─────────────────────────────────
@@ -1147,7 +1195,7 @@ function transcriptHarnessPath(home, harness) {
     return join(stateDir(home), `transcript-${harness}.json`);
 }
 
-function logConnect(home, line) {
+export function logConnect(home, line) {
     try { appendFileSync(join(home, '.valorbrain', 'connect.log'), `${new Date().toISOString()} [valorbrain] ${line}\n`); } catch { /* fail-open */ }
 }
 
@@ -1232,12 +1280,16 @@ export async function uploadTranscript(argv, deps = {}) {
         try {
             const res = await fetchImpl(`${creds.api}/api/v1/hooks/run`, {
                 method: 'POST',
-                headers: { 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
+                headers: { ...clientHeaders(home, harness), 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
                 body: JSON.stringify({ hook, input, transcript }),
                 signal: AbortSignal.timeout(TRANSCRIPT_REQUEST_TIMEOUT_MS),
             });
             status = res.status;
-            try { await res.arrayBuffer(); } catch { /* drained */ }
+            let json = null;
+            try { json = JSON.parse(await res.text()); } catch { /* not JSON */ }
+            if (json?.client_pin) {
+                try { noticePin(json.client_pin, [`--harness=${harness}`], {}, { env, home, spawnImpl: deps.spawnImpl, self: deps.self }); } catch { /* fail-open */ }
+            }
         } catch (e) {
             logConnect(home, `transcript ${harness}: ${hook} ${e?.name === 'TimeoutError' ? 'timed out' : 'request failed'}`);
             return done;
@@ -1271,10 +1323,11 @@ export async function readStdinPayload(stdin = process.stdin) {
     }
 }
 
-// ─── local client entry point ────────────────────────────────────────────────
-// `node <this file> hook <name> --harness=<id>` (the local copy) or
-// `node <this file> heal-dispatch --harness=<id>` (spawned by it). Imported by
-// index.mjs or the tests, none of this runs.
+// ─── direct entry point ──────────────────────────────────────────────────────
+// `node <this file> hook <name> --harness=<id>`: how launcher.mjs runs the
+// current version (it points process.argv[1] here), and how a 0.10 local copy
+// ran. `transcript-upload` is spawned by the Stop hook. Imported by index.mjs
+// or the tests, none of this runs.
 
 function invokedDirectly() {
     try {
@@ -1289,14 +1342,16 @@ if (invokedDirectly()) {
     if (command === 'hook') {
         readStdinPayload()
             .then(async (payload) => {
-                const code = await runHook(rest, { payload, clientVersion: CLIENT_VERSION });
-                try { kickLocalHeal(rest, payload); } catch { /* fail-open */ }
+                const code = await runHook(rest, {
+                    payload,
+                    clientVersion: CLIENT_VERSION,
+                    onPinHint: (pin) => noticePin(pin, rest, payload),
+                });
+                try { kickHeal(rest, payload); } catch { /* fail-open */ }
                 return code;
             })
             .then((code) => process.exit(code))
             .catch(() => process.exit(0));
-    } else if (command === 'heal-dispatch') {
-        healDispatch(rest).catch(() => null).finally(() => process.exit(0));
     } else if (command === 'transcript-upload') {
         uploadTranscript(rest).catch(() => null).finally(() => process.exit(0));
     } else {

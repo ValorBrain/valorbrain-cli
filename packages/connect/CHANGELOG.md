@@ -1,5 +1,53 @@
 # Changelog — @valorbrain/connect
 
+## 0.11.0 — 2026-10-14
+
+- **Hooks que se atualizam sozinhos.** A instalação pede `client=launcher` e
+  grava o mesmo comando em todo hook, para sempre:
+  `node "~/.valorbrain/bin/connect/launcher.mjs" hook <evento> --harness=<id>`.
+  - O comando não tem versão nem `||`, então funciona no Windows também
+    (PowerShell 5.1, cmd).
+  - O launcher (só módulos nativos) lê `current.json` e roda a `<versão>/`
+    indicada ali, uma cópia completa do pacote que não precisa de
+    `npm install`. O `yaml` passou a ser carregado só quando é preciso.
+  - Se faltar o arquivo ou a pasta, o launcher escreve uma linha no stderr,
+    devolve a resposta vazia e sai com 0. Ele recusa uma pasta que seja
+    symlink, de outro usuário ou gravável por outros.
+- **Atualização sem npx e sem tocar no harness.**
+  - O heal baixa o tarball que o manifesto assinado nomeia, confere o sha512
+    assinado, descompacta com um leitor de tar próprio numa pasta temporária,
+    renomeia e troca o `current.json` (e o `launcher.mjs`, se mudou).
+  - Roda a cada 6 h e também na hora em que o engine responde com outro
+    `client_pin`, uma vez por versão. Sempre em segundo plano.
+  - Nunca roda tag, faixa de versões, versão < 0.11.0 nem sha512 diferente.
+  - Os arquivos de configuração dos harnesses não mudam numa troca de versão.
+  - O `heal-dispatch` e o `npx … heal` da 0.10 saíram.
+- **Escopo de coleta.** Cada harness em `connect.json` ganha
+  `consented_scope`. Um manifesto com `data_scope` maior fica retido até a
+  pessoa rodar o instalador: o heal escreve uma linha em `connect.log`, grava
+  `update_blocked` e o `--status` mostra o motivo.
+- **Cabeçalhos em toda chamada ao engine** (cue, hooks/run, envio de
+  transcript, `runtimes/register`):
+  - `X-ValorBrain-Client: connect/<versão>`;
+  - `X-ValorBrain-Harness`;
+  - `X-ValorBrain-Install` (`install_id` aleatório por harness em
+    `connect.json`);
+  - `X-ValorBrain-Client-State` (`blocked-scope=<n>` ou `needs-reinstall`).
+- **Migração da 0.10.** O primeiro heal da 0.11 troca o comando dos hooks uma
+  vez para todos os harnesses, menos o Codex.
+  - O Codex fica como está e informa `needs-reinstall`; quem migra o Codex é
+    o instalador rodado por uma pessoa.
+  - Toda entrada de `connect.json` ganha `install_id` e `consented_scope: 1`.
+    Se a ponte do omp ou o plugin do Hermes já tinham um id, ele é
+    reaproveitado.
+- **omp e Hermes.** `launcher.mjs heal --harness=omp|hermes` atualiza a ponte
+  `.ts` e os arquivos do plugin pelo manifesto assinado, com as regras de
+  edição manual. O Hermes faz isso sem token.
+- O heal nunca migra os hooks do Codex, nem com mudança de contrato.
+- `--transcript on` no omp não diz mais "nothing is sent": a ponte envia.
+- `--status` mostra o launcher, a versão em uso, a versão fixada e a
+  atualização retida. `--remove` apaga o launcher quando nenhum harness o usa.
+
 ## 0.10.1 — 2026-10-14
 
 - **Transcript opt-in no Claude Code e no Grok.** Com `--transcript on`
