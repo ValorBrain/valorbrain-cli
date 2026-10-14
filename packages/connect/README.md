@@ -346,13 +346,15 @@ não precisa recarregar hooks.
     `npm install`. O `yaml` só é carregado quando a instalação mescla o config
     do Hermes.
   - Toda a cadeia, do `$HOME` até o arquivo que roda, precisa ser sua e não
-    gravável por grupo nem por outros. Instalação e heal tiram essa permissão
-    de escrita de `~/.valorbrain` e `bin/` e deixam `connect/` em 0700. O
-    `$HOME` em si nunca é alterado: se ele for gravável por outros, a
-    instalação e o heal recusam e o hook fica em npx. O launcher confere a
-    cadeia de novo a cada execução e recusa, com uma linha no stderr, uma
-    pasta que seja symlink, de outro usuário ou gravável por outros: num host
-    com várias pessoas, ninguém troca `connect/` pelo seu.
+    gravável por grupo nem por outros. A exceção é o próprio `$HOME`, que pode
+    ser gravável pelo grupo (0775/2775 é comum com grupo privado por usuário);
+    só um `$HOME` de outro usuário ou gravável por todos (o+w) é recusado.
+    Instalação e heal tiram a permissão de escrita de grupo/outros de
+    `~/.valorbrain` e `bin/` e deixam `connect/` em 0700. O `$HOME` nunca é
+    alterado: se for recusado, a instalação e o heal param ali e o hook fica em
+    npx. O launcher confere a cadeia de novo a cada execução e recusa, com uma
+    linha no stderr, uma pasta que seja symlink, de outro usuário ou gravável
+    por outros: num host com várias pessoas, ninguém troca `connect/` pelo seu.
   - **Windows:** lá não há uid nem bits de modo (as permissões são ACLs), então
     só os testes de tipo e de symlink rodam. A proteção vem das ACLs do perfil
     do usuário.

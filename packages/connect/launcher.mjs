@@ -32,17 +32,19 @@ const harness = (process.argv.find((a) => a.startsWith('--harness=')) || '').sli
 
 /**
  * A directory or file only this user can change: not a symlink, our uid, not
- * group/world-writable. `follow` checks a symlink's target instead (only
- * ~/.valorbrain, which a person may link from their dotfiles). Windows has no
- * uid or mode bits to check (ACLs): there only the type and symlink checks run.
+ * group/world-writable. `follow` checks a symlink's target instead ($HOME and
+ * ~/.valorbrain, which a person may link). `home` allows group write ($HOME
+ * under user private groups is often 0775/2775): only world write is refused
+ * there. Windows has no uid or mode bits to check (ACLs): there only the type
+ * and symlink checks run.
  */
-function safe(path, kind, follow = false) {
+function safe(path, kind, { follow = false, home = false } = {}) {
     const st = follow ? statSync(path) : lstatSync(path);
     if (st.isSymbolicLink()) return `${path} is a symlink`;
     if (kind === 'dir' ? !st.isDirectory() : !st.isFile()) return `${path} is not a ${kind === 'dir' ? 'directory' : 'file'}`;
     if (process.platform === 'win32') return '';
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return `${path} belongs to another user`;
-    if ((st.mode & 0o022) !== 0) return `${path} is writable by others`;
+    if ((st.mode & (home ? 0o002 : 0o022)) !== 0) return `${path} is writable by ${home ? 'everyone' : 'others'}`;
     return '';
 }
 
@@ -61,7 +63,7 @@ function resolveEntry() {
     try {
         // The whole chain from $HOME down: a writable parent lets someone swap the directory below it.
         // $HOME and ~/.valorbrain may be symlinks a person made; their targets are checked.
-        const reason = safe(homedir(), 'dir', true) || safe(dirname(dirname(root)), 'dir', true) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
+        const reason = safe(homedir(), 'dir', { follow: true, home: true }) || safe(dirname(dirname(root)), 'dir', { follow: true }) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
         if (reason) return { error: `refusing to run ${version}: ${reason}` };
     } catch {
         return { error: `version ${version} is not installed` };

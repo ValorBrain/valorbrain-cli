@@ -690,16 +690,33 @@ test('tryLock: two processes breaking the same stale lock — exactly one wins, 
     assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-')), [], 'no .own-/.break- leftovers');
 });
 
-test('$HOME writable by group/others: install and heal refuse (and never chmod $HOME); the launcher refuses too', async () => {
+test('$HOME: group-writable (0775, user private groups) works silently; world-writable (0777) is refused by install, heal and the launcher; $HOME is never chmodded', async () => {
     const { server, url } = await stubEngine();
+    // 0775: installs, runs, says nothing.
+    const ok = home();
+    chmodSync(ok, 0o775);
+    assert.equal(ensureClientRoot(ok), '');
+    assert.equal((await install(ok, url)).code, 0);
+    assert.equal(statSync(ok).mode & 0o777, 0o775, '$HOME left as it was');
+    assert.ok(existsSync(launcherPath(ok)));
+    writeHealState(ok, { ...readHealState(ok), lastHealAt: Date.now() });
+    const ran = await launch(ok, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+    assert.match(ran.stdout, /recall/);
+    assert.equal(ran.stderr, '', 'no line per event');
+    await launch(ok, url, ['heal', '--harness=claude-code']);
+    const okLog = join(ok, '.valorbrain', 'connect.log');
+    assert.equal(existsSync(okLog) && /writable/.test(readFileSync(okLog, 'utf-8')), false);
+    chmodSync(ok, 0o700);
+    // 0777: refused at install (hooks stay on npx), $HOME untouched.
     const h = home();
-    chmodSync(h, 0o775);
-    assert.match(ensureClientRoot(h), /is writable by others/);
+    chmodSync(h, 0o777);
+    assert.match(ensureClientRoot(h), /is writable by everyone/);
     const r = await install(h, url);
-    assert.equal(statSync(h).mode & 0o777, 0o775, '$HOME left as it was');
-    assert.match(r.stdout, /unsafe client directory: .* is writable by others/);
+    assert.equal(statSync(h).mode & 0o777, 0o777, '$HOME left as it was');
+    assert.match(r.stdout, /unsafe client directory: .* is writable by everyone/);
     assert.equal(existsSync(launcherPath(h)), false);
-    // Installed while safe, then $HOME opened up: the launcher stays silent.
+    chmodSync(h, 0o700);
+    // Installed while safe, then $HOME opened to everyone: the launcher stays silent, one stderr line.
     const g = home();
     assert.equal((await install(g, url)).code, 0);
     writeHealState(g, { ...readHealState(g), lastHealAt: Date.now() });
@@ -708,6 +725,37 @@ test('$HOME writable by group/others: install and heal refuse (and never chmod $
     server.close();
     assert.equal(out.code, 0);
     assert.equal(out.stdout.trim(), '{}');
-    assert.match(out.stderr, new RegExp(`${g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is writable by others`));
+    assert.equal(out.stderr.trim().split('\n').length, 1);
+    assert.match(out.stderr, new RegExp(`${g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is writable by everyone`));
     chmodSync(g, 0o700);
+});
+
+test('tryLock without hard links (EPERM / ENOTSUP / EXDEV): wx-create + re-check, same guarantees', () => {
+    for (const code of ['EPERM', 'ENOTSUP', 'EXDEV']) {
+        const h = home();
+        const lock = join(h, '.lock-0.11.7');
+        const link = () => { throw Object.assign(new Error(`link: ${code}`), { code }); };
+        // Acquire, held, release.
+        const t = tryLock(lock, { link });
+        assert.ok(t, code);
+        assert.equal(readFileSync(lock, 'utf-8'), t);
+        assert.equal(tryLock(lock, { link }), null, `${code}: held`);
+        releaseLock(lock, 'not-mine');
+        assert.ok(existsSync(lock));
+        releaseLock(lock, t);
+        assert.equal(existsSync(lock), false);
+        // Two breakers of one stale lock: exactly one wins.
+        writeFileSync(lock, 'crashed-heal');
+        const old = (Date.now() - 10 * 60_000) / 1000;
+        utimesSync(lock, old, old);
+        let inner = null;
+        const outer = tryLock(lock, { link, onStale: () => { inner = tryLock(lock, { link }); } });
+        const winners = [outer, inner].filter(Boolean);
+        assert.equal(winners.length, 1, `${code}: outer=${outer} inner=${inner}`);
+        assert.equal(readFileSync(lock, 'utf-8'), winners[0]);
+        assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-') && f !== '.lock-0.11.7'), [], `${code}: no leftovers`);
+    }
+    // Any other link error is a real failure, not a silent fallback.
+    const h = home();
+    assert.throws(() => tryLock(join(h, '.lock-x'), { link: () => { throw Object.assign(new Error('io'), { code: 'EIO' }); } }), /io/);
 });

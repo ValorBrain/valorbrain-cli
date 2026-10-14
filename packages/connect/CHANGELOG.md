@@ -13,10 +13,14 @@ instalações 0.11.0 sem ninguém mexer: só muda `~/.valorbrain/bin/connect/`.
     arquivo movido é o mesmo que se viu vencido. Se não for, ele volta para o
     lugar e esse heal desiste.
   - Só quem tem o token solta o lock.
-- **`$HOME` gravável por outros.** No Linux e no macOS, um `$HOME` de outro
-  usuário ou gravável por grupo/outros é recusado como os demais diretórios da
-  cadeia, na instalação, no heal e no launcher. O connect nunca muda a
-  permissão do `$HOME`.
+  - Em sistema de arquivos sem hard link (FAT/exFAT, alguns mounts de rede:
+    `EPERM`, `ENOTSUP`, `EXDEV`), o lock é criado com `wx` e o token é relido
+    para confirmar. As mesmas garantias valem.
+- **`$HOME` gravável por todos.** No Linux e no macOS, um `$HOME` de outro
+  usuário ou gravável por todos (o+w) é recusado como os demais diretórios da
+  cadeia, na instalação, no heal e no launcher. Gravável só pelo grupo
+  (0775/2775, grupo privado por usuário) é aceito sem aviso. O connect nunca
+  muda a permissão do `$HOME`.
 - **Teste determinístico da corrida no `placeVersion`.** Uma barreira (só para
   teste) faz os dois heals passarem pela checagem "já instalado?" antes de
   qualquer um renomear. Com o lock, um só preenche e a primeira cópia nunca é

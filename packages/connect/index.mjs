@@ -198,10 +198,10 @@ hook …, on every system; updates swap the version it runs under
 touch the harness files again. An update that would collect more by default
 than you installed under waits for you to run this installer.
 VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
-launcher refuses to run unless $HOME, ~/.valorbrain, bin/, connect/ and the
-version it runs are yours and not writable by others ($HOME is never
-chmodded); on Windows only the symlink and type checks apply (there are no
-uid or mode bits).
+launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version it
+runs are yours and not writable by others, and $HOME is yours and not
+world-writable (group write is fine there; $HOME is never chmodded). On
+Windows only the symlink and type checks apply (there are no uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
 this package before a single file is written; an unsigned or altered one is
@@ -403,12 +403,13 @@ const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
  * Create ~/.valorbrain/bin/connect and make the whole chain ours: every hook
  * runs code from there, so a directory on the way that another user owns or
  * can write to would let them swap `connect/` for their own. `$HOME` itself
- * must be ours and not group/other-writable — it is never chmodded (not ours
- * to change), only refused. `.valorbrain` and `bin` lose group/other write,
- * `connect` is 0700; anything not ours, a symlink for `bin` or `connect`, or
- * still writable by others is refused — '' when safe, else the reason. Paths
- * a shell or a JSON string would have to escape are refused too (the launcher
- * path is substituted as plain text).
+ * must be ours and not world-writable; group write is allowed there (homes of
+ * 0775/2775 under user private groups are common) and `$HOME` is never
+ * chmodded (not ours to change), only refused. `.valorbrain` and `bin` lose
+ * group/other write, `connect` is 0700; anything not ours, a symlink for
+ * `bin` or `connect`, or still writable by others is refused — '' when safe,
+ * else the reason. Paths a shell or a JSON string would have to escape are
+ * refused too (the launcher path is substituted as plain text).
  * Windows: no uid or mode bits to check (ACLs), only type and symlink.
  */
 export function ensureClientRoot(home) {
@@ -418,7 +419,7 @@ export function ensureClientRoot(home) {
     if (posix) {
       const st = statSync(home);
       if (st.uid !== process.getuid()) return `${home} belongs to another user`;
-      if ((st.mode & 0o022) !== 0) return `${home} is writable by others`;
+      if ((st.mode & 0o002) !== 0) return `${home} is writable by everyone`;
     }
     const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
     for (const [i, d] of chain.entries()) {
@@ -517,15 +518,31 @@ function tarballUrlAllowed(url) {
 /** A lock file under the client root: one placer per version at a time; a lock older than this is a crashed heal. */
 const PLACE_LOCK_STALE_MS = 120_000;
 
-/** Create `to` as a hard link to `from`: atomic, and fails EEXIST when `to` exists. */
-function linkNew(from, to) {
+/** Errors of a filesystem without hard links (FAT/exFAT, some network mounts). */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"]);
+
+/**
+ * Create `to` holding `from`'s content, failing (false) when `to` exists. A
+ * hard link is atomic and never half-written. Where hard links are not
+ * supported, a `wx` create of the same content, then a re-read that it still
+ * holds it. `link` is the seam tests use to simulate such a filesystem.
+ */
+function linkNew(from, to, link = linkSync) {
   try {
-    linkSync(from, to);
+    link(from, to);
     return true;
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    if (!NO_HARD_LINKS.has(err?.code)) throw err;
+  }
+  const content = readFileSync(from, "utf-8");
+  try {
+    writeFileSync(to, content, { mode: 0o600, flag: "wx" });
   } catch (err) {
     if (err?.code === "EEXIST") return false;
     throw err;
   }
+  return readOrNull(to) === content;
 }
 
 function readOrNull(path) {
@@ -535,40 +552,42 @@ function readOrNull(path) {
 /**
  * Take the lock at `path`: the token written into it, or null when someone
  * else holds it. The lock is created by hard-linking a file that already holds
- * our unique token (atomic, no half-written lock). A stale lock is broken by
- * RENAMING it away and checking that what moved is the stale one we read: two
- * breakers can never both win, because the second rename either finds nothing
- * or moves the first one's fresh lock — which it puts back and gives up.
- * `onStale` (tests) runs between seeing a stale lock and breaking it.
+ * our unique token (atomic, no half-written lock; `wx` + re-check where there
+ * are no hard links). A stale lock is broken by RENAMING it away and checking
+ * that what moved is the stale one we read: two breakers can never both win,
+ * because the second rename either finds nothing or moves the first one's
+ * fresh lock — which it puts back and gives up.
+ * Seams for tests: `onStale` runs between seeing a stale lock and breaking it;
+ * `link` replaces fs.linkSync.
  */
-export function tryLock(path, { staleMs = PLACE_LOCK_STALE_MS, now = () => Date.now(), onStale } = {}) {
+export function tryLock(path, { staleMs = PLACE_LOCK_STALE_MS, now = () => Date.now(), onStale, link = linkSync } = {}) {
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   const mine = `${path}.own-${token}`;
   writeFileSync(mine, token, { mode: 0o600, flag: "wx" });
   try {
-    if (linkNew(mine, path)) return token;
+    if (linkNew(mine, path, link)) return token;
     let seen;
     try {
       if (now() - statSync(path).mtimeMs <= staleMs) return null;
       seen = readFileSync(path, "utf-8");
     } catch {
-      return linkNew(mine, path) ? token : null; // released meanwhile
+      return linkNew(mine, path, link) ? token : null; // released meanwhile
     }
     onStale?.();
     const moved = `${path}.break-${token}`;
     try {
       renameSync(path, moved);
     } catch {
-      return linkNew(mine, path) ? token : null; // someone else broke it first
+      return linkNew(mine, path, link) ? token : null; // someone else broke it first
     }
     if (readOrNull(moved) !== seen) {
       // We moved a live lock that replaced the stale one: put it back, it is theirs.
-      try { linkNew(moved, path); } catch { /* fail-safe: we do not hold it */ }
+      try { linkNew(moved, path, link); } catch { /* fail-safe: we do not hold it */ }
       try { unlinkSync(moved); } catch { /* gone */ }
       return null;
     }
     unlinkSync(moved);
-    return linkNew(mine, path) ? token : null;
+    return linkNew(mine, path, link) ? token : null;
   } finally {
     try { unlinkSync(mine); } catch { /* gone */ }
   }
