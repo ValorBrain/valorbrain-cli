@@ -154,9 +154,25 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
   máquina inteira com `VALORBRAIN_CHECKPOINT=off` — que vence o arquivo nos dois
   sentidos (`VALORBRAIN_CHECKPOINT=on` religa). No Gemini CLI, que roda os hooks
   sem o ambiente, só o arquivo vale.
-- **Transcript do Hermes**: só com opt-in,
-  `npx -y @valorbrain/connect --harness hermes --transcript on` (ou
-  `VALORBRAIN_SEND_TRANSCRIPT=on`). Os outros harnesses nunca enviam transcript.
+- **Transcript da sessão**: só com opt-in, desligado por padrão. Liga por
+  harness com `npx -y @valorbrain/connect --harness <id> --transcript on`
+  (grava `send_transcript: true`; `--transcript off` desliga), ou na máquina
+  inteira com `VALORBRAIN_SEND_TRANSCRIPT=on|off`, que vence o arquivo nos dois
+  sentidos.
+  - **Hermes:** o plugin de memória envia o transcript aos hooks de extração.
+  - **Claude Code e Grok:** o hook de Stop envia o arquivo de transcript da
+    sessão para `/api/v1/hooks/run` (`episode-extractor`, que cria o documento
+    da conversa e os episódios, e depois `decision-extractor`). A primeira vez
+    é depois de 3 turnos concluídos; depois disso, só quando o arquivo cresceu
+    e no máximo a cada 10 min por sessão. Turnos que só continuam um bloqueio
+    (`stop_hook_active`) e sessões via SDK não enviam.
+  - O envio roda em segundo plano e o hook não espera por ele. O limite é de
+    8 MiB: um arquivo maior manda o final.
+  - Falhas viram uma linha em `~/.valorbrain/connect.log`, nunca o conteúdo.
+    Depois de 401/403/413 o envio pausa 6 h; depois de 429, 30 min.
+  - **Codex e Gemini CLI** também informam um transcript, mas o engine ainda
+    não lê esses formatos, então nada é enviado. **Kiro e Cursor** não
+    informam transcript.
 
 ## Login pelo navegador (0.6)
 
@@ -253,7 +269,7 @@ por diretório.
 ### Hooks (protocolo v2, ADR-058)
 
 Desde a 0.5.0 os hooks cobrem três momentos. Nenhum deles roda LLM do
-ValorBrain nem envia transcript:
+ValorBrain nem envia transcript (exceto com `--transcript on`, acima):
 
 | momento | o que faz |
 |---|---|

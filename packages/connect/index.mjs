@@ -54,6 +54,8 @@ const WARN = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[33m!\x1b[0m" 
 
 /** Flag each saved switch answers to (`--prompt off` → send_prompt). */
 const SWITCH_FLAGS = { send_prompt: "prompt", send_transcript: "transcript", checkpoint: "checkpoint" };
+/** Harnesses whose transcript `--transcript on` sends: the Hermes plugin, and the Stop hook where the engine parses the format. */
+const TRANSCRIPT_HARNESSES = new Set(["hermes", "claude-code", "grok"]);
 
 /** Artifacts that act on every turn — what --mcp-only leaves out. */
 export const isPerTurn = (artifact) => artifact?.kind === "hooks";
@@ -162,8 +164,11 @@ Options
                     Only changes ~/.valorbrain/connect.json for the harnesses
                     named (or every one saved there) and exits.
                     VALORBRAIN_SEND_PROMPT=off does the same for the whole machine.
-  --transcript on|off  Hermes only: upload the session transcript to the
-                    extraction hooks (default off).
+  --transcript on|off  upload the session transcript for conversation memory
+                    (default off). Hermes: its memory plugin. Claude Code and
+                    Grok: the Stop hook, in the background, after 3 turns and
+                    then at most every 10 min while the file grows. Saved like
+                    --prompt; VALORBRAIN_SEND_TRANSCRIPT=off|on wins over it.
   --checkpoint on|off  let the Stop hook ask the agent for a short memory
                     checkpoint every few turns (default on). Saved like
                     --prompt; VALORBRAIN_CHECKPOINT=off|on wins over it. Gemini
@@ -1255,8 +1260,8 @@ async function main() {
       setPrivacy(home, id, args.privacy);
       const what = privacy.map((k) => `${SWITCH_FLAGS[k]} ${args.privacy[k] ? "on" : "off"}`).join(", ");
       console.log(`${C.green}✓${C.off} ${id}: ${what} ${C.dim}(${credsPath(home).replace(home, "~")})${C.off}`);
-      if ("send_transcript" in args.privacy && id !== "hermes") {
-        console.log(`  ${C.dim}note: only the Hermes plugin has a transcript to send; ${id} never sends one${C.off}`);
+      if ("send_transcript" in args.privacy && !TRANSCRIPT_HARNESSES.has(id)) {
+        console.log(`  ${C.dim}note: ${id} has no transcript ValorBrain can read — nothing is sent (works for: ${[...TRANSCRIPT_HARNESSES].join(", ")})${C.off}`);
       }
     }
     // The switches exit before any install: an --mcp-only next to them is not

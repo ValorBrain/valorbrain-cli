@@ -1,5 +1,32 @@
 # Changelog — @valorbrain/connect
 
+## 0.10.1 — 2026-10-14
+
+- **Transcript opt-in no Claude Code e no Grok.** Com `--transcript on`
+  (`send_transcript: true` em `connect.json`) ou `VALORBRAIN_SEND_TRANSCRIPT=on`,
+  que vence o arquivo nos dois sentidos, o hook de Stop manda o transcript da
+  sessão para `/api/v1/hooks/run`: `episode-extractor` (documento da conversa
+  em `claude-transcripts` e episódios), depois `decision-extractor`. O padrão
+  continua desligado; sem opt-in nada muda.
+  - **Quando:** a primeira vez depois de 3 Stops concluídos na sessão. Depois
+    disso, só quando o arquivo cresceu e já passaram 10 min desde o último
+    envio. Stop que continua um bloqueio (`stop_hook_active`), sessão via SDK e
+    o mesmo Stop entregue por dois arquivos não contam.
+  - **Limite por harness:** 8 envios por 10 min (16 chamadas, contra o limite de
+    40 do engine por token).
+  - **Como:** o hook só decide, sob um lock por harness, e dispara
+    `transcript-upload` em segundo plano; ele nunca espera o envio. O token não
+    vai no argv.
+  - **Tamanho:** até 8 MiB. Um arquivo maior manda o final, com as linhas
+    cortadas do início trocadas por linhas vazias, para que o cursor de linhas
+    do engine não se perca. Os hooks de extração legados também passaram a
+    mandar o final, não mais o começo.
+  - **Falhas:** uma linha em `connect.log`, sem conteúdo. 401/403/413 pausam o
+    envio por 6 h; 429, por 30 min.
+  - Codex e Gemini CLI informam um transcript em formatos que o engine não lê,
+    e Kiro e Cursor não informam nenhum: nada é enviado por eles. O
+    `--transcript on` nesses harnesses avisa isso.
+
 ## 0.10.0 — 2026-10-14
 
 - **Hooks sem npx a cada evento.** A instalação pede ao engine o manifesto
