@@ -31,6 +31,28 @@
   apaga na hora quando nenhum harness usa mais a versão.
 - `CLIENT_VERSION` e o estado do heal (`connect-state.json`) passaram para o
   `hook.mjs`, que roda sozinho como cliente local.
+- **Instalação troca hooks self-hosted pelos hospedados.** `valorbrain hook`,
+  `valorbrain-hook-env hook`, `vbhook` e `clawmem hook` saem dos arquivos de
+  hooks que a instalação escreve, comando a comando: hooks de terceiros ficam,
+  mesmo no mesmo grupo. O plano lista os nomes (também no `--dry-run`) e fica
+  o `.valorbrain-bak`.
+  - Kiro: o standalone self-hosted é substituído inteiro. Com
+    `--kiro-engine=legacy`, é apagado ao lado do agent config.
+  - Até a 0.9, a instalação somava 3 hooks hospedados aos 8 self-hosted do
+    Claude Code: contexto duas vezes por prompt e os extratores mais o
+    checkpoint no Stop.
+  - O self-heal nunca remove hooks self-hosted. Se houver hospedados e
+    self-hosted no mesmo arquivo, escreve uma linha por heal em `connect.log`
+    com o comando que resolve. `--remove` e `--mcp-only` só mexem nas entradas
+    do connect.
+- `connect-state.json` é gravado com tmp + rename: um leitor concorrente não
+  vê mais arquivo pela metade e não perde `written`/`hook_clients`.
+  `hook_clients` é guardado por harness e por caminho, então o mesmo harness em
+  dois escopos não apaga a versão do outro.
+- O heal roda `npx --no-update-notifier --loglevel=warn -y …@<pin> heal`, sem
+  os avisos do npm 12. Ele não usa `--prefer-offline`: logo depois de um bump
+  de pin, o packument em cache não tem a versão nova e o npm falharia com
+  ETARGET.
 
 ## 0.9.0 — 2026-10-12
 
