@@ -8,7 +8,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { planFor, scopedManifest, staleKiroFiles, detectKiroMode, kiroEngineFromPayload, kiroProjectHasOurHooks } = await import('../index.mjs');
+const { planFor, scopedManifest, staleKiroFiles, detectKiroMode, kiroProjectHasOurHooks } = await import('../index.mjs');
+const { kiroEngineFromPayload } = await import('../hook.mjs');
 
 const HOME = '/home/customer';
 const CWD = '/work/proj';

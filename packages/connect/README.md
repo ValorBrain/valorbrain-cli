@@ -276,6 +276,52 @@ Para desligar o checkpoint de um harness, `--checkpoint off` (fica em
 numa máquina inteira, `VALORBRAIN_CHECKPOINT=off` no ambiente do harness, que
 vence o arquivo. A mesma variável no engine desliga para todos.
 
+### Cliente local do hook (0.10)
+
+Rodar o hook por `npx -y @valorbrain/connect@<versão> hook …` custa a
+resolução do pacote a cada evento: ~650–700 ms com o cache do npm quente,
+medido num servidor Linux, e mais na primeira vez. A partir da 0.10 o
+instalador pede ao engine o manifesto `client=local` e grava os hooks assim:
+
+```
+node "/home/você/.valorbrain/bin/connect/0.10.0/hook.mjs" hook prompt --harness=claude-code || npx -y @valorbrain/connect@0.10.0 hook prompt --harness=claude-code
+```
+
+O mesmo evento cai para 27–55 ms.
+
+- **O que é instalado.** `hook.mjs` e `manifest-signature.mjs`, só módulos
+  nativos do node, copiados para `~/.valorbrain/bin/connect/<versão>/`, com
+  diretório 0700, arquivos 0644, escrita tmp + rename e uma pasta por versão. O
+  caminho entra no comando depois de conferida a assinatura do manifesto, como
+  o token.
+- **Se o arquivo sumir**, o `node` sai antes de ler o stdin e o `npx` da versão
+  fixada atende o mesmo evento. O OpenCode, que roda um argv sem shell, escolhe
+  o fallback no próprio plugin.
+- **Windows continua no npx.** O Gemini CLI usa o Windows PowerShell 5.1
+  quando não há pwsh, e lá o `||` não existe. `VALORBRAIN_HOOK_CLIENT=local`
+  força o cliente local e `=npx` o desliga em qualquer sistema.
+- **Versão fixada pelo engine.** Se o engine fixa outra versão
+  (`hook_client_version`), o instalador grava o npx daquela versão, e é ela que
+  instala a própria cópia local.
+- **Self-heal fora do caminho do hook.** O cliente local nunca espera o heal.
+  Quando ele vence (a cada 6 h, `lastHealAt` em
+  `~/.valorbrain/connect-state.json`), o cliente dispara em segundo plano um
+  processo que confere a assinatura do manifesto e roda
+  `npx -y @valorbrain/connect@<hook_client_version> heal --harness=<id>`, e
+  responde ao harness na hora. Nunca roda `latest`, faixa de versões ou versão
+  anterior à 0.10.0.
+- **Troca de versão.** Quando o engine sobe a versão fixada, esse heal instala
+  a cópia nova e reescreve os hooks. As outras regras do heal continuam
+  valendo: arquivo editado à mão fica, `--mcp-only` não ganha hooks nem cópia
+  local, Codex não migra sozinho, e no Kiro o heal não cria um segundo arquivo
+  de hooks.
+- **Vindo do npx.** Um hook npx da 0.10 que ainda não tentou o cliente local
+  faz o heal no primeiro evento, sem esperar as 6 h, uma vez por versão.
+- **Limpeza.** Uma versão que nenhum hook usa é apagada 24 h depois, porque uma
+  sessão aberta do Claude Code mantém os comandos com que começou. `--remove`
+  apaga na hora quando nenhum harness usa mais a versão. O `--status` mostra
+  `client: local <versão>` ou `client: npx <versão>` em cada arquivo de hooks.
+
 ```bash
 npm test   # node --test, sem dependências além do yaml
 ```
