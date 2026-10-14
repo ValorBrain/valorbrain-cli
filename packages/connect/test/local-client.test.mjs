@@ -128,7 +128,7 @@ test('a fresh install asks for client=local, installs the local client and wires
     for (const d of [dirname(file), dirname(dirname(file)), dirname(dirname(dirname(file)))]) {
         assert.equal(statSync(d).mode & 0o777, 0o700, d);
     }
-    assert.match(r.stdout, /local hook client 0\.10\.0/);
+    assert.ok(r.stdout.includes(`local hook client ${CLIENT_VERSION}`), r.stdout);
     assert.deepEqual(readHealState(h).hook_clients, { 'claude-code': { [join(h, '.claude', 'settings.json')]: [CLIENT_VERSION] } });
 });
 
@@ -337,7 +337,7 @@ test('`heal` installs the pinned local client and rewrites hooks; another pin is
     const healed = await cli(h, url, ['heal', '--harness=claude-code']);
     assert.equal(healed.code, 0);
     assert.equal(healed.stdout, '');
-    assert.match(promptCommand(h), /^node ".*\/\.valorbrain\/bin\/connect\/0\.10\.0\/hook\.mjs" hook prompt/);
+    assert.ok(promptCommand(h).startsWith(`node "${localClientFile(h)}" hook prompt`), promptCommand(h));
 
     state.pin = '0.10.5';
     const npx = fakeNpx();
@@ -383,13 +383,13 @@ test('--status names the client: local and its version, or npx and its pin', asy
     const h = home();
     assert.equal((await install(h, url)).code, 0);
     const local = await cli(h, url, ['--status', '--harness', 'claude-code']);
-    assert.match(local.stdout, /hook protocol v2 — client: local 0\.10\.0/);
+    assert.ok(local.stdout.includes(`hook protocol v2 — client: local ${CLIENT_VERSION}`), local.stdout);
     rmSync(dirname(localClientFile(h)), { recursive: true });
-    assert.match((await cli(h, url, ['--status', '--harness', 'claude-code'])).stdout, /client: local 0\.10\.0 \(missing: 0\.10\.0 — those hooks fall back to npx/);
+    assert.ok((await cli(h, url, ['--status', '--harness', 'claude-code'])).stdout.includes(`client: local ${CLIENT_VERSION} (missing: ${CLIENT_VERSION} — those hooks fall back to npx`));
     state.supportsLocal = false;
     const n = home();
     assert.equal((await install(n, url)).code, 0);
-    assert.match((await cli(n, url, ['--status', '--harness', 'claude-code'])).stdout, /hook protocol v2 — client: npx 0\.10\.0/);
+    assert.ok((await cli(n, url, ['--status', '--harness', 'claude-code'])).stdout.includes(`hook protocol v2 — client: npx ${CLIENT_VERSION}`));
     server.close();
     assert.equal(hookClientDetail('npx -y @valorbrain/connect hook prompt', n), 'client: npx (unpinned)');
     assert.deepEqual(hookClientVersions(JSON.stringify({ command: 'node "/h/.valorbrain/bin/connect/0.10.0/hook.mjs" hook stop' })), ['0.10.0']);

@@ -49,7 +49,7 @@ import { fileURLToPath } from 'node:url';
 import { trustedManifestKeys, verifyManifest } from './manifest-signature.mjs';
 
 /** This package's version. Also the directory name of the local hook client. */
-export const CLIENT_VERSION = '0.10.0';
+export const CLIENT_VERSION = '0.10.1';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
@@ -217,8 +217,9 @@ export function writeCreds(home, { api, token, harness, kiroEngine, mcpOnly = fa
 /**
  * What leaves the machine, per harness (PRD decision 18): `send_prompt`
  * (default true — the prompt of each turn goes to /api/v1/hooks/cue for recall),
- * `send_transcript` (default false — only the Hermes plugin has one to
- * send) and `checkpoint` (default true — the Stop hook may ask the agent for a
+ * `send_transcript` (default false — the Hermes plugin, and the Stop hook of
+ * harnesses whose transcript the engine reads: Claude Code, Grok) and
+ * `checkpoint` (default true — the Stop hook may ask the agent for a
  * memory checkpoint). Kept in this harness's entry of connect.json, so
  * `--prompt off` for Codex leaves Claude Code alone.
  */
@@ -261,6 +262,24 @@ export function checkpointEnabled(home, harness, env = {}) {
     if (/^(off|0|false|no)$/.test(v)) return false;
     if (/^(on|1|true|yes)$/.test(v)) return true;
     return readCredsFile(home).harnesses[canonicalHarness(harness)]?.checkpoint !== false;
+}
+
+/**
+ * The transcript switch as chosen (decision 18): VALORBRAIN_SEND_TRANSCRIPT=
+ * off|on (machine-wide), then the harness's `send_transcript` in connect.json
+ * (`--transcript on|off`). null when nobody chose.
+ */
+export function transcriptChoice(home, harness, env = {}) {
+    const v = str(env.VALORBRAIN_SEND_TRANSCRIPT).toLowerCase();
+    if (/^(off|0|false|no)$/.test(v)) return false;
+    if (/^(on|1|true|yes)$/.test(v)) return true;
+    const saved = readCredsFile(home).harnesses[canonicalHarness(harness)]?.send_transcript;
+    return typeof saved === 'boolean' ? saved : null;
+}
+
+/** Whether the Stop hook may upload this harness's session transcript: only an explicit on. */
+export function transcriptSharing(home, harness, env = {}) {
+    return transcriptChoice(home, harness, env) === true;
 }
 
 /** Drop one harness's entry (or all); the file goes when nothing is left. */
@@ -326,6 +345,9 @@ export const EXTRACTION_HOOKS = new Set([
     'decision-extractor', 'episode-extractor', 'handoff-generator',
     'feedback-loop', 'precompact-extract', 'staleness-check',
 ]);
+
+/** Extraction hooks that read nothing but the transcript: with it off the engine returns empty. */
+const TRANSCRIPT_ONLY_HOOKS = new Set(['decision-extractor', 'episode-extractor', 'handoff-generator', 'feedback-loop', 'precompact-extract']);
 
 export function normalizeEvent(name) {
     return EVENT_ALIASES[String(name || '').toLowerCase()] || null;
@@ -618,10 +640,38 @@ async function legacyContext(api, token, message, timeoutMs, fetchImpl, clientVe
     return (result?.content || []).map((c) => c?.text).filter(Boolean).join('\n').trim();
 }
 
-const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
+export const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 
-/** Legacy explicit extraction hooks (uploads the transcript to /api/v1/hooks/run). */
-async function runExtraction(api, token, name, payload, fetchImpl) {
+/**
+ * A transcript for /api/v1/hooks/run, at most `max` bytes (the engine's
+ * HOOK_TRANSCRIPT_MAX_BYTES). Larger files keep their TAIL, and each dropped
+ * head line becomes an empty line: the engine's extraction cursor counts
+ * lines, so line N of the file stays line N of the upload and a trimmed
+ * upload never re-extracts or skips what the cursor already passed. The cut
+ * falls after a newline, so the UTF-8 stays whole.
+ */
+export function readTranscriptCapped(path, max = MAX_TRANSCRIPT_BYTES) {
+    const buf = readFileSync(path);
+    if (buf.length <= max) return buf.toString('utf-8');
+    let start = buf.indexOf(0x0a, buf.length - max);
+    if (start === -1) return '';
+    start += 1;
+    let dropped = 0;
+    for (let i = buf.indexOf(0x0a); i !== -1 && i < start; i = buf.indexOf(0x0a, i + 1)) dropped++;
+    while (start < buf.length && dropped + (buf.length - start) > max) {
+        const next = buf.indexOf(0x0a, start);
+        if (next === -1) return '\n'.repeat(Math.min(dropped, max));
+        start = next + 1;
+        dropped++;
+    }
+    return '\n'.repeat(dropped) + buf.subarray(start).toString('utf-8');
+}
+
+/**
+ * Legacy explicit extraction hooks (uploads the transcript to /api/v1/hooks/run).
+ * `withTranscript: false` (an explicit `send_transcript` off) never reads it.
+ */
+async function runExtraction(api, token, name, payload, fetchImpl, { withTranscript = true } = {}) {
     const input = {
         sessionId: payload?.session_id || payload?.sessionId,
         prompt: payload?.prompt,
@@ -630,9 +680,9 @@ async function runExtraction(api, token, name, payload, fetchImpl) {
         lastAssistantMessage: payload?.last_assistant_message || payload?.lastAssistantMessage,
     };
     let transcript = '';
-    const tp = payload?.transcript_path || payload?.transcriptPath;
+    const tp = withTranscript ? (payload?.transcript_path || payload?.transcriptPath) : '';
     if (tp && existsSync(tp)) {
-        try { transcript = readFileSync(tp, 'utf-8').slice(0, MAX_TRANSCRIPT_BYTES); } catch { transcript = ''; }
+        try { transcript = readTranscriptCapped(tp); } catch { transcript = ''; }
     }
     const res = await fetchImpl(`${api}/api/v1/hooks/run`, {
         method: 'POST',
@@ -691,7 +741,16 @@ export async function runHook(argv, deps = {}) {
         : Promise.resolve();
 
     if (EXTRACTION_HOOKS.has(name)) {
-        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl).catch(() => false), heal]);
+        // Wiring an extraction hook by hand is itself the opt-in (as in 0.9),
+        // so an unset switch uploads. An explicit off wins: no transcript is
+        // read or sent, and a hook that only reads the transcript is not
+        // called at all (the engine would return empty and spend the rate limit).
+        const withTranscript = transcriptChoice(home, harness, env) !== false;
+        if (!withTranscript && TRANSCRIPT_ONLY_HOOKS.has(name)) {
+            await heal;
+            return 0;
+        }
+        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript }).catch(() => false), heal]);
         return 0;
     }
     if (!event) {
@@ -776,6 +835,9 @@ export async function runHook(argv, deps = {}) {
     // stays silent and does not touch the state — counting it would count the
     // same turn twice.
     const silent = renderSilentStop(dialect);
+    // Opt-in transcript upload (decision 18), before and independent of the
+    // checkpoint switch. Only decides and spawns: the upload runs detached.
+    try { kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps }); } catch { /* fail-open */ }
     // Opt-out: VALORBRAIN_CHECKPOINT, then this harness's `checkpoint` in
     // connect.json (the engine has its own switch for everyone). And headless
     // runs: an SDK-driven Claude Code session's final message is somebody's
@@ -1048,6 +1110,152 @@ export async function healDispatch(argv, deps = {}) {
     return spawnDetached('npx', args, { env, spawnImpl: deps.spawnImpl }) ? pin : null;
 }
 
+// ─── transcript upload (opt-in, decision 18) ─────────────────────────────────
+//
+// With `send_transcript` on, the Stop hook of a harness whose transcript the
+// engine can read hands it to /api/v1/hooks/run — `episode-extractor`
+// (conversation doc + episodes), then `decision-extractor` — as the
+// self-hosted Stop hooks do with the local file. The hook only decides and
+// spawns `transcript-upload` detached; it never waits for the upload.
+//
+// Which harnesses: Claude Code (transcript_path, JSONL the engine parses) and
+// Grok (transcriptPath, the engine's ACP parser). Codex and Gemini send a
+// transcript_path too, but in formats the engine does not parse (Codex rollout
+// `response_item` lines, Gemini's single JSON file): an upload would ingest
+// nothing. Kiro and Cursor send none.
+
+const TRANSCRIPT_DIALECTS = new Set(['claude', 'grok']);
+/** Later uploads of a session: at most one per this interval (growth required). */
+const TRANSCRIPT_INTERVAL_MS = 10 * MIN;
+/** First upload of a session: after this many completed turns (a one-shot `-p` run never uploads). */
+const TRANSCRIPT_FIRST_AFTER_STOPS = 3;
+/** Per harness: 8 uploads × 2 calls = 16 of the engine's 40 hooks/run per token per 10 min. */
+const TRANSCRIPT_WINDOW_MS = 10 * MIN;
+const TRANSCRIPT_MAX_UPLOADS_PER_WINDOW = 8;
+/** Extraction runs an LLM; p95 was ~2 min self-hosted. Detached, so nobody waits. */
+const TRANSCRIPT_REQUEST_TIMEOUT_MS = 180_000;
+const TRANSCRIPT_BACKOFF_MS = { 401: 6 * 60 * MIN, 403: 6 * 60 * MIN, 413: 6 * 60 * MIN, 429: 30 * MIN };
+
+function writeJsonAtomic(path, value) {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    renameSync(tmp, path);
+}
+
+function transcriptHarnessPath(home, harness) {
+    return join(stateDir(home), `transcript-${harness}.json`);
+}
+
+function logConnect(home, line) {
+    try { appendFileSync(join(home, '.valorbrain', 'connect.log'), `${new Date().toISOString()} [valorbrain] ${line}\n`); } catch { /* fail-open */ }
+}
+
+/**
+ * Under a per-harness lock: count this Stop for the session and decide whether
+ * its transcript is due. When due, the attempt is recorded before anything is
+ * sent (like the heal throttle): two Stops never both upload, and a failing
+ * upload is not retried on every turn.
+ */
+export function claimTranscriptUpload(home, { harness, key, size, stopId = '', now = Date.now() }) {
+    const lock = acquireLock(home, `transcript-${harness}`, now);
+    if (!lock) return false;
+    try {
+        const sessionPath = join(stateDir(home), `${key}.transcript.json`);
+        const st = { stops: 0, lastSize: 0, lastAt: null, lastStopId: null, ...(readJson(sessionPath) || {}) };
+        // The same Stop delivered through two hook files counts once.
+        if (stopId && stopId === st.lastStopId) return false;
+        st.stops += 1;
+        if (stopId) st.lastStopId = stopId;
+        const h = readJson(transcriptHarnessPath(home, harness)) || {};
+        const window = (Array.isArray(h.uploads) ? h.uploads : []).filter((t) => now - t < TRANSCRIPT_WINDOW_MS);
+        const due = size > st.lastSize
+            && (typeof st.lastAt === 'number' ? now - st.lastAt >= TRANSCRIPT_INTERVAL_MS : st.stops >= TRANSCRIPT_FIRST_AFTER_STOPS)
+            && !(typeof h.backoffUntil === 'number' && now < h.backoffUntil)
+            && window.length < TRANSCRIPT_MAX_UPLOADS_PER_WINDOW;
+        if (due) {
+            st.lastSize = size;
+            st.lastAt = now;
+            writeJsonAtomic(transcriptHarnessPath(home, harness), { ...h, uploads: [...window, now] });
+        }
+        writeJsonAtomic(sessionPath, st);
+        return due;
+    } catch {
+        return false;
+    } finally {
+        releaseLock(lock);
+    }
+}
+
+/** Stop hook: when the opt-in is on and the transcript is due, spawn the detached uploader. */
+function kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps }) {
+    if (!harness || !sessionId || !TRANSCRIPT_DIALECTS.has(dialect)) return false;
+    if (!transcriptSharing(home, harness, env)) return false;
+    // Programmatic runs (SDK) and continuations of a block are not new work.
+    if (/^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) return false;
+    if (!isGenuineCompletion(dialect, payload) || isContinuation(payload, state, now)) return false;
+    const path = str(payload.transcript_path) || str(payload.transcriptPath);
+    if (!path) return false;
+    let size = 0;
+    try { size = statSync(path).size; } catch { return false; }
+    const stopId = str(payload.generation_id) || str(payload.promptId) || str(payload.turn_id);
+    if (!claimTranscriptUpload(home, { harness, key, size, stopId, now })) return false;
+    const cwd = str(payload.cwd) || str(payload.workspaceRoot) || '';
+    const self = deps.self ?? fileURLToPath(import.meta.url);
+    return spawnDetached(process.execPath, [self, 'transcript-upload', `--harness=${harness}`, `--session=${sessionId}`, `--transcript=${path}`, ...(cwd ? [`--cwd=${cwd}`] : [])], { env, spawnImpl: deps.spawnImpl });
+}
+
+/**
+ * Detached: POST the transcript to /api/v1/hooks/run (episode-extractor, then
+ * decision-extractor) with this harness's token. Never logs content: one
+ * connect.log line per failure, and 401/403/413/429 back the harness off.
+ * Returns the hooks that succeeded.
+ */
+export async function uploadTranscript(argv, deps = {}) {
+    const env = deps.env ?? process.env;
+    const home = deps.home ?? env.HOME ?? '';
+    const fetchImpl = deps.fetchImpl ?? ((u, i) => fetch(u, i));
+    const now = deps.now ?? Date.now();
+    const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) || '';
+    const harness = canonicalHarness(arg('harness'));
+    const sessionId = arg('session');
+    const path = arg('transcript');
+    if (!harness || !sessionId || !path) return [];
+    const creds = resolveCredentials({ argv: [], env, home, harness });
+    if (!creds.token) return [];
+    let transcript;
+    try { transcript = readTranscriptCapped(path); } catch { return []; }
+    const input = { sessionId, hookEventName: 'Stop', ...(arg('cwd') ? { workingDir: arg('cwd') } : {}) };
+    const done = [];
+    for (const hook of ['episode-extractor', 'decision-extractor']) {
+        let status = 0;
+        try {
+            const res = await fetchImpl(`${creds.api}/api/v1/hooks/run`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
+                body: JSON.stringify({ hook, input, transcript }),
+                signal: AbortSignal.timeout(TRANSCRIPT_REQUEST_TIMEOUT_MS),
+            });
+            status = res.status;
+            try { await res.arrayBuffer(); } catch { /* drained */ }
+        } catch (e) {
+            logConnect(home, `transcript ${harness}: ${hook} ${e?.name === 'TimeoutError' ? 'timed out' : 'request failed'}`);
+            return done;
+        }
+        if (status >= 200 && status < 300) { done.push(hook); continue; }
+        const backoff = TRANSCRIPT_BACKOFF_MS[status];
+        logConnect(home, `transcript ${harness}: ${hook} HTTP ${status}${backoff ? ` — uploads paused ${Math.round(backoff / MIN)} min` : ''}`);
+        if (backoff) {
+            const lock = acquireLock(home, `transcript-${harness}`, now);
+            try {
+                writeJsonAtomic(transcriptHarnessPath(home, harness), { ...(readJson(transcriptHarnessPath(home, harness)) || {}), backoffUntil: now + backoff });
+            } catch { /* fail-open */ } finally { releaseLock(lock); }
+        }
+        return done;
+    }
+    return done;
+}
+
 /** Parse the harness payload from stdin ('' or invalid JSON → {}). */
 export async function readStdinPayload(stdin = process.stdin) {
     if (stdin.isTTY) return {};
@@ -1089,6 +1297,8 @@ if (invokedDirectly()) {
             .catch(() => process.exit(0));
     } else if (command === 'heal-dispatch') {
         healDispatch(rest).catch(() => null).finally(() => process.exit(0));
+    } else if (command === 'transcript-upload') {
+        uploadTranscript(rest).catch(() => null).finally(() => process.exit(0));
     } else {
         process.stderr.write('usage: node hook.mjs hook <session-start|prompt|stop> --harness=<id>\n');
         process.exitCode = 2;
