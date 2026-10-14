@@ -289,13 +289,20 @@ O checkpoint chega pelo mecanismo de continuação do próprio harness:
 
 | harness | mecanismo |
 |---|---|
-| Claude | `hookSpecificOutput.additionalContext` no `Stop` (aparece como "Stop hook feedback", não como erro) |
+| Claude | `hookSpecificOutput.additionalContext` no `Stop` (aparece como "Stop hook feedback", não como erro; exige Claude Code ≥ 2.1.163) |
 | Codex, Kiro, Grok | `decision:block` |
 | Gemini | `deny` |
 | Cursor | `followup_message` |
 
 O modelo do harness revisa o trabalho e grava via MCP o que for durável, ou
 não grava nada.
+
+No Claude Code, o checkpoint exige a versão 2.1.163 ou mais nova, a primeira
+em que o `Stop` aceita `additionalContext`. Uma versão anterior descarta a saída
+sem aviso e perde o checkpoint daquele turno; o resto do hook não muda. O hook
+não sabe a versão do Claude Code (ela não vem no payload nem no ambiente), por
+isso não há fallback para `decision:block`. Atualize o Claude Code
+(`claude update`).
 
 - **Credencial fora da linha de comando, uma por harness.** O instalador grava
   `~/.valorbrain/connect.json` (0600) com uma entrada por harness, e cada hook

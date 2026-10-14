@@ -475,7 +475,9 @@ export function renderContext(dialect, event, context, payload = {}) {
  * `hookSpecificOutput.additionalContext` on Stop/SubagentStop continues the
  * same way (same `stop_hook_active` guard and continuation cap) and is shown
  * as "Stop hook feedback: …". Its `hookEventName` must be the event the hook
- * ran for, or Claude Code rejects the output.
+ * ran for, or Claude Code rejects the output. Needs Claude Code >= 2.1.163
+ * (older builds drop it silently); the hook cannot see the version, so there
+ * is no decision:block fallback.
  */
 export function renderCheckpoint(dialect, cue, payload = {}) {
     switch (dialect) {
