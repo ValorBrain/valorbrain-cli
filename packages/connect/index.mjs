@@ -30,7 +30,7 @@ import { parseDocument } from "yaml";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  CLIENT_VERSION, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, credsPath, healPin, kiroEngineFromPayload, listCreds,
+  CLIENT_VERSION, HEAL_NPX_FLAGS, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, credsPath, healPin, kiroEngineFromPayload, listCreds,
   manifestHealPin, readCreds, readHealState, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, setPrivacy,
   spawnDetached, writeCreds, writeHealState,
 } from "./hook.mjs";
@@ -1844,7 +1844,7 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
       if (pin && pin !== CLIENT_VERSION) {
         // Only the version the engine pins may run the hooks: it heals with
         // its own local client. This one writes nothing.
-        spawnDetached("npx", ["-y", `@valorbrain/connect@${pin}`, "heal", `--harness=${id}`, ...(engineHint ? [`--caller-engine=${engineHint}`] : [])]);
+        spawnDetached("npx", [...HEAL_NPX_FLAGS, "-y", `@valorbrain/connect@${pin}`, "heal", `--harness=${id}`, ...(engineHint ? [`--caller-engine=${engineHint}`] : [])]);
         return;
       }
       hookClient = pin ? installLocalClient(home) : null;

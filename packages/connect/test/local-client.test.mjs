@@ -250,7 +250,7 @@ test('a due heal is spawned detached: the hook returns before it finishes, pinne
     assert.ok(r.ms < 1500, `hook took ${r.ms}ms`);
     const logged = await waitFor(() => existsSync(npx.log) && readFileSync(npx.log, 'utf-8'));
     server.close();
-    assert.equal(logged.trim(), '-y @valorbrain/connect@0.10.7 heal --harness=claude-code');
+    assert.equal(logged.trim(), '--no-update-notifier --loglevel=warn -y @valorbrain/connect@0.10.7 heal --harness=claude-code');
     // The throttle was claimed by the hook itself.
     assert.ok(Date.now() - readHealState(h).lastHealAt < 30_000);
 });
@@ -294,7 +294,7 @@ test('heal-dispatch runs only a pin the signed manifest names (≥ 0.10.0, exact
     };
     const deps = (fetchImpl) => ({ env: { HOME: h, ...SIGNED_ENV }, home: h, fetchImpl, spawnImpl });
     assert.equal(await healDispatch(['--harness=claude-code', '--caller-engine=v3'], deps(serve(claudeManifest({ pin: '0.10.4', local: true })))), '0.10.4');
-    assert.deepEqual(spawned.pop(), ['npx', '-y', '@valorbrain/connect@0.10.4', 'heal', '--harness=claude-code', '--caller-engine=v3']);
+    assert.deepEqual(spawned.pop(), ['npx', '--no-update-notifier', '--loglevel=warn', '-y', '@valorbrain/connect@0.10.4', 'heal', '--harness=claude-code', '--caller-engine=v3']);
     // Unsigned, a tag, or no harness: nothing runs.
     assert.equal(await healDispatch(['--harness=claude-code'], deps(serve(claudeManifest({ pin: '0.10.4', local: true }), false))), null);
     assert.equal(await healDispatch(['--harness=claude-code'], deps(serve({ ...claudeManifest({ pin: 'latest', local: true }), artifacts: [] }))), null);
@@ -345,7 +345,7 @@ test('`heal` installs the pinned local client and rewrites hooks; another pin is
     await cli(h, url, ['heal', '--harness=claude-code'], { env: npx.env });
     const logged = await waitFor(() => existsSync(npx.log) && readFileSync(npx.log, 'utf-8'));
     server.close();
-    assert.equal(logged.trim(), '-y @valorbrain/connect@0.10.5 heal --harness=claude-code');
+    assert.equal(logged.trim(), '--no-update-notifier --loglevel=warn -y @valorbrain/connect@0.10.5 heal --harness=claude-code');
     assert.equal(readFileSync(join(h, '.claude', 'settings.json'), 'utf-8'), before, '0.10.0 writes nothing for a 0.10.5 pin');
 });
 

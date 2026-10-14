@@ -1012,6 +1012,15 @@ export function kickLocalHeal(argv, payload, deps = {}) {
 }
 
 /**
+ * npx flags for `npx … @<pin> heal`: no update notice, no `npm notice run`
+ * lines (verified on npm 12.0.2; errors still print). Never `--prefer-offline`:
+ * this runs right after a pin bump, when the cached packument predates the new
+ * pin — npm would trust it and fail ETARGET, and the bump would never land.
+ * Off the hot path, a revalidating npx costs nothing anyone waits for.
+ */
+export const HEAL_NPX_FLAGS = ['--no-update-notifier', '--loglevel=warn'];
+
+/**
  * Detached: fetch and verify the manifest, then run the pinned version's heal
  * (`npx -y @valorbrain/connect@<pin> heal --harness=<id>`). Returns the pin
  * started, or null. Never runs a version the signed manifest does not name.
@@ -1035,7 +1044,7 @@ export async function healDispatch(argv, deps = {}) {
     const pin = manifestHealPin(checked.manifest);
     if (!pin) return null;
     const engine = argv.find((a) => /^--caller-engine=(v3|legacy)$/.test(a));
-    const args = ['-y', `@valorbrain/connect@${pin}`, 'heal', `--harness=${harness}`, ...(engine ? [engine] : [])];
+    const args = [...HEAL_NPX_FLAGS, '-y', `@valorbrain/connect@${pin}`, 'heal', `--harness=${harness}`, ...(engine ? [engine] : [])];
     return spawnDetached('npx', args, { env, spawnImpl: deps.spawnImpl }) ? pin : null;
 }
 
