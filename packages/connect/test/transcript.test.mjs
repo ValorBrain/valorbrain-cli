@@ -214,3 +214,47 @@ test('end to end: the local client\'s Stop returns at once; the detached uploade
     assert.equal(got[0].input.sessionId, 'sess-e2e');
     assert.equal(got[0].bytes, readFileSync(transcript, 'utf-8').length);
 });
+
+// ── legacy explicit extraction hooks (Rev446 on #24) ────────────────────────
+
+/** Run one hand-wired extraction hook; returns the hooks/run bodies it sent. */
+async function legacy(h, transcript, { name = 'decision-extractor', env = {} } = {}) {
+    const bodies = [];
+    await runHook([name, '--harness=claude-code'], {
+        env, home: h, now: T0,
+        payload: { hook_event_name: 'Stop', session_id: 'sess-1', transcript_path: transcript, cwd: '/w' },
+        fetchImpl: async (url, init) => { if (String(url).endsWith('/api/v1/hooks/run')) bodies.push(JSON.parse(init.body)); return new Response('{}'); },
+        out: () => {}, err: () => {},
+    });
+    return bodies;
+}
+
+test('legacy extraction hook, switch unset: still uploads the transcript (wiring it by hand is the opt-in, as in 0.9)', async () => {
+    const { h, transcript } = setup({ optIn: false });
+    const [body] = await legacy(h, transcript);
+    assert.equal(body.hook, 'decision-extractor');
+    assert.equal(body.transcript, readFileSync(transcript, 'utf-8'));
+});
+
+test('legacy extraction hook, env off: no transcript read or sent; transcript-only hooks are not called', async () => {
+    const { h, transcript } = setup({ optIn: true });
+    assert.deepEqual(await legacy(h, transcript, { env: { VALORBRAIN_SEND_TRANSCRIPT: 'off' } }), []);
+    // staleness-check does not need the transcript: it still runs, without one.
+    const [body] = await legacy(h, transcript, { name: 'staleness-check', env: { VALORBRAIN_SEND_TRANSCRIPT: 'off' } });
+    assert.equal(body.hook, 'staleness-check');
+    assert.equal(body.transcript, '');
+});
+
+test('legacy extraction hook, connect.json off: same as env off', async () => {
+    const { h, transcript } = setup({ optIn: false });
+    setPrivacy(h, 'claude-code', { send_transcript: false });
+    assert.deepEqual(await legacy(h, transcript), []);
+    assert.equal((await legacy(h, transcript, { name: 'staleness-check' }))[0].transcript, '');
+});
+
+test('legacy extraction hook, env on beats file off: uploads', async () => {
+    const { h, transcript } = setup({ optIn: false });
+    setPrivacy(h, 'claude-code', { send_transcript: false });
+    const [body] = await legacy(h, transcript, { env: { VALORBRAIN_SEND_TRANSCRIPT: 'on' } });
+    assert.equal(body.transcript, readFileSync(transcript, 'utf-8'));
+});

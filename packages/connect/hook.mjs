@@ -265,15 +265,21 @@ export function checkpointEnabled(home, harness, env = {}) {
 }
 
 /**
- * Whether the Stop hook may upload this harness's session transcript (decision
- * 18): VALORBRAIN_SEND_TRANSCRIPT=off|on (machine-wide), then the harness's
- * `send_transcript` in connect.json (`--transcript on`), then OFF.
+ * The transcript switch as chosen (decision 18): VALORBRAIN_SEND_TRANSCRIPT=
+ * off|on (machine-wide), then the harness's `send_transcript` in connect.json
+ * (`--transcript on|off`). null when nobody chose.
  */
-export function transcriptSharing(home, harness, env = {}) {
+export function transcriptChoice(home, harness, env = {}) {
     const v = str(env.VALORBRAIN_SEND_TRANSCRIPT).toLowerCase();
     if (/^(off|0|false|no)$/.test(v)) return false;
     if (/^(on|1|true|yes)$/.test(v)) return true;
-    return readCredsFile(home).harnesses[canonicalHarness(harness)]?.send_transcript === true;
+    const saved = readCredsFile(home).harnesses[canonicalHarness(harness)]?.send_transcript;
+    return typeof saved === 'boolean' ? saved : null;
+}
+
+/** Whether the Stop hook may upload this harness's session transcript: only an explicit on. */
+export function transcriptSharing(home, harness, env = {}) {
+    return transcriptChoice(home, harness, env) === true;
 }
 
 /** Drop one harness's entry (or all); the file goes when nothing is left. */
@@ -339,6 +345,9 @@ export const EXTRACTION_HOOKS = new Set([
     'decision-extractor', 'episode-extractor', 'handoff-generator',
     'feedback-loop', 'precompact-extract', 'staleness-check',
 ]);
+
+/** Extraction hooks that read nothing but the transcript: with it off the engine returns empty. */
+const TRANSCRIPT_ONLY_HOOKS = new Set(['decision-extractor', 'episode-extractor', 'handoff-generator', 'feedback-loop', 'precompact-extract']);
 
 export function normalizeEvent(name) {
     return EVENT_ALIASES[String(name || '').toLowerCase()] || null;
@@ -658,8 +667,11 @@ export function readTranscriptCapped(path, max = MAX_TRANSCRIPT_BYTES) {
     return '\n'.repeat(dropped) + buf.subarray(start).toString('utf-8');
 }
 
-/** Legacy explicit extraction hooks (uploads the transcript to /api/v1/hooks/run). */
-async function runExtraction(api, token, name, payload, fetchImpl) {
+/**
+ * Legacy explicit extraction hooks (uploads the transcript to /api/v1/hooks/run).
+ * `withTranscript: false` (an explicit `send_transcript` off) never reads it.
+ */
+async function runExtraction(api, token, name, payload, fetchImpl, { withTranscript = true } = {}) {
     const input = {
         sessionId: payload?.session_id || payload?.sessionId,
         prompt: payload?.prompt,
@@ -668,7 +680,7 @@ async function runExtraction(api, token, name, payload, fetchImpl) {
         lastAssistantMessage: payload?.last_assistant_message || payload?.lastAssistantMessage,
     };
     let transcript = '';
-    const tp = payload?.transcript_path || payload?.transcriptPath;
+    const tp = withTranscript ? (payload?.transcript_path || payload?.transcriptPath) : '';
     if (tp && existsSync(tp)) {
         try { transcript = readTranscriptCapped(tp); } catch { transcript = ''; }
     }
@@ -729,7 +741,16 @@ export async function runHook(argv, deps = {}) {
         : Promise.resolve();
 
     if (EXTRACTION_HOOKS.has(name)) {
-        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl).catch(() => false), heal]);
+        // Wiring an extraction hook by hand is itself the opt-in (as in 0.9),
+        // so an unset switch uploads. An explicit off wins: no transcript is
+        // read or sent, and a hook that only reads the transcript is not
+        // called at all (the engine would return empty and spend the rate limit).
+        const withTranscript = transcriptChoice(home, harness, env) !== false;
+        if (!withTranscript && TRANSCRIPT_ONLY_HOOKS.has(name)) {
+            await heal;
+            return 0;
+        }
+        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript }).catch(() => false), heal]);
         return 0;
     }
     if (!event) {

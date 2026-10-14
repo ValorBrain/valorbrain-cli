@@ -26,6 +26,12 @@
   - Codex e Gemini CLI informam um transcript em formatos que o engine não lê,
     e Kiro e Cursor não informam nenhum: nada é enviado por eles. O
     `--transcript on` nesses harnesses avisa isso.
+  - **Hooks de extração ligados à mão:** um off explícito (`--transcript off`
+    ou `VALORBRAIN_SEND_TRANSCRIPT=off`) agora vence. O transcript não é lido
+    nem enviado, e os hooks que só leem o transcript não são chamados. Até a
+    0.10.0 esses hooks enviavam o transcript mesmo com o off. Com a chave sem
+    valor, eles continuam enviando como na 0.9, porque ligá-los à mão é o
+    opt-in.
 
 ## 0.10.0 — 2026-10-14
 

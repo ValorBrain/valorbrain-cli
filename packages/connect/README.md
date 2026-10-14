@@ -173,6 +173,14 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
   - **Codex e Gemini CLI** também informam um transcript, mas o engine ainda
     não lê esses formatos, então nada é enviado. **Kiro e Cursor** não
     informam transcript.
+  - **Hooks de extração ligados à mão** (`decision-extractor`,
+    `episode-extractor`, `handoff-generator`, `feedback-loop`,
+    `precompact-extract`, `staleness-check` no comando do hook). Ligar um
+    desses hooks já é o opt-in: com a chave sem valor, ele envia o transcript,
+    como na 0.9. Um **off explícito** (`--transcript off` ou
+    `VALORBRAIN_SEND_TRANSCRIPT=off`) vence: o transcript não é lido nem
+    enviado, e os hooks que só leem o transcript nem são chamados. O
+    `staleness-check` roda sem ele.
 
 ## Login pelo navegador (0.6)
 
