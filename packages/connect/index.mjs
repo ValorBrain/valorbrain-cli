@@ -22,7 +22,7 @@
  * republishing when the rules text changes.
  */
 
-import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
@@ -311,32 +311,126 @@ function mergeJson(existingRaw, renderedRaw, remove) {
 }
 
 /**
+ * Lines of `raw` holding the table `header` (its header line through the line
+ * before the next `[` header, `[[` included) — the range every TOML edit here
+ * replaces or removes. Null when the header is not there.
+ */
+function tomlTableRange(raw, header) {
+  const lines = raw.split("\n");
+  const start = lines.findIndex((l) => l.trim() === header);
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) { end = i; break; }
+  }
+  return { lines, start, end };
+}
+
+/** `raw` without the table `header` (same range rule as tomlTableRange). */
+function dropTomlTable(raw, header) {
+  const table = tomlTableRange(raw, header);
+  if (!table) return raw;
+  table.lines.splice(table.start, table.end - table.start);
+  return table.lines.join("\n");
+}
+
+/** A `[mcp_servers.valorbrain]` body that is hosted: a `url`, no `command`. */
+function hostedTomlBody(lines) {
+  return lines.some((l) => /^\s*url\s*=/.test(l)) && !lines.some((l) => /^\s*command\s*=/.test(l));
+}
+
+/**
  * TOML: replace only our `[mcp_servers.valorbrain]` table. Line-based, because a
  * regex that stops at the first `[` corrupts inline arrays like `args = [ "mcp",]`.
+ * The table's `env` subtable is the self-hosted command's environment: it goes
+ * on remove (same as the engine's remove path) and when a hosted table (`url`)
+ * replaces a self-hosted one — codex refuses `env` on a streamable_http server.
+ * Other subtables (`tools.*` approvals) are the person's and stay.
  */
 function mergeToml(existingRaw, renderedRaw, remove) {
-  const header = "[mcp_servers.valorbrain]";
-  const lines = (existingRaw || "").split("\n");
-  const start = lines.findIndex((l) => l.trim() === header);
-  let end = lines.length;
-  if (start !== -1) {
-    for (let i = start + 1; i < lines.length; i++) {
-      if (/^\s*\[/.test(lines[i])) { end = i; break; }
-    }
-  }
+  const ENV = "[mcp_servers.valorbrain.env]";
+  const table = tomlTableRange(existingRaw || "", "[mcp_servers.valorbrain]");
   const block = renderedRaw.trimEnd().split("\n");
   if (remove) {
-    if (start === -1) return existingRaw;
-    lines.splice(start, end - start);
-    return lines.join("\n");
+    if (!table) return existingRaw;
+    table.lines.splice(table.start, table.end - table.start);
+    return dropTomlTable(table.lines.join("\n"), ENV);
   }
-  if (start !== -1) {
-    lines.splice(start, end - start, ...block, "");
-    return lines.join("\n");
+  if (table) {
+    table.lines.splice(table.start, table.end - table.start, ...block, "");
+    const merged = table.lines.join("\n");
+    return hostedTomlBody(block) ? dropTomlTable(merged, ENV) : merged;
   }
   const base = existingRaw || "";
   const sep = base.length === 0 ? "" : base.endsWith("\n\n") ? "" : base.endsWith("\n") ? "\n" : "\n\n";
   return base + sep + block.join("\n") + "\n";
+}
+
+/** The TOML key each hosted harness reads its Streamable HTTP headers from. */
+const TOML_HEADER_KEY = { codex: "http_headers", grok: "headers" };
+
+/**
+ * Targeted repair of the hosted auth shape in our `[mcp_servers.valorbrain]`
+ * TOML table (codex, grok). connect <= 0.12.0 wrote `url` + `bearer_token`:
+ * grok 1.0.46 never reads that key (handshake "Auth required"; its docs name
+ * only `headers`), and codex 0.160.0 refuses the whole config.toml at startup
+ * ("bearer_token is not supported for streamable_http"). Rewrites ONLY the
+ * `bearer_token` key line into the header key the harness reads — same token,
+ * byte for byte — and drops the self-hosted `[mcp_servers.valorbrain.env]`
+ * subtable a hosted table cannot carry (codex: "env is not supported for
+ * streamable_http"). Every other key, subtable (`tools.*` approvals) and
+ * server is left alone. A table that needs nothing comes back unchanged
+ * (idempotent); a self-hosted table (`command`) is never touched — its `env`
+ * is the credential store the local command reads. Agrees with the engine
+ * render (hostedTomlBody in agentxagi/valorbrain src/harness/adapters.ts).
+ */
+export function repairTomlMcp(existingRaw, harness) {
+  const headerKey = TOML_HEADER_KEY[harness];
+  if (!existingRaw || !headerKey) return existingRaw;
+  const table = tomlTableRange(existingRaw, "[mcp_servers.valorbrain]");
+  if (!table) return existingRaw;
+  const body = table.lines.slice(table.start + 1, table.end);
+  if (!hostedTomlBody(body)) return existingRaw;
+  const bearerIdx = body.findIndex((l) => /^\s*bearer_token\s*=/.test(l));
+  if (bearerIdx !== -1) {
+    const hasHeaders = body.some((l) => new RegExp(`^\\s*${headerKey}\\s*=`).test(l));
+    // Basic or literal string; anything else (unquoted, multi-line): never
+    // guess a credential, leave the file as it is.
+    const m = /^\s*bearer_token\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^'"\\]*)')\s*(?:#.*)?$/.exec(body[bearerIdx]);
+    if (!m && !hasHeaders) return existingRaw;
+    // Headers already there (a hand fix): a second key would be invalid TOML.
+    if (hasHeaders) body.splice(bearerIdx, 1);
+    else body[bearerIdx] = `${headerKey} = { "Authorization" = "Bearer ${m[1] ?? m[2]}" }`;
+  }
+  const out = [...table.lines.slice(0, table.start + 1), ...body, ...table.lines.slice(table.end)].join("\n");
+  return dropTomlTable(out, "[mcp_servers.valorbrain.env]");
+}
+
+/**
+ * The heal's half of the repair: every hosted TOML install on this machine
+ * (codex AND grok, whichever harness's heal runs — codex cannot start with
+ * the broken file, so its own hooks never fire to heal it). In place:
+ * backup, then tmp + rename at the real path (a symlinked dotfile stays a
+ * symlink) with the file's own mode. Returns the paths repaired. Never throws.
+ */
+export function repairInstalledTomlMcp(home) {
+  const repaired = [];
+  for (const [harness, rel] of [["codex", ".codex/config.toml"], ["grok", ".grok/config.toml"]]) {
+    try {
+      const path = realpathSync(join(home, rel));
+      const before = readFileSync(path, "utf-8");
+      const after = repairTomlMcp(before, harness);
+      if (after === before) continue;
+      const mode = statSync(path).mode & 0o7777;
+      writeBackup(path, before);
+      writeFileAtomic(path, after, mode);
+      repaired.push(path);
+      logConnect(home, `${path}: repaired the hosted MCP auth (${TOML_HEADER_KEY[harness]}, same token) — valid from the next ${harness} start`);
+    } catch {
+      /* missing, unreadable or unwritable: the installer still repairs it */
+    }
+  }
+  return repaired;
 }
 
 // ── plan / apply ────────────────────────────────────────────────────────────
@@ -1123,7 +1217,9 @@ function planFor(manifest, token, home, remove, cwd = process.cwd(), { launcher 
         // Hermes: config.yaml é do cliente; mescla por chave, nunca overwrite.
         after = mergeYaml(before, rendered, rm);
       } else if (artifact.kind === "mcp" && path.endsWith(".toml")) {
-        after = mergeToml(before, rendered, rm);
+        // Repair AFTER the merge: even against an engine that still renders
+        // `bearer_token`, what lands on disk is the shape the harness reads.
+        after = rm ? mergeToml(before, rendered, true) : repairTomlMcp(mergeToml(before, rendered, false), String(manifest.harness || ""));
       } else if (artifact.kind === "mcp") {
         after = mergeJson(before ?? "{}", rendered, rm);
       } else if (artifact.kind === "hooks" && path.endsWith(".json") && !/valorbrain/i.test(path)) {
@@ -1445,10 +1541,18 @@ function statusFor(manifest, home) {
     if (artifact.kind === "mcp") {
       const ok = body.includes("valorbrain");
       const tokenSet = !body.includes(TOKEN_PLACEHOLDER);
+      // codex/grok: the hosted table connect <= 0.12.0 wrote (`bearer_token`,
+      // maybe a stale `env` subtable) — codex 0.160 refuses the whole file,
+      // grok never authenticates. Drift until the heal or the installer repairs it.
+      const legacyAuth = path.endsWith(".toml") && repairTomlMcp(body, String(manifest.harness || "")) !== body;
       rows.push({
         kind: "mcp",
-        state: ok ? (tokenSet ? "ok" : "drift") : "missing",
-        detail: ok ? (tokenSet ? "registered" : "registered but token is still the placeholder") : "not registered",
+        state: !ok ? "missing" : legacyAuth ? "drift" : tokenSet ? "ok" : "drift",
+        detail: !ok
+          ? "not registered"
+          : legacyAuth
+            ? `hosted auth in the old shape (\`bearer_token\` / \`env\`) this harness cannot use — the next heal repairs it, or run: npx -y @valorbrain/connect --harness ${manifest.harness}`
+            : tokenSet ? "registered" : "registered but token is still the placeholder",
       });
     } else if (artifact.kind === "hooks") {
       const ours = body.includes("@valorbrain/connect") || body.includes("valorbrain-connect") || hookClientVersions(body).length > 0 || launcherReferenced(body);
@@ -2241,6 +2345,12 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     if (!claimHeal(home, { env: process.env, force, patch: { launcher_tried: CLIENT_VERSION } })) return;
     // 0.11 migration: install ids and consented scope on every saved harness.
     try { ensureInstallIds(home); } catch { /* fail-open */ }
+    // Hosted MCP auth repair (codex/grok TOML): before the manifest fetch, so
+    // neither an engine outage nor a held update keeps a broken file broken.
+    // The plan below never carries `mcp` artifacts (a table the person chose is
+    // theirs), but `bearer_token` under a hosted valorbrain table is the shape
+    // only connect <= 0.12.0 wrote, and it cannot authenticate.
+    for (const path of repairInstalledTomlMcp(home)) console.error(`[valorbrain] ${path}: hosted MCP auth repaired — vale no próximo carregamento`);
     const state = readHealState(home);
     // Modo: SÓ o opt-in registrado (--kiro-engine=legacy no connect.json)
     // decide legado. Agent config nosso em $HOME não prova nada — a 0.5.1

@@ -192,7 +192,9 @@ test('no --token: the CLI logs in through the browser flow and wires each harnes
 
         const claude = JSON.parse(readFileSync(join(h, '.claude.json'), 'utf-8'));
         assert.equal(claude.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_claude');
-        assert.match(readFileSync(join(h, '.codex', 'config.toml'), 'utf-8'), /bearer_token = "vbm_codex"/);
+        // The repair turns even the stub's old bearer_token render into the
+        // header shape codex 0.160.0 accepts.
+        assert.match(readFileSync(join(h, '.codex', 'config.toml'), 'utf-8'), /http_headers = \{ "Authorization" = "Bearer vbm_codex" \}/);
 
         const creds = JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8'));
         assert.equal(creds.harnesses['claude-code'].token, 'vbm_claude');

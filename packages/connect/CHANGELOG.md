@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## 0.12.1 — 2026-10-14
+
+- **Repair of the hosted MCP auth in codex and grok.** connect ≤ 0.12.0
+  wrote `[mcp_servers.valorbrain]` with `url` + `bearer_token`. codex-cli
+  0.160.0 refuses the whole `~/.codex/config.toml` at startup with it
+  ("bearer_token is not supported for streamable_http"; with a leftover
+  `[mcp_servers.valorbrain.env]` also "env is not supported for
+  streamable_http"), and grok 1.0.46 never reads the key (handshake "Auth
+  required"). The table is rewritten to the key each harness reads, with the
+  same token: codex `http_headers = { "Authorization" = "Bearer …" }`, grok
+  `headers = { … }`, and a stale `env` subtable is dropped. Nothing else is
+  touched: other keys, the codex `[mcp_servers.valorbrain.tools.*]` approvals,
+  other servers, a self-hosted table (`command`). The file keeps its mode
+  and a `.valorbrain-bak`; a symlinked config stays a symlink.
+  - **Install** (`--harness codex|grok`): the repair runs after the merge, so
+    an engine that still renders `bearer_token` lands the right shape.
+  - **Heal** (the launcher's `heal`, the hook's detached heal): every heal
+    repairs both files, whichever harness triggered it, before the manifest
+    fetch — codex cannot start with the broken file, so its own hooks never
+    fire. An install on 0.12.0 gets 0.12.1 through the pin; the first heal
+    0.12.1 runs (at most the 6 h throttle later) repairs.
+  - **mergeToml:** a hosted table written over a self-hosted one takes the
+    self-hosted `env` subtable with it.
+  - **`--status`:** the old shape is `drift`, with the command that fixes it.
+
 ## 0.12.0 — 2026-10-14
 
 Publicar só depois do deploy dos leitores de transcript do engine (Codex,
