@@ -48,7 +48,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** This package's version. Also its directory name under ~/.valorbrain/bin/connect/. */
-export const CLIENT_VERSION = '0.12.0';
+export const CLIENT_VERSION = '0.12.1';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
