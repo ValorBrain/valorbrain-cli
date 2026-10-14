@@ -111,6 +111,12 @@ gateway again.
   the local binary in self-hosted mode.
 - **Contract declaration**: the plugin reports the contract version it ships
   with, so the ValorBrain dashboard shows adoption per harness.
+- **Who drives the session (1.10.0)**: the extraction hooks carry
+  `agent_context` and Hermes' session source (`cli`, `oneshot`, `cron`,
+  `telegram`, ...; `agentContext`/`sessionSource` in hosted mode). The engine
+  writes a keyed decision fact only from a person's session: a one-shot
+  `hermes chat -q`/`-z` or cron run gives none (FB-0205,
+  `src/hooks/run-authorship.ts`).
 - **Client identity (1.9.0)**: every `POST /api/v1/hooks/run` and
   `POST /api/v1/runtimes/register` carries `X-ValorBrain-Client:
   hermes-plugin/<version>`, `X-ValorBrain-Harness: hermes` and
