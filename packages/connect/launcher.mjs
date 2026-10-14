@@ -21,7 +21,7 @@
  * the version directory is missing, unreadable or unsafe it writes one line to
  * stderr, prints the harness's empty answer and exits 0.
  */
-import { lstatSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -31,18 +31,40 @@ const harness = (process.argv.find((a) => a.startsWith('--harness=')) || '').sli
 
 /**
  * A directory or file only this user can change: not a symlink, our uid, not
- * group/world-writable. `follow` checks a symlink's target instead (only
- * ~/.valorbrain, which a person may link from their dotfiles). Windows has no
- * uid or mode bits to check (ACLs): there only the type and symlink checks run.
+ * group/world-writable. `follow` checks a symlink's target instead
+ * (~/.valorbrain, which a person may link). A sticky directory is not refused
+ * for write bits: others cannot rename or remove what we own in it. Windows
+ * has no uid or mode bits to check (ACLs): only the type and symlink checks.
  */
-function safe(path, kind, follow = false) {
+function safe(path, kind, { follow = false, writeMask = 0o022 } = {}) {
     const st = follow ? statSync(path) : lstatSync(path);
     if (st.isSymbolicLink()) return `${path} is a symlink`;
     if (kind === 'dir' ? !st.isDirectory() : !st.isFile()) return `${path} is not a ${kind === 'dir' ? 'directory' : 'file'}`;
     if (process.platform === 'win32') return '';
     if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return `${path} belongs to another user`;
-    if ((st.mode & 0o022) !== 0) return `${path} is writable by others`;
+    if ((st.mode & writeMask) !== 0 && !(st.isDirectory() && (st.mode & 0o1000) !== 0)) return `${path} is writable by others`;
     return '';
+}
+
+/**
+ * The directory holding ~/.valorbrain (the real one, from this file's own
+ * path) should be ours and not world-writable; group write is normal there.
+ * A problem with it is never a reason to stop: earlier launchers did not check
+ * it, so refusing here would silence installs that work. It is logged once
+ * (per reason) to connect.log instead; installs refuse it with a person present.
+ */
+function warnAboutHome() {
+    const home = dirname(dirname(dirname(root)));
+    let reason = '';
+    try { reason = safe(home, 'dir', { follow: true, writeMask: 0o002 }); } catch { return; }
+    const marker = join(root, '.home-warning');
+    let seen = null;
+    try { seen = readFileSync(marker, 'utf-8'); } catch { /* first time */ }
+    if (reason === (seen ?? '')) return;
+    try {
+        writeFileSync(marker, reason, { mode: 0o600 });
+        if (reason) appendFileSync(join(dirname(dirname(root)), 'connect.log'), `${new Date().toISOString()} [valorbrain] launcher: ${reason} — fix it with chmod o-w; hooks keep running\n`);
+    } catch { /* fail-open */ }
 }
 
 /** The entry file for this command, or a reason it cannot run. */
@@ -58,12 +80,13 @@ function resolveEntry() {
     const dir = join(root, version);
     const entry = join(dir, command === 'heal' ? 'index.mjs' : 'hook.mjs');
     try {
-        // The whole chain from ~/.valorbrain down: a writable parent lets someone swap the directory below it.
-        const reason = safe(dirname(dirname(root)), 'dir', true) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
+        // The chain from ~/.valorbrain down: a writable parent lets someone swap the directory below it.
+        const reason = safe(dirname(dirname(root)), 'dir', { follow: true }) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
         if (reason) return { error: `refusing to run ${version}: ${reason}` };
     } catch {
         return { error: `version ${version} is not installed` };
     }
+    warnAboutHome();
     return { entry };
 }
 

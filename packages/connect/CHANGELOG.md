@@ -1,5 +1,44 @@
 # Changelog — @valorbrain/connect
 
+## 0.11.1 — 2026-10-14
+
+Pequena, e também é a prova de que uma versão nova chega a todas as
+instalações 0.11.0 sem ninguém mexer: só muda `~/.valorbrain/bin/connect/`.
+
+- **Quebra de lock velho sem corrida.** Antes, dois heals que achavam o mesmo
+  lock vencido podiam os dois apagar e recriar o lock, e cada um se achava o
+  dono.
+  - Agora o lock nasce de um hard link de um arquivo que já tem um token
+    único. O lock vencido é quebrado com um rename atômico, conferindo que o
+    arquivo movido é o mesmo que se viu vencido. Se não for, ele volta para o
+    lugar e esse heal desiste.
+  - Só quem tem o token solta o lock.
+  - Em sistema de arquivos sem hard link (FAT/exFAT, alguns mounts de rede:
+    `EPERM`, `ENOTSUP`, `EXDEV`), o lock é criado com `wx` e o token é relido
+    para confirmar. As mesmas garantias valem.
+- **`$HOME` gravável por todos.** No Linux e no macOS, a instalação (com a
+  pessoa presente) recusa um `$HOME` de outro usuário ou gravável por todos
+  (o+w sem sticky bit). Gravável pelo grupo (0775/2775) e sticky (1777) são
+  aceitos. O connect nunca muda a permissão do `$HOME`.
+  - **Uma atualização automática nunca silencia uma instalação que funciona.**
+    O launcher só registra um problema no `$HOME` uma vez em `connect.log`,
+    nunca recusa por isso. O heal mantém a versão em uso e só deixa de subir
+    para uma versão nova enquanto o `$HOME` estiver gravável por todos (uma
+    linha no log por versão). Testado com o 0.11.0 publicado instalando num
+    `$HOME` 1777 e noutro 0777 e o heal do próprio 0.11.0 trocando para esta
+    versão.
+  - O launcher confere a pasta real que contém o `.valorbrain` (a partir do
+    próprio caminho), não o `homedir()` do ambiente do hook.
+  - Pastas com sticky bit não são recusadas pelos bits de escrita, em nenhum
+    ponto da cadeia.
+  - Um heal já na versão fixada não escreve nada e não checa diretórios.
+- O GC apaga sobras `.lock-<v>.own-*` / `.break-*` de um heal que caiu, depois
+  da janela de lock vencido.
+- **Teste determinístico da corrida no `placeVersion`.** Uma barreira (só para
+  teste) faz os dois heals passarem pela checagem "já instalado?" antes de
+  qualquer um renomear. Com o lock, um só preenche e a primeira cópia nunca é
+  apagada. O mesmo teste falha com o `placeVersion` sem lock da 1ea8d3c.
+
 ## 0.11.0 — 2026-10-14
 
 - **Hooks que se atualizam sozinhos.** A instalação pede `client=launcher` e

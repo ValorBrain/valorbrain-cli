@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,7 @@ import { CLIENT_VERSION, clientHeaders, launcherPin, noticePin, readHealState, r
 import { SIGNED_ENV, signedManifestHeaders } from './signed-stub.mjs';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { downloadClientVersion, gcClientVersions, launcherPath, launcherWanted, planFor, readCurrent, untarPackage } = await import('../index.mjs');
+const { downloadClientVersion, ensureClientRoot, gcClientVersions, launcherPath, launcherWanted, placeVersion, planFor, readCurrent, releaseLock, tryLock, untarPackage } = await import('../index.mjs');
 
 const PKG = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(PKG, 'index.mjs');
@@ -570,11 +570,12 @@ test('directory chain: install takes group/other write off ~/.valorbrain and bin
         chmodSync(dir, 0o755);
     }
     if (process.getuid?.() === 0) {
-        // Someone else's bin/: the heal refuses to install there and logs why, once.
+        // Someone else's bin/: the launcher refuses (0.11.0 refused this too); an
+        // install, with a person present, refuses to write there and says why.
         chownSync(join(h, '.valorbrain', 'bin'), 65534, 65534);
         assert.match((await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD })).stderr, /belongs to another user/);
-        await cli(h, url, ['heal', '--harness=claude-code']);
-        assert.match(readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8'), /unsafe client directory: .*bin belongs to another user/);
+        rmSync(join(h, '.valorbrain', 'bin', 'connect', 'current.json'));
+        assert.match((await install(h, url)).stdout, /unsafe client directory: .*bin belongs to another user/);
         chownSync(join(h, '.valorbrain', 'bin'), 0, 0);
     }
     server.close();
@@ -635,4 +636,185 @@ test('racing heals: two at once place the version once; current.json never names
     const groot = join(g, '.valorbrain', 'bin', 'connect');
     assert.ok(existsSync(join(groot, NEXT, 'hook.mjs')));
     assert.deepEqual(readdirSync(groot).filter((f) => f.startsWith('.')), []);
+});
+
+// ── 0.11.1: deterministic race, stale-lock race, $HOME (review notes on #26) ─
+
+test('placeVersion race (deterministic): both placers reach the "installed?" check before either renames — one fill, the first copy is never removed', async () => {
+    const h = home();
+    assert.equal(ensureClientRoot(h), '');
+    const v = '0.11.7';
+    // Barrier: each placer waits here until the other arrives too (or 400 ms pass,
+    // which is what a placer blocked behind the lock makes happen).
+    let arrived = 0;
+    let open;
+    const both = new Promise((r) => { open = r; });
+    const barrier = async () => {
+        if (++arrived === 2) open();
+        await Promise.race([both, new Promise((r) => setTimeout(r, 400))]);
+    };
+    const fills = [];
+    const fill = (who) => (tmp) => {
+        fills.push(who);
+        writeFileSync(join(tmp, 'package.json'), JSON.stringify({ version: v }));
+        writeFileSync(join(tmp, 'hook.mjs'), who);
+        writeFileSync(join(tmp, 'index.mjs'), '');
+    };
+    await Promise.all([placeVersion(h, v, fill('A'), { onChecked: barrier }), placeVersion(h, v, fill('B'), { onChecked: barrier })]);
+    assert.deepEqual(fills, ['A'], 'the second placer found the version complete and filled nothing');
+    assert.equal(readFileSync(join(h, '.valorbrain', 'bin', 'connect', v, 'hook.mjs'), 'utf-8'), 'A', 'the first copy was never removed');
+    assert.deepEqual(readdirSync(join(h, '.valorbrain', 'bin', 'connect')).filter((f) => f.startsWith('.')), []);
+});
+
+test('tryLock: two processes breaking the same stale lock — exactly one wins, and the loser does not release it', () => {
+    const h = home();
+    const lock = join(h, '.lock-0.11.7');
+    writeFileSync(lock, 'crashed-heal');
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    utimesSync(lock, old, old);
+    // The second breaker runs exactly between the first one seeing the stale lock and breaking it.
+    let inner = null;
+    const outer = tryLock(lock, { onStale: () => { inner = tryLock(lock); } });
+    const winners = [outer, inner].filter(Boolean);
+    assert.equal(winners.length, 1, `outer=${outer} inner=${inner}`);
+    assert.equal(readFileSync(lock, 'utf-8'), winners[0]);
+    releaseLock(lock, outer || 'not-mine'); // the loser's release
+    releaseLock(lock, inner || 'not-mine');
+    assert.equal(existsSync(lock), false, 'only the winner removed it');
+    // A fresh lock is never broken, and a held one cannot be taken.
+    const t = tryLock(lock);
+    assert.ok(t);
+    assert.equal(tryLock(lock), null);
+    releaseLock(lock, 'someone-else');
+    assert.equal(readFileSync(lock, 'utf-8'), t);
+    releaseLock(lock, t);
+    assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-')), [], 'no .own-/.break- leftovers');
+});
+
+test('$HOME at install (a person present): 0775 and sticky 1777 install; non-sticky 0777 is refused (hooks stay on npx); $HOME is never chmodded', async () => {
+    const { server, url } = await stubEngine();
+    for (const mode of [0o775, 0o1777]) {
+        const ok = home();
+        chmodSync(ok, mode);
+        assert.equal(ensureClientRoot(ok), '', mode.toString(8));
+        assert.equal((await install(ok, url)).code, 0);
+        assert.equal(statSync(ok).mode & 0o7777, mode, '$HOME left as it was');
+        writeHealState(ok, { ...readHealState(ok), lastHealAt: Date.now() });
+        const ran = await launch(ok, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+        assert.match(ran.stdout, /recall/);
+        assert.equal(ran.stderr, '', `${mode.toString(8)}: nothing per event`);
+        assert.equal(existsSync(join(ok, '.valorbrain', 'connect.log')), false, `${mode.toString(8)}: nothing logged`);
+        chmodSync(ok, 0o700);
+    }
+    const h = home();
+    chmodSync(h, 0o777);
+    assert.match(ensureClientRoot(h), /is writable by everyone/);
+    const r = await install(h, url);
+    server.close();
+    assert.equal(statSync(h).mode & 0o777, 0o777, '$HOME left as it was');
+    assert.match(r.stdout, /unsafe client directory: .* is writable by everyone/);
+    assert.equal(existsSync(launcherPath(h)), false);
+    chmodSync(h, 0o700);
+});
+
+// The reviewer's scenario on #27: an install made by the PUBLISHED 0.11.0 (which
+// never looked at $HOME) under a 1777 or 0777 home, moved to this version by
+// 0.11.0's own heal (the real swap path), must keep answering hooks.
+const CONNECT_0110 = readFileSync(new URL('./fixtures/connect-0.11.0.tgz', import.meta.url));
+const CONNECT_0110_INTEGRITY = 'sha512-PwEnYiC5stqJ4uDTNUQR8KMi3sYzlH7+rcLR1pISRhzcVOHXGQndJMW7sfkvu4AOiuuUEuA+XNZvMQWCcoeD0A=='; // npm view @valorbrain/connect@0.11.0 dist.integrity
+
+for (const mode of [0o1777, 0o777]) {
+    test(`auto-update never silences: a 0.11.0 install with a ${mode.toString(8)} home, updated by 0.11.0's heal, keeps answering`, async () => {
+        assert.equal(integrityOf(CONNECT_0110), CONNECT_0110_INTEGRITY, 'the fixture is the published 0.11.0');
+        const { server, state, url } = await stubEngine();
+        state.tarballs['0.11.0'] = CONNECT_0110;
+        state.pin = '0.11.0';
+        // Install with 0.11.0's own index.mjs.
+        const old = home();
+        for (const f of untarPackage(CONNECT_0110)) {
+            mkdirSync(dirname(join(old, f.name)), { recursive: true });
+            writeFileSync(join(old, f.name), f.data);
+        }
+        const h = home();
+        chmodSync(h, mode);
+        const installed = await run(process.execPath, [join(old, 'index.mjs'), '--token', 'vbm_test', '--harness', 'claude-code'], { h, url });
+        assert.equal(installed.code, 0, installed.stderr);
+        assert.equal(readCurrent(h).version, '0.11.0');
+        // The engine pins this version; 0.11.0's heal (through 0.11.0's launcher) swaps it in.
+        state.tarballs['0.11.1'] = packageAt('0.11.1');
+        state.pin = '0.11.1';
+        assert.equal((await launch(h, url, ['heal', '--harness=claude-code'])).code, 0);
+        assert.equal(readCurrent(h).version, '0.11.1', 'swapped by 0.11.0');
+        assert.deepEqual(readFileSync(launcherPath(h)), readFileSync(join(PKG, 'launcher.mjs')), 'the new launcher is in place');
+        // The new launcher keeps answering, every time, quietly.
+        writeHealState(h, { ...readHealState(h), lastHealAt: Date.now() });
+        for (let i = 0; i < 3; i++) {
+            const r = await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+            assert.match(r.stdout, /recall/, `hook ${i}`);
+            assert.equal(r.stderr, '', `hook ${i}: no stderr`);
+        }
+        assert.equal(state.requests.filter((q) => q.path === '/api/v1/hooks/cue').at(-1).headers['x-valorbrain-client'], 'connect/0.11.1');
+        const log = () => (existsSync(join(h, '.valorbrain', 'connect.log')) ? readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8') : '');
+        const warned = (log().match(/launcher: .* is writable by others/g) || []).length;
+        assert.equal(warned, mode === 0o777 ? 1 : 0, 'warned once for 0777, never for a sticky home');
+        // Its own heal at the same pin changes nothing and keeps it running.
+        assert.equal((await launch(h, url, ['heal', '--harness=claude-code'])).code, 0);
+        assert.equal(readCurrent(h).version, '0.11.1');
+        // A newer pin: a sticky home updates; a 0777 home declines (logged once) and keeps 0.11.1 running.
+        state.tarballs['0.11.9'] = packageAt('0.11.9');
+        state.pin = '0.11.9';
+        await launch(h, url, ['heal', '--harness=claude-code']);
+        await launch(h, url, ['heal', '--harness=claude-code']);
+        const after = await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+        server.close();
+        assert.match(after.stdout, /recall/);
+        if (mode === 0o777) {
+            assert.equal(readCurrent(h).version, '0.11.1');
+            assert.equal((log().match(/update to 0\.11\.9 not applied — unsafe client directory: .* is writable by everyone; the current version keeps running/g) || []).length, 1);
+        } else {
+            assert.equal(readCurrent(h).version, '0.11.9');
+        }
+        chmodSync(h, 0o700);
+    });
+}
+
+test('GC removes .own-/.break- leftovers of a crashed lock holder after the stale window, never the lock itself', () => {
+    const h = home();
+    const root = join(h, '.valorbrain', 'bin', 'connect');
+    mkdirSync(root, { recursive: true });
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    for (const f of ['.lock-0.11.9', '.lock-0.11.9.own-1-abc', '.lock-0.11.9.break-2-def', '.lock-0.11.9.own-3-fresh']) writeFileSync(join(root, f), 'x');
+    for (const f of ['.lock-0.11.9', '.lock-0.11.9.own-1-abc', '.lock-0.11.9.break-2-def']) utimesSync(join(root, f), old, old);
+    gcClientVersions(h);
+    assert.deepEqual(readdirSync(root).sort(), ['.lock-0.11.9', '.lock-0.11.9.own-3-fresh']);
+});
+
+test('tryLock without hard links (EPERM / ENOTSUP / EXDEV): wx-create + re-check, same guarantees', () => {
+    for (const code of ['EPERM', 'ENOTSUP', 'EXDEV']) {
+        const h = home();
+        const lock = join(h, '.lock-0.11.7');
+        const link = () => { throw Object.assign(new Error(`link: ${code}`), { code }); };
+        // Acquire, held, release.
+        const t = tryLock(lock, { link });
+        assert.ok(t, code);
+        assert.equal(readFileSync(lock, 'utf-8'), t);
+        assert.equal(tryLock(lock, { link }), null, `${code}: held`);
+        releaseLock(lock, 'not-mine');
+        assert.ok(existsSync(lock));
+        releaseLock(lock, t);
+        assert.equal(existsSync(lock), false);
+        // Two breakers of one stale lock: exactly one wins.
+        writeFileSync(lock, 'crashed-heal');
+        const old = (Date.now() - 10 * 60_000) / 1000;
+        utimesSync(lock, old, old);
+        let inner = null;
+        const outer = tryLock(lock, { link, onStale: () => { inner = tryLock(lock, { link }); } });
+        const winners = [outer, inner].filter(Boolean);
+        assert.equal(winners.length, 1, `${code}: outer=${outer} inner=${inner}`);
+        assert.equal(readFileSync(lock, 'utf-8'), winners[0]);
+        assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-') && f !== '.lock-0.11.7'), [], `${code}: no leftovers`);
+    }
+    // Any other link error is a real failure, not a silent fallback.
+    const h = home();
+    assert.throws(() => tryLock(join(h, '.lock-x'), { link: () => { throw Object.assign(new Error('io'), { code: 'EIO' }); } }), /io/);
 });

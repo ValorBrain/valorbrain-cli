@@ -345,13 +345,22 @@ não precisa recarregar hooks.
   - Cada `<versão>/` é uma cópia completa do pacote e roda com node ou Bun, sem
     `npm install`. O `yaml` só é carregado quando a instalação mescla o config
     do Hermes.
-  - Toda a cadeia, de `~/.valorbrain` até o arquivo que roda, precisa ser sua
-    e não gravável por grupo nem por outros. Instalação e heal tiram essa
-    permissão de escrita de `~/.valorbrain` e `bin/` e deixam `connect/` em
-    0700. O launcher confere a cadeia de novo a cada execução e recusa, com
-    uma linha no stderr, uma pasta que seja symlink, de outro usuário ou
-    gravável por outros: num host com várias pessoas, ninguém troca
-    `connect/` pelo seu.
+  - De `~/.valorbrain` até o arquivo que roda, tudo precisa ser seu e não
+    gravável por grupo nem por outros. Instalação e heal tiram essa permissão
+    de escrita de `~/.valorbrain` e `bin/` e deixam `connect/` em 0700. O
+    launcher confere essa cadeia a cada execução e recusa, com uma linha no
+    stderr, uma pasta que seja symlink, de outro usuário ou gravável por
+    outros: num host com várias pessoas, ninguém troca `connect/` pelo seu.
+  - Pasta com sticky bit (1777, como um `$HOME` em /tmp) não é recusada pelos
+    bits de escrita: lá ninguém renomeia nem apaga o que é seu.
+  - **O `$HOME`** (a pasta que contém o `.valorbrain` real) nunca é alterado.
+    - **Na instalação**, com a pessoa presente, um `$HOME` de outro usuário
+      ou gravável por todos (o+w, sem sticky) é recusado, e o hook fica em
+      npx. Gravável pelo grupo (0775/2775) é aceito.
+    - **Depois de instalado, isso nunca desliga os hooks.** O launcher só
+      registra o problema uma vez em `connect.log`. O heal mantém a versão em
+      uso e não passa para uma versão nova enquanto o `$HOME` estiver gravável
+      por todos (também registrado uma vez).
   - **Windows:** lá não há uid nem bits de modo (as permissões são ACLs), então
     só os testes de tipo e de symlink rodam. A proteção vem das ACLs do perfil
     do usuário.

@@ -22,10 +22,10 @@
  * republishing when the rules text changes.
  */
 
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -198,8 +198,11 @@ hook …, on every system; updates swap the version it runs under
 touch the harness files again. An update that would collect more by default
 than you installed under waits for you to run this installer.
 VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
-launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version
-it runs are yours and not writable by others; on Windows only the symlink and
+launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version it
+runs are yours and not writable by others (sticky directories excepted). An
+install refuses a $HOME that is not yours or is world-writable (group write and
+sticky are fine; $HOME is never chmodded); once installed, a $HOME problem is
+only logged, never a reason to stop the hooks. On Windows only the symlink and
 type checks apply (there are no uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
@@ -401,17 +404,27 @@ const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
 /**
  * Create ~/.valorbrain/bin/connect and make the whole chain ours: every hook
  * runs code from there, so a directory on the way that another user owns or
- * can write to would let them swap `connect/` for their own. `.valorbrain`
- * and `bin` lose group/other write, `connect` is 0700; anything not ours, a
- * symlink for `bin` or `connect`, or still writable by others is refused —
- * '' when safe, else the reason. Paths a shell or a JSON string would have to
- * escape are refused too (the launcher path is substituted as plain text).
+ * can write to would let them swap `connect/` for their own. `$HOME` itself
+ * must be ours and not world-writable; group write is allowed there (homes of
+ * 0775/2775 under user private groups are common) and `$HOME` is never
+ * chmodded (not ours to change), only refused. A sticky directory (1777, a
+ * /tmp home) is not refused for write bits: others cannot rename or remove
+ * what we own in it. `.valorbrain` and `bin` lose
+ * group/other write, `connect` is 0700; anything not ours, a symlink for
+ * `bin` or `connect`, or still writable by others is refused — '' when safe,
+ * else the reason. Paths a shell or a JSON string would have to escape are
+ * refused too (the launcher path is substituted as plain text).
  * Windows: no uid or mode bits to check (ACLs), only type and symlink.
  */
 export function ensureClientRoot(home) {
   if (/["'`$%!\\\r\n]/.test(launcherPath(home))) return "the path needs quoting";
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   try {
+    if (posix) {
+      const st = statSync(home);
+      if (st.uid !== process.getuid()) return `${home} belongs to another user`;
+      if ((st.mode & 0o002) !== 0 && (st.mode & 0o1000) === 0) return `${home} is writable by everyone`;
+    }
     const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
     for (const [i, d] of chain.entries()) {
       mkdirSync(d, { recursive: true, mode: 0o700 });
@@ -423,7 +436,8 @@ export function ensureClientRoot(home) {
       if (st.uid !== process.getuid()) return `${d} belongs to another user`;
       const mode = i === chain.length - 1 ? 0o700 : st.mode & 0o755;
       if ((st.mode & 0o777) !== mode) chmodSync(d, mode);
-      if ((statSync(d).mode & 0o022) !== 0) return `${d} is writable by others`;
+      const now = statSync(d).mode;
+      if ((now & 0o022) !== 0 && (now & 0o1000) === 0) return `${d} is writable by others`;
     }
     return "";
   } catch (err) {
@@ -509,19 +523,85 @@ function tarballUrlAllowed(url) {
 /** A lock file under the client root: one placer per version at a time; a lock older than this is a crashed heal. */
 const PLACE_LOCK_STALE_MS = 120_000;
 
-function tryLock(path) {
+/** Errors of a filesystem without hard links (FAT/exFAT, some network mounts). */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOSYS"]);
+
+/**
+ * Create `to` holding `from`'s content, failing (false) when `to` exists. A
+ * hard link is atomic and never half-written. Where hard links are not
+ * supported, a `wx` create of the same content, then a re-read that it still
+ * holds it. `link` is the seam tests use to simulate such a filesystem.
+ */
+function linkNew(from, to, link = linkSync) {
   try {
-    closeSync(openSync(path, "wx", 0o600));
+    link(from, to);
     return true;
-  } catch {
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    if (!NO_HARD_LINKS.has(err?.code)) throw err;
+  }
+  const content = readFileSync(from, "utf-8");
+  try {
+    writeFileSync(to, content, { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    throw err;
+  }
+  return readOrNull(to) === content;
+}
+
+function readOrNull(path) {
+  try { return readFileSync(path, "utf-8"); } catch { return null; }
+}
+
+/**
+ * Take the lock at `path`: the token written into it, or null when someone
+ * else holds it. The lock is created by hard-linking a file that already holds
+ * our unique token (atomic, no half-written lock; `wx` + re-check where there
+ * are no hard links). A stale lock is broken by RENAMING it away and checking
+ * that what moved is the stale one we read: two breakers can never both win,
+ * because the second rename either finds nothing or moves the first one's
+ * fresh lock — which it puts back and gives up.
+ * Seams for tests: `onStale` runs between seeing a stale lock and breaking it;
+ * `link` replaces fs.linkSync.
+ */
+export function tryLock(path, { staleMs = PLACE_LOCK_STALE_MS, now = () => Date.now(), onStale, link = linkSync } = {}) {
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const mine = `${path}.own-${token}`;
+  writeFileSync(mine, token, { mode: 0o600, flag: "wx" });
+  try {
+    if (linkNew(mine, path, link)) return token;
+    let seen;
     try {
-      if (Date.now() - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) {
-        unlinkSync(path);
-        closeSync(openSync(path, "wx", 0o600));
-        return true;
-      }
-    } catch { /* lost the race */ }
-    return false;
+      if (now() - statSync(path).mtimeMs <= staleMs) return null;
+      seen = readFileSync(path, "utf-8");
+    } catch {
+      return linkNew(mine, path, link) ? token : null; // released meanwhile
+    }
+    onStale?.();
+    const moved = `${path}.break-${token}`;
+    try {
+      renameSync(path, moved);
+    } catch {
+      return linkNew(mine, path, link) ? token : null; // someone else broke it first
+    }
+    if (readOrNull(moved) !== seen) {
+      // We moved a live lock that replaced the stale one: put it back, it is theirs.
+      try { linkNew(moved, path, link); } catch { /* fail-safe: we do not hold it */ }
+      try { unlinkSync(moved); } catch { /* gone */ }
+      return null;
+    }
+    unlinkSync(moved);
+    return linkNew(mine, path, link) ? token : null;
+  } finally {
+    try { unlinkSync(mine); } catch { /* gone */ }
+  }
+}
+
+/** Drop the lock only while it is still ours (a stale break may have given it to someone else). */
+export function releaseLock(path, token) {
+  if (token && readOrNull(path) === token) {
+    try { unlinkSync(path); } catch { /* gone */ }
   }
 }
 
@@ -531,12 +611,14 @@ function tryLock(path) {
  * already complete under the lock stops there (same pin, same signed bytes);
  * a broken <version>/ is replaced only by the lock holder. current.json is
  * written only after this returns with the version complete, so it never
- * names a missing directory.
+ * names a missing directory. `onChecked` (tests) is awaited after the
+ * "already installed?" check, before anything is filled or renamed.
  */
-async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
+export async function placeVersion(home, version, fill, { waitMs = 90_000, onChecked } = {}) {
   const lock = join(clientRoot(home), `.lock-${version}`);
   const until = Date.now() + waitMs;
-  while (!tryLock(lock)) {
+  let token;
+  while (!(token = tryLock(lock))) {
     if (Date.now() > until) throw new Error(`another heal holds ${version}`);
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -544,6 +626,7 @@ async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
   const tmp = join(clientRoot(home), `.tmp-${version}-${process.pid}-${Date.now()}`);
   try {
     if (versionInstalled(home, version)) return;
+    await onChecked?.();
     mkdirSync(tmp, { mode: 0o700 });
     fill(tmp);
     chmodSync(tmp, 0o700);
@@ -551,7 +634,7 @@ async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
     renameSync(tmp, dest);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
-    try { unlinkSync(lock); } catch { /* already gone */ }
+    releaseLock(lock, token);
   }
 }
 
@@ -618,6 +701,18 @@ export async function downloadClientVersion(home, { version, tarball, integrity 
   if (!versionInstalled(home, version)) throw new Error("unpacked version is incomplete");
 }
 
+/** current.json names this pin and integrity, its directory is complete, and the launcher is the one it ships. */
+function isCurrent(home, version, integrity) {
+  const current = readCurrent(home);
+  if (current?.version !== version || current?.integrity !== integrity || !versionInstalled(home, version)) return false;
+  try {
+    const shipped = join(clientRoot(home), version, "launcher.mjs");
+    return !existsSync(shipped) || readFileSync(shipped).equals(readFileSync(join(clientRoot(home), "launcher.mjs")));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Make the pinned version of a `client=launcher` manifest runnable: its
  * directory, current.json and the launcher itself. Returns the launcher path,
@@ -627,6 +722,10 @@ export async function downloadClientVersion(home, { version, tarball, integrity 
 export async function ensureLauncher(home, manifest, { fetchImpl, selfDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
   const version = launcherPin(manifest?.hook_client_version);
   if (manifest?.hook_client !== "launcher" || !version) return { error: "the manifest names no launcher version" };
+  // Already running this pin with this launcher: nothing to write, so nothing
+  // to check — a heal never turns a working install off over the directory
+  // rules (those apply when something is written: installs and updates).
+  if (isCurrent(home, version, manifest.hook_client_integrity ?? null)) return { launcher: launcherPath(home), version };
   const unsafe = ensureClientRoot(home);
   if (unsafe) return { error: `unsafe client directory: ${unsafe}` };
   try {
@@ -729,6 +828,11 @@ export function gcClientVersions(home, { now = Date.now(), graceMs = CLIENT_GRAC
       try { if (graceMs === 0 || now - statSync(path).mtimeMs > 3600 * 1000) rmSync(path, { recursive: true, force: true }); } catch { /* gone */ }
       continue;
     }
+    if (/^\.lock-.+\.(?:own|break)-/.test(v)) {
+      // Left by a heal that crashed between creating and removing them; never the lock itself.
+      try { if (graceMs === 0 || now - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) unlinkSync(path); } catch { /* gone */ }
+      continue;
+    }
     if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v)) continue; // launcher.mjs, current.json
     if (used.has(v)) { delete unused[v]; continue; }
     const since = unused[v] ?? now;
@@ -745,6 +849,7 @@ export function gcClientVersions(home, { now = Date.now(), graceMs = CLIENT_GRAC
     for (const f of ["launcher.mjs", "current.json"]) {
       try { if (existsSync(join(root, f))) { unlinkSync(join(root, f)); deleted.push(f); } } catch { /* fail-open */ }
     }
+    try { unlinkSync(join(root, ".home-warning")); } catch { /* absent */ }
     for (const d of [root, dirname(root)]) {
       try { if (readdirSync(d).length === 0) rmSync(d, { recursive: true }); } catch { /* absent or not empty */ }
     }
@@ -2184,7 +2289,14 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
       const r = await ensureLauncher(home, manifest);
       if (r.launcher) launcher = r.launcher;
       else {
-        logConnect(home, `${id}: update to ${manifest.hook_client_version} not applied — ${r.error}`);
+        // Declined (unsafe $HOME, bad download…): the running version keeps
+        // running, and the reason is logged once per pin and reason, not per heal.
+        const st = readHealState(home);
+        const note = `${manifest.hook_client_version}|${r.error}`;
+        if (st.update_declined?.[id] !== note) {
+          logConnect(home, `${id}: update to ${manifest.hook_client_version} not applied — ${r.error}; the current version keeps running`);
+          writeHealState(home, { ...st, update_declined: { ...(st.update_declined || {}), [id]: note } });
+        }
         launcher = existsSync(join(clientRoot(home), "launcher.mjs")) && readCurrent(home) ? launcherPath(home) : null;
       }
       if (!launcher) manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });
