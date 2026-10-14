@@ -1,5 +1,27 @@
 # Changelog — @valorbrain/connect
 
+## 0.11.1 — 2026-10-14
+
+Pequena, e também é a prova de que uma versão nova chega a todas as
+instalações 0.11.0 sem ninguém mexer: só muda `~/.valorbrain/bin/connect/`.
+
+- **Quebra de lock velho sem corrida.** Antes, dois heals que achavam o mesmo
+  lock vencido podiam os dois apagar e recriar o lock, e cada um se achava o
+  dono.
+  - Agora o lock nasce de um hard link de um arquivo que já tem um token
+    único. O lock vencido é quebrado com um rename atômico, conferindo que o
+    arquivo movido é o mesmo que se viu vencido. Se não for, ele volta para o
+    lugar e esse heal desiste.
+  - Só quem tem o token solta o lock.
+- **`$HOME` gravável por outros.** No Linux e no macOS, um `$HOME` de outro
+  usuário ou gravável por grupo/outros é recusado como os demais diretórios da
+  cadeia, na instalação, no heal e no launcher. O connect nunca muda a
+  permissão do `$HOME`.
+- **Teste determinístico da corrida no `placeVersion`.** Uma barreira (só para
+  teste) faz os dois heals passarem pela checagem "já instalado?" antes de
+  qualquer um renomear. Com o lock, um só preenche e a primeira cópia nunca é
+  apagada. O mesmo teste falha com o `placeVersion` sem lock da 1ea8d3c.
+
 ## 0.11.0 — 2026-10-14
 
 - **Hooks que se atualizam sozinhos.** A instalação pede `client=launcher` e

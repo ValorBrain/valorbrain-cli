@@ -22,10 +22,10 @@
  * republishing when the rules text changes.
  */
 
-import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -198,9 +198,10 @@ hook …, on every system; updates swap the version it runs under
 touch the harness files again. An update that would collect more by default
 than you installed under waits for you to run this installer.
 VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
-launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version
-it runs are yours and not writable by others; on Windows only the symlink and
-type checks apply (there are no uid or mode bits).
+launcher refuses to run unless $HOME, ~/.valorbrain, bin/, connect/ and the
+version it runs are yours and not writable by others ($HOME is never
+chmodded); on Windows only the symlink and type checks apply (there are no
+uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
 this package before a single file is written; an unsigned or altered one is
@@ -401,17 +402,24 @@ const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
 /**
  * Create ~/.valorbrain/bin/connect and make the whole chain ours: every hook
  * runs code from there, so a directory on the way that another user owns or
- * can write to would let them swap `connect/` for their own. `.valorbrain`
- * and `bin` lose group/other write, `connect` is 0700; anything not ours, a
- * symlink for `bin` or `connect`, or still writable by others is refused —
- * '' when safe, else the reason. Paths a shell or a JSON string would have to
- * escape are refused too (the launcher path is substituted as plain text).
+ * can write to would let them swap `connect/` for their own. `$HOME` itself
+ * must be ours and not group/other-writable — it is never chmodded (not ours
+ * to change), only refused. `.valorbrain` and `bin` lose group/other write,
+ * `connect` is 0700; anything not ours, a symlink for `bin` or `connect`, or
+ * still writable by others is refused — '' when safe, else the reason. Paths
+ * a shell or a JSON string would have to escape are refused too (the launcher
+ * path is substituted as plain text).
  * Windows: no uid or mode bits to check (ACLs), only type and symlink.
  */
 export function ensureClientRoot(home) {
   if (/["'`$%!\\\r\n]/.test(launcherPath(home))) return "the path needs quoting";
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   try {
+    if (posix) {
+      const st = statSync(home);
+      if (st.uid !== process.getuid()) return `${home} belongs to another user`;
+      if ((st.mode & 0o022) !== 0) return `${home} is writable by others`;
+    }
     const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
     for (const [i, d] of chain.entries()) {
       mkdirSync(d, { recursive: true, mode: 0o700 });
@@ -509,19 +517,67 @@ function tarballUrlAllowed(url) {
 /** A lock file under the client root: one placer per version at a time; a lock older than this is a crashed heal. */
 const PLACE_LOCK_STALE_MS = 120_000;
 
-function tryLock(path) {
+/** Create `to` as a hard link to `from`: atomic, and fails EEXIST when `to` exists. */
+function linkNew(from, to) {
   try {
-    closeSync(openSync(path, "wx", 0o600));
+    linkSync(from, to);
     return true;
-  } catch {
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
+function readOrNull(path) {
+  try { return readFileSync(path, "utf-8"); } catch { return null; }
+}
+
+/**
+ * Take the lock at `path`: the token written into it, or null when someone
+ * else holds it. The lock is created by hard-linking a file that already holds
+ * our unique token (atomic, no half-written lock). A stale lock is broken by
+ * RENAMING it away and checking that what moved is the stale one we read: two
+ * breakers can never both win, because the second rename either finds nothing
+ * or moves the first one's fresh lock — which it puts back and gives up.
+ * `onStale` (tests) runs between seeing a stale lock and breaking it.
+ */
+export function tryLock(path, { staleMs = PLACE_LOCK_STALE_MS, now = () => Date.now(), onStale } = {}) {
+  const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const mine = `${path}.own-${token}`;
+  writeFileSync(mine, token, { mode: 0o600, flag: "wx" });
+  try {
+    if (linkNew(mine, path)) return token;
+    let seen;
     try {
-      if (Date.now() - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) {
-        unlinkSync(path);
-        closeSync(openSync(path, "wx", 0o600));
-        return true;
-      }
-    } catch { /* lost the race */ }
-    return false;
+      if (now() - statSync(path).mtimeMs <= staleMs) return null;
+      seen = readFileSync(path, "utf-8");
+    } catch {
+      return linkNew(mine, path) ? token : null; // released meanwhile
+    }
+    onStale?.();
+    const moved = `${path}.break-${token}`;
+    try {
+      renameSync(path, moved);
+    } catch {
+      return linkNew(mine, path) ? token : null; // someone else broke it first
+    }
+    if (readOrNull(moved) !== seen) {
+      // We moved a live lock that replaced the stale one: put it back, it is theirs.
+      try { linkNew(moved, path); } catch { /* fail-safe: we do not hold it */ }
+      try { unlinkSync(moved); } catch { /* gone */ }
+      return null;
+    }
+    unlinkSync(moved);
+    return linkNew(mine, path) ? token : null;
+  } finally {
+    try { unlinkSync(mine); } catch { /* gone */ }
+  }
+}
+
+/** Drop the lock only while it is still ours (a stale break may have given it to someone else). */
+export function releaseLock(path, token) {
+  if (token && readOrNull(path) === token) {
+    try { unlinkSync(path); } catch { /* gone */ }
   }
 }
 
@@ -531,12 +587,14 @@ function tryLock(path) {
  * already complete under the lock stops there (same pin, same signed bytes);
  * a broken <version>/ is replaced only by the lock holder. current.json is
  * written only after this returns with the version complete, so it never
- * names a missing directory.
+ * names a missing directory. `onChecked` (tests) is awaited after the
+ * "already installed?" check, before anything is filled or renamed.
  */
-async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
+export async function placeVersion(home, version, fill, { waitMs = 90_000, onChecked } = {}) {
   const lock = join(clientRoot(home), `.lock-${version}`);
   const until = Date.now() + waitMs;
-  while (!tryLock(lock)) {
+  let token;
+  while (!(token = tryLock(lock))) {
     if (Date.now() > until) throw new Error(`another heal holds ${version}`);
     await new Promise((r) => setTimeout(r, 100));
   }
@@ -544,6 +602,7 @@ async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
   const tmp = join(clientRoot(home), `.tmp-${version}-${process.pid}-${Date.now()}`);
   try {
     if (versionInstalled(home, version)) return;
+    await onChecked?.();
     mkdirSync(tmp, { mode: 0o700 });
     fill(tmp);
     chmodSync(tmp, 0o700);
@@ -551,7 +610,7 @@ async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
     renameSync(tmp, dest);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
-    try { unlinkSync(lock); } catch { /* already gone */ }
+    releaseLock(lock, token);
   }
 }
 

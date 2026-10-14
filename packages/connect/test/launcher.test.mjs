@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,7 @@ import { CLIENT_VERSION, clientHeaders, launcherPin, noticePin, readHealState, r
 import { SIGNED_ENV, signedManifestHeaders } from './signed-stub.mjs';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { downloadClientVersion, gcClientVersions, launcherPath, launcherWanted, planFor, readCurrent, untarPackage } = await import('../index.mjs');
+const { downloadClientVersion, ensureClientRoot, gcClientVersions, launcherPath, launcherWanted, placeVersion, planFor, readCurrent, releaseLock, tryLock, untarPackage } = await import('../index.mjs');
 
 const PKG = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(PKG, 'index.mjs');
@@ -635,4 +635,79 @@ test('racing heals: two at once place the version once; current.json never names
     const groot = join(g, '.valorbrain', 'bin', 'connect');
     assert.ok(existsSync(join(groot, NEXT, 'hook.mjs')));
     assert.deepEqual(readdirSync(groot).filter((f) => f.startsWith('.')), []);
+});
+
+// ── 0.11.1: deterministic race, stale-lock race, $HOME (review notes on #26) ─
+
+test('placeVersion race (deterministic): both placers reach the "installed?" check before either renames — one fill, the first copy is never removed', async () => {
+    const h = home();
+    assert.equal(ensureClientRoot(h), '');
+    const v = '0.11.7';
+    // Barrier: each placer waits here until the other arrives too (or 400 ms pass,
+    // which is what a placer blocked behind the lock makes happen).
+    let arrived = 0;
+    let open;
+    const both = new Promise((r) => { open = r; });
+    const barrier = async () => {
+        if (++arrived === 2) open();
+        await Promise.race([both, new Promise((r) => setTimeout(r, 400))]);
+    };
+    const fills = [];
+    const fill = (who) => (tmp) => {
+        fills.push(who);
+        writeFileSync(join(tmp, 'package.json'), JSON.stringify({ version: v }));
+        writeFileSync(join(tmp, 'hook.mjs'), who);
+        writeFileSync(join(tmp, 'index.mjs'), '');
+    };
+    await Promise.all([placeVersion(h, v, fill('A'), { onChecked: barrier }), placeVersion(h, v, fill('B'), { onChecked: barrier })]);
+    assert.deepEqual(fills, ['A'], 'the second placer found the version complete and filled nothing');
+    assert.equal(readFileSync(join(h, '.valorbrain', 'bin', 'connect', v, 'hook.mjs'), 'utf-8'), 'A', 'the first copy was never removed');
+    assert.deepEqual(readdirSync(join(h, '.valorbrain', 'bin', 'connect')).filter((f) => f.startsWith('.')), []);
+});
+
+test('tryLock: two processes breaking the same stale lock — exactly one wins, and the loser does not release it', () => {
+    const h = home();
+    const lock = join(h, '.lock-0.11.7');
+    writeFileSync(lock, 'crashed-heal');
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    utimesSync(lock, old, old);
+    // The second breaker runs exactly between the first one seeing the stale lock and breaking it.
+    let inner = null;
+    const outer = tryLock(lock, { onStale: () => { inner = tryLock(lock); } });
+    const winners = [outer, inner].filter(Boolean);
+    assert.equal(winners.length, 1, `outer=${outer} inner=${inner}`);
+    assert.equal(readFileSync(lock, 'utf-8'), winners[0]);
+    releaseLock(lock, outer || 'not-mine'); // the loser's release
+    releaseLock(lock, inner || 'not-mine');
+    assert.equal(existsSync(lock), false, 'only the winner removed it');
+    // A fresh lock is never broken, and a held one cannot be taken.
+    const t = tryLock(lock);
+    assert.ok(t);
+    assert.equal(tryLock(lock), null);
+    releaseLock(lock, 'someone-else');
+    assert.equal(readFileSync(lock, 'utf-8'), t);
+    releaseLock(lock, t);
+    assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-')), [], 'no .own-/.break- leftovers');
+});
+
+test('$HOME writable by group/others: install and heal refuse (and never chmod $HOME); the launcher refuses too', async () => {
+    const { server, url } = await stubEngine();
+    const h = home();
+    chmodSync(h, 0o775);
+    assert.match(ensureClientRoot(h), /is writable by others/);
+    const r = await install(h, url);
+    assert.equal(statSync(h).mode & 0o777, 0o775, '$HOME left as it was');
+    assert.match(r.stdout, /unsafe client directory: .* is writable by others/);
+    assert.equal(existsSync(launcherPath(h)), false);
+    // Installed while safe, then $HOME opened up: the launcher stays silent.
+    const g = home();
+    assert.equal((await install(g, url)).code, 0);
+    writeHealState(g, { ...readHealState(g), lastHealAt: Date.now() });
+    chmodSync(g, 0o777);
+    const out = await launch(g, url, ['hook', 'prompt', '--harness=gemini-cli'], { stdin: PAYLOAD });
+    server.close();
+    assert.equal(out.code, 0);
+    assert.equal(out.stdout.trim(), '{}');
+    assert.match(out.stderr, new RegExp(`${g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is writable by others`));
+    chmodSync(g, 0o700);
 });

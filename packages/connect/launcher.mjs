@@ -22,6 +22,7 @@
  * stderr, prints the harness's empty answer and exits 0.
  */
 import { lstatSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -58,8 +59,9 @@ function resolveEntry() {
     const dir = join(root, version);
     const entry = join(dir, command === 'heal' ? 'index.mjs' : 'hook.mjs');
     try {
-        // The whole chain from ~/.valorbrain down: a writable parent lets someone swap the directory below it.
-        const reason = safe(dirname(dirname(root)), 'dir', true) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
+        // The whole chain from $HOME down: a writable parent lets someone swap the directory below it.
+        // $HOME and ~/.valorbrain may be symlinks a person made; their targets are checked.
+        const reason = safe(homedir(), 'dir', true) || safe(dirname(dirname(root)), 'dir', true) || safe(dirname(root), 'dir') || safe(root, 'dir') || safe(dir, 'dir') || safe(entry, 'file');
         if (reason) return { error: `refusing to run ${version}: ${reason}` };
     } catch {
         return { error: `version ${version} is not installed` };
