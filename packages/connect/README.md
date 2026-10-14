@@ -325,51 +325,82 @@ Para desligar o checkpoint de um harness, `--checkpoint off` (fica em
 numa máquina inteira, `VALORBRAIN_CHECKPOINT=off` no ambiente do harness, que
 vence o arquivo. A mesma variável no engine desliga para todos.
 
-### Cliente local do hook (0.10)
+### Hooks que se atualizam sozinhos (0.11)
 
-Rodar o hook por `npx -y @valorbrain/connect@<versão> hook …` custa a
-resolução do pacote a cada evento: ~650–700 ms com o cache do npm quente,
-medido num servidor Linux, e mais na primeira vez. A partir da 0.10 o
-instalador pede ao engine o manifesto `client=local` e grava os hooks assim:
+A partir da 0.11, todo hook roda o mesmo comando, para sempre:
 
 ```
-node "/home/você/.valorbrain/bin/connect/0.10.0/hook.mjs" hook prompt --harness=claude-code || npx -y @valorbrain/connect@0.10.0 hook prompt --harness=claude-code
+node "/home/você/.valorbrain/bin/connect/launcher.mjs" hook prompt --harness=claude-code
 ```
 
-O mesmo evento cai para 27–55 ms.
+Sem versão e sem `||` no comando: ele funciona em sh, cmd e nas duas
+PowerShells, inclusive no Windows. Uma atualização nunca muda um arquivo de
+configuração do harness, então o Codex não pede um novo trust e o Claude Code
+não precisa recarregar hooks.
 
-- **O que é instalado.** `hook.mjs` e `manifest-signature.mjs`, só módulos
-  nativos do node, copiados para `~/.valorbrain/bin/connect/<versão>/`, com
-  diretório 0700, arquivos 0644, escrita tmp + rename e uma pasta por versão. O
-  caminho entra no comando depois de conferida a assinatura do manifesto, como
-  o token.
-- **Se o arquivo sumir**, o `node` sai antes de ler o stdin e o `npx` da versão
-  fixada atende o mesmo evento. O OpenCode, que roda um argv sem shell, escolhe
-  o fallback no próprio plugin.
-- **Windows continua no npx.** O Gemini CLI usa o Windows PowerShell 5.1
-  quando não há pwsh, e lá o `||` não existe. `VALORBRAIN_HOOK_CLIENT=local`
-  força o cliente local e `=npx` o desliga em qualquer sistema.
-- **Versão fixada pelo engine.** Se o engine fixa outra versão
-  (`hook_client_version`), o instalador grava o npx daquela versão, e é ela que
-  instala a própria cópia local.
-- **Self-heal fora do caminho do hook.** O cliente local nunca espera o heal.
-  Quando ele vence (a cada 6 h, `lastHealAt` em
-  `~/.valorbrain/connect-state.json`), o cliente dispara em segundo plano um
-  processo que confere a assinatura do manifesto e roda
-  `npx -y @valorbrain/connect@<hook_client_version> heal --harness=<id>`, e
-  responde ao harness na hora. Nunca roda `latest`, faixa de versões ou versão
-  anterior à 0.10.0.
-- **Troca de versão.** Quando o engine sobe a versão fixada, esse heal instala
-  a cópia nova e reescreve os hooks. As outras regras do heal continuam
-  valendo: arquivo editado à mão fica, `--mcp-only` não ganha hooks nem cópia
-  local, Codex não migra sozinho, e no Kiro o heal não cria um segundo arquivo
-  de hooks.
-- **Vindo do npx.** Um hook npx da 0.10 que ainda não tentou o cliente local
-  faz o heal no primeiro evento, sem esperar as 6 h, uma vez por versão.
-- **Limpeza.** Uma versão que nenhum hook usa é apagada 24 h depois, porque uma
-  sessão aberta do Claude Code mantém os comandos com que começou. `--remove`
-  apaga na hora quando nenhum harness usa mais a versão. O `--status` mostra
-  `client: local <versão>` ou `client: npx <versão>` em cada arquivo de hooks.
+- **Como funciona.** O `launcher.mjs` lê `current.json`
+  (`{version, integrity, data_scope, installed_at}`) e roda
+  `./<versão>/hook.mjs` (no `heal`, roda o `index.mjs`). O launcher usa só
+  módulos nativos do node.
+  - Cada `<versão>/` é uma cópia completa do pacote e roda com node ou Bun, sem
+    `npm install`. O `yaml` só é carregado quando a instalação mescla o config
+    do Hermes.
+  - Toda a cadeia, de `~/.valorbrain` até o arquivo que roda, precisa ser sua
+    e não gravável por grupo nem por outros. Instalação e heal tiram essa
+    permissão de escrita de `~/.valorbrain` e `bin/` e deixam `connect/` em
+    0700. O launcher confere a cadeia de novo a cada execução e recusa, com
+    uma linha no stderr, uma pasta que seja symlink, de outro usuário ou
+    gravável por outros: num host com várias pessoas, ninguém troca
+    `connect/` pelo seu.
+  - **Windows:** lá não há uid nem bits de modo (as permissões são ACLs), então
+    só os testes de tipo e de symlink rodam. A proteção vem das ACLs do perfil
+    do usuário.
+  - Se faltar `current.json` ou a pasta, ele escreve uma linha no stderr,
+    devolve a resposta vazia do harness e sai com 0.
+- **De onde vem uma versão.** O engine assina o manifesto
+  (`client=launcher`) com a versão fixada, o tarball do npm e o sha512 dele.
+  - O heal baixa o tarball, confere o sha512 antes de abrir qualquer coisa,
+    descompacta numa pasta temporária (com um leitor de tar próprio, que nunca
+    extrai link, caminho absoluto ou `..`) e renomeia para `<versão>/`. Por
+    fim troca o `current.json` (tmp + rename) e, se a versão nova trouxer um
+    `launcher.mjs` diferente, troca também o launcher, no mesmo caminho.
+  - Sem npx em nenhum ponto. Nunca roda tag, faixa de versões, versão anterior
+    à 0.11.0 nem nada cujo sha512 não confira.
+- **Quando atualiza.** Sempre em segundo plano, sem atrasar o hook:
+  - a cada 6 h (`lastHealAt` em `~/.valorbrain/connect-state.json`);
+  - na hora, quando a resposta do engine (`client_pin`) diz que a versão
+    fixada mudou. Isso acontece uma vez por versão nova, por harness.
+- **Nunca coleta mais sem você.** Cada harness guarda em `connect.json` o
+  `consented_scope`, o nível de coleta que você aceitou ao instalar.
+  - Uma versão cujo `data_scope` passe disso não é aplicada: o heal escreve uma
+    linha em `connect.log`, o `--status` mostra "update held" e o engine é
+    avisado pelo cabeçalho `X-ValorBrain-Client-State: blocked-scope=<n>`.
+  - Rodar o instalador de novo é como você aceita o nível novo.
+- **Codex.** A troca para o comando do launcher é a última mudança de comando,
+  e o heal não a faz sozinho: um comando novo exige confiar de novo em
+  `/hooks`. Enquanto isso, o engine recebe `needs-reinstall`. Rode
+  `npx -y @valorbrain/connect --harness codex` uma vez e confie no comando.
+- **omp e Hermes.** A ponte do omp e o plugin do Hermes chamam
+  `launcher.mjs heal --harness=omp|hermes`, que atualiza os arquivos deles
+  pelo manifesto assinado, com as mesmas regras de edição manual. O plugin do
+  Hermes não precisa de token para isso.
+- **Quem é quem.** Toda chamada ao engine (cue, hooks/run, envio de
+  transcript, registro do runtime) leva estes cabeçalhos:
+  - `X-ValorBrain-Client: connect/<versão>`;
+  - `X-ValorBrain-Harness`;
+  - `X-ValorBrain-Install`, um id aleatório por harness, guardado em
+    `connect.json` (`install_id`), sem hostname nem caminho.
+
+  Assim o engine vê a versão que de fato roda, não só a declarada na
+  instalação.
+- **Vindo da 0.10.** O primeiro heal da 0.11 troca o comando dos hooks (uma
+  vez) por todos os harnesses, menos o Codex, e grava `install_id` e
+  `consented_scope: 1` em cada entrada de `connect.json`. Se a ponte do omp ou o
+  plugin do Hermes já tinham um id próprio, ele é reaproveitado.
+- **Limpeza.** Uma versão que nada roda é apagada 24 h depois. O `--remove`
+  apaga o launcher quando nenhum harness o usa mais. O `--status` mostra o
+  launcher, a versão que ele roda, a versão fixada e se há atualização retida.
+- `VALORBRAIN_HOOK_CLIENT=npx` mantém o comando npx.
 
 ```bash
 npm test   # node --test, sem dependências além do yaml

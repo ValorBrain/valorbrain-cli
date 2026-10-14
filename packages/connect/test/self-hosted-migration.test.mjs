@@ -16,7 +16,7 @@ import { CLIENT_VERSION, readHealState, writeHealState } from '../hook.mjs';
 import { SIGNED_ENV, signedManifestHeaders } from './signed-stub.mjs';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
-const { gcLocalClients, isSelfHostedHookCommand, recordHookClients, selfHostedHookCommands } = await import('../index.mjs');
+const { gcClientVersions, isSelfHostedHookCommand, recordHookClients, selfHostedHookCommands } = await import('../index.mjs');
 
 const PKG = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(PKG, 'index.mjs');
@@ -351,8 +351,8 @@ test('hook_clients is kept per harness and path: one scope never erases another,
     recordHookClients(h, 'kiro', [user]);
     assert.deepEqual(readHealState(h).hook_clients, { kiro: { [project]: ['0.10.0'], [user]: ['0.10.1'] } });
     const t = Date.now();
-    gcLocalClients(h, { now: t });
-    assert.deepEqual(gcLocalClients(h, { now: t + 48 * 3600_000 }), [], 'both scopes still run their version');
+    gcClientVersions(h, { now: t });
+    assert.deepEqual(gcClientVersions(h, { now: t + 48 * 3600_000 }), [], 'both scopes still run their version');
     // The project goes back to npx: only that path's record goes.
     writeFileSync(project, 'npx -y @valorbrain/connect@0.10.0 hook stop');
     recordHookClients(h, 'kiro', [project]);

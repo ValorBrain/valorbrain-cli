@@ -6,8 +6,9 @@
  * so `valorbrain setup harness` is not available to them. This is the client half:
  * it asks the engine for the rendered artifacts and writes them.
  *
- * Node built-ins + `yaml` (o config do Hermes é YAML; preservamos o arquivo do
- * cliente e só mesclamos as chaves nossas).
+ * Node built-ins; `yaml` only to merge the Hermes config, loaded lazily: a
+ * version copied under ~/.valorbrain/bin/connect/ has no node_modules, and
+ * neither its hooks nor its self-heal (which never touches MCP entries) need it.
  *
  *   npx @valorbrain/connect                            # detect, approve in the browser, wire everything
  *   npx @valorbrain/connect --token vbm_xxx            # same, with a token you already have
@@ -21,28 +22,35 @@
  * republishing when the rules text changes.
  */
 
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { parseDocument } from "yaml";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import {
-  CLIENT_VERSION, HEAL_NPX_FLAGS, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, credsPath, healPin, kiroEngineFromPayload, listCreds,
-  manifestHealPin, readCreds, readHealState, readStdinPayload, removeCreds, resolveCredentials, runHook, savedApiForToken, setPrivacy,
-  spawnDetached, writeCreds, writeHealState,
+  CLIENT_VERSION, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, clientHeaders, consentedScope, credsPath, ensureInstallIds, logConnect,
+  kiroEngineFromPayload, launcherPin, listCreds, noticePin, readCreds, readHealState, readStdinPayload, removeCreds, resolveCredentials,
+  runHook, savedApiForToken, setPrivacy, writeCreds, writeHealState,
 } from "./hook.mjs";
 import { deviceLabel, deviceLogin, installId, isUnattended, resolveAppUrl } from "./login.mjs";
 import { trustedManifestKeys, verifyManifest } from "./manifest-signature.mjs";
+
+// Optional module: a version copied under ~/.valorbrain/bin/connect/ ships no
+// node_modules, and only an install merging the Hermes YAML config needs it.
+let parseDocument = null;
+try { ({ parseDocument } = await import("yaml")); } catch { /* not installed alongside this copy */ }
 
 const DEFAULT_API = process.env.VALORBRAIN_API_URL || "https://valorbrain-api.valor.digital";
 const BLOCK_BEGIN = "<!-- valorbrain:begin -->";
 const BLOCK_END = "<!-- valorbrain:end -->";
 const TOKEN_PLACEHOLDER = "vbm_<YOUR_TOKEN>";
-/** Engine's HOOK_CLIENT_PLACEHOLDER (src/harness/hosted.ts): the local hook client's path in a client=local manifest. */
-const HOOK_CLIENT_PLACEHOLDER = "<VALORBRAIN_HOOK_CLIENT>";
+/** Engine's launcher placeholder (contract A): the absolute launcher path, substituted after the signature check. */
+const LAUNCHER_PLACEHOLDER = "<VALORBRAIN_HOOK_LAUNCHER>";
+/** Any engine path placeholder left in a file would make the hook run nothing. */
+const PATH_PLACEHOLDER = /<VALORBRAIN_HOOK_(?:LAUNCHER|CLIENT)>/;
 
 const C = process.stdout.isTTY && !process.env.NO_COLOR
   ? { dim: "\x1b[2m", green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m", bold: "\x1b[1m", off: "\x1b[0m" }
@@ -54,8 +62,8 @@ const WARN = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[33m!\x1b[0m" 
 
 /** Flag each saved switch answers to (`--prompt off` → send_prompt). */
 const SWITCH_FLAGS = { send_prompt: "prompt", send_transcript: "transcript", checkpoint: "checkpoint" };
-/** Harnesses whose transcript `--transcript on` sends: the Hermes plugin, and the Stop hook where the engine parses the format. */
-const TRANSCRIPT_HARNESSES = new Set(["hermes", "claude-code", "grok"]);
+/** Harnesses whose transcript `--transcript on` sends: the Hermes plugin, the omp bridge, and the Stop hook where the engine parses the format. */
+const TRANSCRIPT_HARNESSES = new Set(["hermes", "claude-code", "grok", "omp"]);
 
 /** Artifacts that act on every turn — what --mcp-only leaves out. */
 export const isPerTurn = (artifact) => artifact?.kind === "hooks";
@@ -184,10 +192,15 @@ MCP. Hooks read the token from ~/.valorbrain/connect.json (0600) — never from
 the command line. Files you own are edited between ${BLOCK_BEGIN} markers;
 everything else is preserved.
 
-On Linux and macOS the hooks run a local copy of the hook client
-(~/.valorbrain/bin/connect/<version>/hook.mjs, pinned npx as fallback) instead
-of npx on every event; Windows keeps npx. VALORBRAIN_HOOK_CLIENT=npx|local
-overrides.
+The hooks run one stable command, node "~/.valorbrain/bin/connect/launcher.mjs"
+hook …, on every system; updates swap the version it runs under
+~/.valorbrain/bin/connect/ (signed pin, sha512-checked tarball) and never
+touch the harness files again. An update that would collect more by default
+than you installed under waits for you to run this installer.
+VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
+launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version
+it runs are yours and not writable by others; on Windows only the symlink and
+type checks apply (there are no uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
 this package before a single file is written; an unsigned or altered one is
@@ -323,110 +336,362 @@ function mergeToml(existingRaw, renderedRaw, remove) {
 
 // ── plan / apply ────────────────────────────────────────────────────────────
 
-async function fetchManifest(api, harness, { local = false } = {}) {
+async function fetchManifest(api, harness, { launcher = false } = {}) {
   // `hooks=2`: this client speaks hook protocol v2 (ADR-058). An engine that
   // predates it ignores the parameter and answers the v1 manifest, which this
   // client still serves (legacy names, `--token=` on the command line).
-  // `client=local`: hook commands run the local copy of the hook client
-  // (HOOK_CLIENT_PLACEHOLDER, substituted in planFor) with the pinned npx as
-  // fallback. An engine that predates it answers the npx manifest.
-  const url = `${api.replace(/\/$/, "")}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}${local ? "&client=local" : ""}`;
+  // `client=launcher`: hook commands run the stable launcher
+  // (LAUNCHER_PLACEHOLDER, substituted in planFor) and the manifest names the
+  // version, tarball and sha512 it runs. An engine that predates it answers
+  // the npx manifest.
+  const url = `${api.replace(/\/$/, "")}/setup/artifacts?agent=${encodeURIComponent(harness)}&hooks=${HOOK_PROTOCOL}${launcher ? "&client=launcher" : ""}`;
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   // Verified before anything is planned, so an unsigned or tampered manifest
   // never reaches planFor — install, --remove, --status and self-heal alike.
-  // The placeholder is substituted only after this check.
+  // The placeholders are substituted only after this check.
   const checked = verifyManifest({ body: await res.text(), headers: res.headers, harness, keys: trustedManifestKeys(process.env) });
   if (checked.error) throw new Error(`${api}: ${checked.error}`);
   return checked.manifest;
 }
 
-// ── local hook client ───────────────────────────────────────────────────────
+// ── launcher and versioned client (contracts A and C) ──────────────────────
 //
-// `npx -y @valorbrain/connect@<pin> hook` costs ~0.6s warm and ~2.7s cold on
-// EVERY hook event. The hook client (hook.mjs) needs nothing but node, so
-// connect copies it to ~/.valorbrain/bin/connect/<version>/ and the hooks run
-// `node "<that file>" hook … || npx -y @valorbrain/connect@<pin> hook …`.
+// Every hook runs `node "~/.valorbrain/bin/connect/launcher.mjs" hook …`. The
+// launcher reads current.json and runs ./<version>/hook.mjs. An update is a
+// new ./<version>/ plus a new current.json: the harness config files are
+// written once (the human's install) and never again for a version bump.
 //
-// Default on Linux and macOS, where every harness runs hook commands through
-// sh/bash. Windows keeps the npx command: Gemini CLI falls back to Windows
-// PowerShell 5.1 when pwsh is absent, and `||` does not parse there.
-// VALORBRAIN_HOOK_CLIENT=npx|local overrides.
+// The code of a version arrives one of two ways:
+//   - this very package, when it IS the pinned version (the install by npx);
+//   - the npm tarball the SIGNED manifest names (`hook_client_tarball`),
+//     checked against its signed sha512 (`hook_client_integrity`), unpacked
+//     by the small tar reader below into a temp dir, renamed into place.
+// Never a tag, a range, or a version the signed manifest did not name.
+//
+// VALORBRAIN_HOOK_CLIENT=npx keeps the npx hook command instead.
 
-export function localClientWanted(env = process.env, platform = process.platform) {
-  if (env.VALORBRAIN_HOOK_CLIENT === "npx") return false;
-  if (env.VALORBRAIN_HOOK_CLIENT === "local") return true;
-  return platform !== "win32";
+export function launcherWanted(env = process.env) {
+  return env.VALORBRAIN_HOOK_CLIENT !== "npx";
 }
 
-export function localClientRoot(home) {
+export function clientRoot(home) {
   return join(home, ".valorbrain", "bin", "connect");
 }
 
-/** The entry point of one installed version, as written into hook commands (forward slashes: node takes them on Windows too). */
-export function localClientFile(home, version = CLIENT_VERSION) {
-  return join(localClientRoot(home), version, "hook.mjs").replace(/\\/g, "/");
+/** The launcher as written into hook commands (forward slashes: node takes them on Windows too). */
+export function launcherPath(home) {
+  return join(clientRoot(home), "launcher.mjs").replace(/\\/g, "/");
 }
 
-/** Files the local client needs: the hook client and the signature check heal-dispatch uses. hook.mjs goes last — its presence means the copy is complete. */
-const LOCAL_CLIENT_FILES = ["manifest-signature.mjs", "hook.mjs"];
-
-/**
- * Copy this package's hook client to ~/.valorbrain/bin/connect/<version>/:
- * directories 0700, files 0644 written tmp + rename, a file already identical
- * left alone. Returns the path for the hook commands, or null (never throws):
- * the caller then keeps the npx hooks. A path a shell or a JSON string would
- * have to escape is refused — the placeholder is substituted as plain text.
- */
-export function installLocalClient(home, { version = CLIENT_VERSION, srcDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
-  const file = localClientFile(home, version);
-  if (/["'`$%!\\\r\n]/.test(file)) return null;
+export function readCurrent(home) {
   try {
-    const dir = join(localClientRoot(home), version);
-    for (const d of [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), localClientRoot(home), dir]) {
-      mkdirSync(d, { recursive: true, mode: 0o700 });
-      const st = lstatSync(d);
-      // Someone else's directory, or a link to one, would hand them the code every hook runs.
-      if (!st.isDirectory() || (typeof process.getuid === "function" && st.uid !== process.getuid())) return null;
-      if (d !== join(home, ".valorbrain")) chmodSync(d, 0o700);
-    }
-    for (const name of LOCAL_CLIENT_FILES) {
-      const src = readFileSync(join(srcDir, name));
-      const dest = join(dir, name);
-      let same = false;
-      try { same = readFileSync(dest).equals(src) && (statSync(dest).mode & 0o022) === 0; } catch { /* absent */ }
-      if (same) continue;
-      const tmp = `${dest}.tmp-${process.pid}-${Date.now()}`;
-      writeFileSync(tmp, src, { mode: 0o644 });
-      chmodSync(tmp, 0o644);
-      renameSync(tmp, dest);
-    }
-    return file;
+    const c = JSON.parse(readFileSync(join(clientRoot(home), "current.json"), "utf-8"));
+    return c && typeof c.version === "string" ? c : null;
   } catch {
     return null;
   }
 }
 
-/** Versions of the local client a hook file runs. */
+/** What a version directory holds when this package copies itself. */
+const SELF_FILES = ["package.json", "manifest-signature.mjs", "login.mjs", "launcher.mjs", "index.mjs", "hook.mjs"];
+const MAX_TARBALL_BYTES = 10 * 1024 * 1024;
+const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Create ~/.valorbrain/bin/connect and make the whole chain ours: every hook
+ * runs code from there, so a directory on the way that another user owns or
+ * can write to would let them swap `connect/` for their own. `.valorbrain`
+ * and `bin` lose group/other write, `connect` is 0700; anything not ours, a
+ * symlink for `bin` or `connect`, or still writable by others is refused —
+ * '' when safe, else the reason. Paths a shell or a JSON string would have to
+ * escape are refused too (the launcher path is substituted as plain text).
+ * Windows: no uid or mode bits to check (ACLs), only type and symlink.
+ */
+export function ensureClientRoot(home) {
+  if (/["'`$%!\\\r\n]/.test(launcherPath(home))) return "the path needs quoting";
+  const posix = process.platform !== "win32" && typeof process.getuid === "function";
+  try {
+    const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
+    for (const [i, d] of chain.entries()) {
+      mkdirSync(d, { recursive: true, mode: 0o700 });
+      // ~/.valorbrain may be a symlink the person made (dotfiles); its target is checked.
+      const st = i === 0 ? statSync(d) : lstatSync(d);
+      if (st.isSymbolicLink()) return `${d} is a symlink`;
+      if (!st.isDirectory()) return `${d} is not a directory`;
+      if (!posix) continue;
+      if (st.uid !== process.getuid()) return `${d} belongs to another user`;
+      const mode = i === chain.length - 1 ? 0o700 : st.mode & 0o755;
+      if ((st.mode & 0o777) !== mode) chmodSync(d, mode);
+      if ((statSync(d).mode & 0o022) !== 0) return `${d} is writable by others`;
+    }
+    return "";
+  } catch (err) {
+    return err?.code || "not creatable";
+  }
+}
+
+function writeFileAtomic(path, data, mode = 0o644) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, data, { mode });
+  chmodSync(tmp, mode);
+  renameSync(tmp, path);
+}
+
+/** True when <version>/ is a complete, safe copy of that version. */
+function versionInstalled(home, version) {
+  const dir = join(clientRoot(home), version);
+  try {
+    const st = lstatSync(dir);
+    if (!st.isDirectory() || st.isSymbolicLink() || (st.mode & 0o022) !== 0) return false;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false;
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8"));
+    return pkg.version === version && existsSync(join(dir, "hook.mjs")) && existsSync(join(dir, "index.mjs"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a gzipped npm tarball (ustar, with pax and GNU long-name records) into
+ * the regular files under `package/`. A reader of our own, not the system
+ * `tar`: Windows may have none, a spawned tar would follow the archive's own
+ * paths and links, and the archive is small and of one known shape. Links,
+ * devices, absolute paths and `..` are never extracted. Throws on anything
+ * malformed.
+ */
+export function untarPackage(gz) {
+  const buf = gunzipSync(gz, { maxOutputLength: MAX_UNPACKED_BYTES });
+  const files = [];
+  let longName = null;
+  for (let off = 0; off + 512 <= buf.length;) {
+    const header = buf.subarray(off, off + 512);
+    if (header.every((b) => b === 0)) break;
+    const field = (start, len) => header.subarray(start, start + len).toString("utf-8").replace(/\0[\s\S]*$/, "");
+    const size = parseInt(field(124, 12).trim() || "0", 8);
+    if (!Number.isFinite(size) || size < 0 || off + 512 + size > buf.length) throw new Error("malformed tar entry");
+    const type = String.fromCharCode(header[156]);
+    const body = buf.subarray(off + 512, off + 512 + size);
+    off += 512 + Math.ceil(size / 512) * 512;
+    if (type === "x" || type === "L") {
+      const text = body.toString("utf-8");
+      longName = type === "L" ? text.replace(/\0[\s\S]*$/, "") : (/(?:^|\n)\d+ path=([^\n]*)\n/.exec(text)?.[1] ?? longName);
+      continue;
+    }
+    if (type === "g") continue;
+    const prefix = field(345, 155);
+    const name = longName ?? (prefix ? `${prefix}/${field(0, 100)}` : field(0, 100));
+    longName = null;
+    if (type !== "0" && type !== "\0") continue; // dirs are implied; links and devices never extracted
+    const rel = name.startsWith("package/") ? name.slice(8) : null;
+    if (!rel || rel.includes("\\") || rel.split("/").some((s) => s === "" || s === "." || s === "..")) throw new Error(`refusing tar path ${JSON.stringify(name)}`);
+    files.push({ name: rel, data: Buffer.from(body) });
+    if (files.length > 1000) throw new Error("tarball has too many files");
+  }
+  return files;
+}
+
+/** `sha512-…` from an npm integrity string (which may list several hashes). */
+function sha512Of(integrity) {
+  return String(integrity ?? "").split(/\s+/).find((h) => /^sha512-[A-Za-z0-9+/]+={0,2}$/.test(h)) ?? null;
+}
+
+/** https, or http to this machine only (a self-hosted or test engine): the signed sha512 is what makes a tarball trusted, not the transport. */
+function tarballUrlAllowed(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || (u.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
+/** A lock file under the client root: one placer per version at a time; a lock older than this is a crashed heal. */
+const PLACE_LOCK_STALE_MS = 120_000;
+
+function tryLock(path) {
+  try {
+    closeSync(openSync(path, "wx", 0o600));
+    return true;
+  } catch {
+    try {
+      if (Date.now() - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) {
+        unlinkSync(path);
+        closeSync(openSync(path, "wx", 0o600));
+        return true;
+      }
+    } catch { /* lost the race */ }
+    return false;
+  }
+}
+
+/**
+ * Fill a temp dir and move it into <version>/, under a per-version lock: two
+ * heals racing never remove what the other placed. Whoever finds the version
+ * already complete under the lock stops there (same pin, same signed bytes);
+ * a broken <version>/ is replaced only by the lock holder. current.json is
+ * written only after this returns with the version complete, so it never
+ * names a missing directory.
+ */
+async function placeVersion(home, version, fill, { waitMs = 90_000 } = {}) {
+  const lock = join(clientRoot(home), `.lock-${version}`);
+  const until = Date.now() + waitMs;
+  while (!tryLock(lock)) {
+    if (Date.now() > until) throw new Error(`another heal holds ${version}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  const dest = join(clientRoot(home), version);
+  const tmp = join(clientRoot(home), `.tmp-${version}-${process.pid}-${Date.now()}`);
+  try {
+    if (versionInstalled(home, version)) return;
+    mkdirSync(tmp, { mode: 0o700 });
+    fill(tmp);
+    chmodSync(tmp, 0o700);
+    if (existsSync(dest)) rmSync(dest, { recursive: true, force: true }); // incomplete or unsafe; only the lock holder gets here
+    renameSync(tmp, dest);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * The tarball body, at most `maxBytes`: refused up front by Content-Length and
+ * aborted mid-stream as soon as it grows past the cap, so a hostile or broken
+ * server can never make a heal hold more than that in memory.
+ */
+async function readCapped(res, maxBytes, abort) {
+  const declared = Number(res.headers?.get?.("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    abort();
+    throw new Error("tarball too large");
+  }
+  if (!res.body) return Buffer.from(await res.arrayBuffer());
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of res.body) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      abort();
+      throw new Error("tarball too large");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Download one exact version from `tarball`, check it against `integrity`
+ * (sha512, npm `dist.integrity`) before unpacking anything, and place it at
+ * <version>/. Throws with a short reason; writes nothing on any mismatch.
+ */
+export async function downloadClientVersion(home, { version, tarball, integrity }, { fetchImpl = (u, i) => fetch(u, i), maxBytes = MAX_TARBALL_BYTES } = {}) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(String(version))) throw new Error("no exact version");
+  const expected = sha512Of(integrity);
+  if (!expected) throw new Error("no sha512 integrity");
+  if (!tarballUrlAllowed(tarball)) throw new Error("tarball URL is not https");
+  const unsafe = ensureClientRoot(home);
+  if (unsafe) throw new Error(`unsafe client directory: ${unsafe}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 60_000);
+  let gz;
+  try {
+    const res = await fetchImpl(tarball, { signal: controller.signal });
+    if (!res.ok) throw new Error(`tarball HTTP ${res.status}`);
+    gz = await readCapped(res, maxBytes, () => controller.abort());
+  } finally {
+    clearTimeout(timer);
+  }
+  const got = `sha512-${createHash("sha512").update(gz).digest("base64")}`;
+  if (got !== expected) throw new Error("tarball integrity mismatch");
+  const files = untarPackage(gz);
+  const pkg = JSON.parse(files.find((f) => f.name === "package.json")?.data.toString("utf-8") ?? "{}");
+  if (pkg.name !== "@valorbrain/connect" || pkg.version !== version) throw new Error(`tarball is ${pkg.name}@${pkg.version}, not @valorbrain/connect@${version}`);
+  await placeVersion(home, version, (tmp) => {
+    for (const f of files) {
+      const dest = join(tmp, ...f.name.split("/"));
+      mkdirSync(dirname(dest), { recursive: true, mode: 0o700 });
+      writeFileSync(dest, f.data, { mode: 0o644 });
+      chmodSync(dest, 0o644);
+    }
+  });
+  if (!versionInstalled(home, version)) throw new Error("unpacked version is incomplete");
+}
+
+/**
+ * Make the pinned version of a `client=launcher` manifest runnable: its
+ * directory, current.json and the launcher itself. Returns the launcher path,
+ * or `{ error }`. When the pin is this package, it copies itself; otherwise it
+ * downloads the signed tarball.
+ */
+export async function ensureLauncher(home, manifest, { fetchImpl, selfDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
+  const version = launcherPin(manifest?.hook_client_version);
+  if (manifest?.hook_client !== "launcher" || !version) return { error: "the manifest names no launcher version" };
+  const unsafe = ensureClientRoot(home);
+  if (unsafe) return { error: `unsafe client directory: ${unsafe}` };
+  try {
+    if (!versionInstalled(home, version)) {
+      if (version === CLIENT_VERSION) {
+        await placeVersion(home, version, (tmp) => {
+          for (const name of SELF_FILES) writeFileSync(join(tmp, name), readFileSync(join(selfDir, name)), { mode: 0o644 });
+        });
+        if (!versionInstalled(home, version)) return { error: "could not copy this package" };
+      } else {
+        await downloadClientVersion(home, { version, tarball: manifest.hook_client_tarball, integrity: manifest.hook_client_integrity }, { fetchImpl });
+      }
+    }
+    // The launcher itself: the newest one a verified version ships, same path.
+    const shipped = join(clientRoot(home), version, "launcher.mjs");
+    const target = join(clientRoot(home), "launcher.mjs");
+    if (existsSync(shipped)) {
+      const src = readFileSync(shipped);
+      let same = false;
+      try { same = readFileSync(target).equals(src); } catch { /* absent */ }
+      if (!same) writeFileAtomic(target, src);
+    }
+    if (!existsSync(target)) return { error: `version ${version} ships no launcher` };
+    const current = readCurrent(home);
+    if (current?.version !== version || current?.integrity !== (manifest.hook_client_integrity ?? null)) {
+      writeFileAtomic(join(clientRoot(home), "current.json"), JSON.stringify({
+        version,
+        integrity: manifest.hook_client_integrity ?? null,
+        data_scope: Number.isInteger(manifest.data_scope) ? manifest.data_scope : 1,
+        installed_at: new Date().toISOString(),
+      }) + "\n");
+    }
+    return { launcher: launcherPath(home), version };
+  } catch (err) {
+    return { error: err?.message || String(err) };
+  }
+}
+
+/** Versions of the 0.10 local client a hook file runs (`…/connect/<v>/hook.mjs`). */
 export function hookClientVersions(text) {
   return [...String(text ?? "").matchAll(/\.valorbrain[\\/]+bin[\\/]+connect[\\/]+([^\\/"'\s]+)[\\/]+hook\.mjs/g)].map((m) => m[1]);
 }
 
+/** True when a hook file runs the 0.11 launcher. */
+export function launcherReferenced(text) {
+  return /\.valorbrain[\\/]+bin[\\/]+connect[\\/]+launcher\.mjs/.test(String(text ?? ""));
+}
+
 /**
- * Record which local client versions each of this harness's hook files runs
- * (read back from disk: a hand edit the heal kept counts), in connect-state.json
- * `hook_clients: { <harness>: { <path>: [versions] } }`. Only the paths given
- * change: the same harness installed in another scope (a project's
- * `.kiro/hooks`) keeps its versions. A path with none (removed, back to npx)
- * is dropped.
+ * Record what each of this harness's hook files runs (read back from disk: a
+ * hand edit the heal kept counts), in connect-state.json
+ * `hook_clients: { <harness>: { <path>: [versions | "launcher"] } }`. Only the
+ * paths given change: the same harness installed in another scope keeps its
+ * record. A path running neither (removed, npx) is dropped.
  */
 export function recordHookClients(home, harness, paths) {
   const state = readHealState(home);
   const byPath = { ...(state.hook_clients?.[harness] || {}) };
   for (const p of paths) {
-    let versions = [];
-    try { versions = [...new Set(hookClientVersions(readFileSync(p, "utf-8")))]; } catch { /* absent */ }
-    if (versions.length > 0) byPath[p] = versions;
+    let uses = [];
+    try {
+      const text = readFileSync(p, "utf-8");
+      uses = [...new Set(hookClientVersions(text)), ...(launcherReferenced(text) ? ["launcher"] : [])];
+    } catch { /* absent */ }
+    if (uses.length > 0) byPath[p] = uses;
     else delete byPath[p];
   }
   const clients = { ...(state.hook_clients || {}) };
@@ -435,52 +700,56 @@ export function recordHookClients(home, harness, paths) {
   writeHealState(home, { ...state, hook_clients: clients });
 }
 
-/** A version no hook file runs any more is deleted this long after it was first seen unused: a running Claude Code session keeps the hook commands it started with. */
-const LOCAL_CLIENT_GRACE_MS = 24 * 3600 * 1000;
+/** A version nothing runs any more is deleted this long after it was first seen unused: a running Claude Code session keeps the hook commands it started with. */
+const CLIENT_GRACE_MS = 24 * 3600 * 1000;
 
 /**
- * Delete local client versions no harness runs. `keep` (the version this run
- * just installed) stays; `graceMs: 0` deletes at once (--remove). Returns the
- * versions deleted.
+ * Delete client versions nothing runs: not current.json's, not `keep`, not one
+ * a hook file still names (a Codex hook still on 0.10's local copy). Leftover
+ * temp dirs go too. `graceMs: 0` (--remove) deletes at once and, when no hook
+ * file runs the launcher and no omp/Hermes entry (whose bridge and plugin call
+ * it) remains, the launcher and current.json as well. Returns what it deleted.
  */
-export function gcLocalClients(home, { now = Date.now(), graceMs = LOCAL_CLIENT_GRACE_MS, keep = null } = {}) {
-  const root = localClientRoot(home);
+export function gcClientVersions(home, { now = Date.now(), graceMs = CLIENT_GRACE_MS, keep = null } = {}) {
+  const root = clientRoot(home);
   let entries = [];
   try { entries = readdirSync(root); } catch { return []; }
   const state = readHealState(home);
-  const used = new Set(Object.values(state.hook_clients || {}).flatMap((byPath) => Object.values(byPath || {}).flat()));
+  const uses = new Set(Object.values(state.hook_clients || {}).flatMap((byPath) => Object.values(byPath || {}).flat()));
+  const launcherUsed = uses.has("launcher") || ["omp", "hermes"].some((h) => readCreds(home, h));
+  const used = new Set(uses);
   if (keep) used.add(keep);
+  const current = readCurrent(home)?.version;
+  if (current && (launcherUsed || graceMs > 0)) used.add(current);
   const unused = { ...(state.hook_clients_unused_since || {}) };
   const deleted = [];
   for (const v of entries) {
+    const path = join(root, v);
+    if (v.startsWith(".tmp-")) {
+      try { if (graceMs === 0 || now - statSync(path).mtimeMs > 3600 * 1000) rmSync(path, { recursive: true, force: true }); } catch { /* gone */ }
+      continue;
+    }
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v)) continue; // launcher.mjs, current.json
     if (used.has(v)) { delete unused[v]; continue; }
     const since = unused[v] ?? now;
     if (graceMs > 0 && now - since < graceMs) { unused[v] = since; continue; }
     try {
-      rmSync(join(root, v), { recursive: true, force: true });
+      rmSync(path, { recursive: true, force: true });
       deleted.push(v);
       delete unused[v];
     } catch { unused[v] = since; }
   }
   for (const v of Object.keys(unused)) if (!entries.includes(v)) delete unused[v];
   writeHealState(home, { ...readHealState(home), hook_clients_unused_since: unused });
-  if (graceMs === 0) {
+  if (graceMs === 0 && !launcherUsed) {
+    for (const f of ["launcher.mjs", "current.json"]) {
+      try { if (existsSync(join(root, f))) { unlinkSync(join(root, f)); deleted.push(f); } } catch { /* fail-open */ }
+    }
     for (const d of [root, dirname(root)]) {
       try { if (readdirSync(d).length === 0) rmSync(d, { recursive: true }); } catch { /* absent or not empty */ }
     }
   }
   return deleted;
-}
-
-/**
- * The local hook client for a client=local manifest: the path to substitute,
- * or null when this run must keep the npx hooks — the engine pins another
- * version (only that version may run; its first hook or heal installs it), or
- * the copy could not be written. `install: false` only computes the path (--dry-run).
- */
-function localClientFor(manifest, home, { install = true } = {}) {
-  if (manifest?.hook_client !== "local" || healPin(manifest.hook_client_version) !== CLIENT_VERSION) return null;
-  return install ? installLocalClient(home) : localClientFile(home);
 }
 
 // ── scope: where harness-local files land ───────────────────────────────────
@@ -566,10 +835,15 @@ const KIRO_OTHER_MODE_FILES = {
   legacy: [".kiro/hooks/valorbrain.json"], // v3 standalone file
 };
 
+/** A connect hook command in a kiro file: npx, the 0.10 local copy or the 0.11 launcher. */
+function runsConnect(text) {
+  return text.includes("@valorbrain/connect") || hookClientVersions(text).length > 0 || launcherReferenced(text);
+}
+
 function isOurStandaloneHooks(raw) {
   try {
     const j = JSON.parse(raw);
-    return j?.version === "v1" && Array.isArray(j.hooks) && JSON.stringify(j).includes("@valorbrain/connect");
+    return j?.version === "v1" && Array.isArray(j.hooks) && runsConnect(JSON.stringify(j));
   } catch {
     return false;
   }
@@ -578,7 +852,7 @@ function isOurStandaloneHooks(raw) {
 function isOurAgentConfig(raw) {
   try {
     const j = JSON.parse(raw);
-    return j?.name === "valorbrain" && JSON.stringify(j).includes("@valorbrain/connect");
+    return j?.name === "valorbrain" && runsConnect(JSON.stringify(j));
   } catch {
     return false;
   }
@@ -641,6 +915,7 @@ export function kiroProjectHasOurHooks(root, { exists = existsSync, read = (p) =
  * chaves de `env` que o manifest trouxer), preservando comentários e o resto.
  */
 function mergeYaml(existingRaw, renderedRaw, remove) {
+  if (!parseDocument) throw new Error("the yaml module is not installed here — run: npx -y @valorbrain/connect");
   const existing = parseDocument(existingRaw ?? "");
   if (existing.errors.length > 0) {
     throw new Error("existing config is not valid YAML — refusing to overwrite");
@@ -701,14 +976,14 @@ export function manifestTarget(rawPath, home, cwd = process.cwd()) {
  * `remove`: true takes every artifact out (--remove); a function picks the
  * artifacts to take out and keeps the rest (--mcp-only drops the per-turn
  * ones). A picked artifact with no file on disk is skipped, never created.
- * `hookClient`: the installed local hook client, substituted for
- * HOOK_CLIENT_PLACEHOLDER (client=local manifests only).
+ * `launcher`: the installed launcher path, substituted for
+ * LAUNCHER_PLACEHOLDER (client=launcher manifests only).
  * `migrateSelfHosted` (explicit install only): self-hosted ValorBrain hook
  * entries in the same hook files are replaced, and listed in the change's
  * `replacesSelfHosted`. Without it (self-heal) they are never touched: a
  * whole hook file of ours holding them is left as is (`selfHostedKept`).
  */
-function planFor(manifest, token, home, remove, cwd = process.cwd(), { hookClient = null, migrateSelfHosted = false } = {}) {
+function planFor(manifest, token, home, remove, cwd = process.cwd(), { launcher = null, migrateSelfHosted = false } = {}) {
   const changes = [];
   // Two artifacts can share a file (Gemini keeps MCP servers and hooks in
   // settings.json): each must build on what the previous one will write, or
@@ -729,14 +1004,14 @@ function planFor(manifest, token, home, remove, cwd = process.cwd(), { hookClien
     // (OpenCode stores an absolute instructions path in its config).
     const rendered = artifact.contents
       .split(TOKEN_PLACEHOLDER).join(token || TOKEN_PLACEHOLDER)
-      .split(HOOK_CLIENT_PLACEHOLDER).join(hookClient || HOOK_CLIENT_PLACEHOLDER)
+      .split(LAUNCHER_PLACEHOLDER).join(launcher || LAUNCHER_PLACEHOLDER)
       .split('"~/').join(`"${home}/`);
 
     let after;
     let selfHostedKept = false;
     try {
-      // A hook that names the placeholder would only ever run its npx fallback.
-      if (!rm && rendered.includes(HOOK_CLIENT_PLACEHOLDER)) throw new Error("the local hook client is not installed — refusing to write its placeholder");
+      // A hook that names a path placeholder would run nothing at all.
+      if (!rm && PATH_PLACEHOLDER.test(rendered)) throw new Error("the launcher is not installed — refusing to write its placeholder");
       if (artifact.kind === "mcp" && /\.ya?ml$/.test(path)) {
         // Hermes: config.yaml é do cliente; mescla por chave, nunca overwrite.
         after = mergeYaml(before, rendered, rm);
@@ -919,13 +1194,13 @@ function writeBackup(path, contents) {
  */
 function isOurHookEntry(entry) {
   const s = JSON.stringify(entry ?? "");
-  return s.includes("@valorbrain/connect") || s.includes("valorbrain hook") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0;
+  return s.includes("@valorbrain/connect") || s.includes("valorbrain hook") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0 || launcherReferenced(s);
 }
 
-/** A hook entry connect wrote: npx @valorbrain/connect, the 0.1.x bin, or the local client. */
+/** A hook entry connect wrote: npx @valorbrain/connect, the 0.1.x bin, the 0.10 local client or the 0.11 launcher. */
 function isConnectHookEntry(entry) {
   const s = JSON.stringify(entry ?? "");
-  return s.includes("@valorbrain/connect") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0;
+  return s.includes("@valorbrain/connect") || s.includes("valorbrain-connect hook") || hookClientVersions(s).length > 0 || launcherReferenced(s);
 }
 
 /**
@@ -1069,7 +1344,7 @@ function statusFor(manifest, home) {
         detail: ok ? (tokenSet ? "registered" : "registered but token is still the placeholder") : "not registered",
       });
     } else if (artifact.kind === "hooks") {
-      const ours = body.includes("@valorbrain/connect") || body.includes("valorbrain-connect") || hookClientVersions(body).length > 0;
+      const ours = body.includes("@valorbrain/connect") || body.includes("valorbrain-connect") || hookClientVersions(body).length > 0 || launcherReferenced(body);
       const legacy = /--token=/.test(body);
       rows.push({
         kind: "hooks",
@@ -1092,12 +1367,17 @@ function statusFor(manifest, home) {
   return rows;
 }
 
-/** Which client a hook file runs, for --status: the local copy (and its version) or npx. */
+/** Which client a hook file runs, for --status: the launcher (and the version it runs), a 0.10 local copy, or npx. */
 export function hookClientDetail(body, home) {
+  if (launcherReferenced(body)) {
+    const current = readCurrent(home)?.version;
+    if (!existsSync(join(clientRoot(home), "launcher.mjs"))) return "client: launcher (missing — those hooks stay silent until the next install)";
+    return current ? `client: launcher → ${current}` : "client: launcher (no current.json — silent until the next heal)";
+  }
   const local = [...new Set(hookClientVersions(body))];
   if (local.length > 0) {
-    const missing = local.filter((v) => !existsSync(localClientFile(home, v)));
-    return `client: local ${local.join(", ")}${missing.length ? ` (missing: ${missing.join(", ")} — those hooks fall back to npx until the next heal)` : ""}`;
+    const missing = local.filter((v) => !existsSync(join(clientRoot(home), v, "hook.mjs")));
+    return `client: local ${local.join(", ")}${missing.length ? ` (missing: ${missing.join(", ")} — those hooks fall back to npx)` : ""}`;
   }
   const pinned = [...new Set([...String(body).matchAll(/@valorbrain\/connect@([^\s"'\\]+)/g)].map((m) => m[1]))];
   return pinned.length > 0 ? `client: npx ${pinned.join(", ")}` : "client: npx (unpinned)";
@@ -1323,14 +1603,14 @@ async function main() {
   // before any login, so a harness the engine cannot serve never costs an
   // approval or a token.
   const manifestCache = new Map();
-  // Installs ask for the local hook client; --status and --remove read the
-  // npx manifest (they only need the artifact paths).
-  const wantLocal = !args.status && !args.remove && !args.mcpOnly && localClientWanted(process.env);
-  const loadManifest = (harness, local = wantLocal) => {
+  // Installs and --status ask for the launcher manifest (it names the pin);
+  // --remove and --mcp-only read the npx one (they only need the artifact paths).
+  const wantLauncher = !args.remove && !args.mcpOnly && launcherWanted(process.env);
+  const loadManifest = (harness, local = wantLauncher) => {
     const api = apiFor(harness);
     const key = `${api}|${harness}|${local}`;
     if (!manifestCache.has(key)) {
-      const pending = fetchManifest(api, harness, { local });
+      const pending = fetchManifest(api, harness, { launcher: local });
       pending.catch(() => {}); // awaited by the caller; never an unhandled rejection
       manifestCache.set(key, pending);
     }
@@ -1431,6 +1711,10 @@ async function main() {
     }
   }
 
+  // 0.11 migration: every saved harness gets its install id and consented scope.
+  if (!args.status && !args.dryRun) {
+    try { ensureInstallIds(home); } catch { /* fail-open */ }
+  }
   const icon = { ok: `${C.green}●${C.off}`, drift: `${C.yellow}◐${C.off}`, missing: `${C.red}○${C.off}` };
   const credsLabel = credsPath(home).replace(home, "~");
 
@@ -1484,6 +1768,21 @@ async function main() {
           ? `  ${icon.ok} creds ${credsLabel} (${saved.api ?? "default API"})`
           : `  ${icon.missing} creds none for ${harness} in ${credsLabel} — hooks stay silent until you run npx -y @valorbrain/connect`);
       }
+      {
+        // The launcher, the version it runs, the engine's pin, and why an update is held.
+        const current = readCurrent(home);
+        const pin = manifest.hook_client === "launcher" ? manifest.hook_client_version : null;
+        const state = readHealState(home);
+        const blocked = state.update_blocked?.[harness];
+        const notes = [
+          pin ? `pin ${pin}${current?.version && current.version !== pin ? " — behind, the next heal updates it" : ""}` : null,
+          blocked ? `update held: the engine's data_scope ${blocked.scope} is above what was consented (${consentedScope(home, harness)}); run the installer to review` : null,
+          state.needs_reinstall?.[harness] ? `needs reinstall: run npx -y @valorbrain/connect --harness ${harness} (then trust the new hook command once)` : null,
+        ].filter(Boolean);
+        if (existsSync(join(clientRoot(home), "launcher.mjs")) || pin) {
+          console.log(`  ${existsSync(join(clientRoot(home), "launcher.mjs")) ? icon.ok : icon.missing} launcher ${launcherPath(home).replace(home, "~")} → ${current?.version ?? "none"}${notes.length ? ` (${notes.join("; ")})` : ""}`);
+        }
+      }
       console.log();
       continue;
     }
@@ -1504,7 +1803,8 @@ async function main() {
         console.log(`  ${C.green}→${C.off} write ${what} ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
       } else {
         try {
-          writeCreds(home, { api: apiFor(harness), token: tokenFor(harness), harness, kiroEngine: args.kiroEngine, mcpOnly });
+          // The person is here: what this install collects is what they consented to (contract C).
+          writeCreds(home, { api: apiFor(harness), token: tokenFor(harness), harness, kiroEngine: args.kiroEngine, mcpOnly, ...(Number.isInteger(manifest.data_scope) ? { consentedScope: manifest.data_scope } : {}) });
           console.log(`  ${C.green}✓${C.off} ${what} ${C.dim}${credsLabel} [${harness}] (0600)${C.off}`);
         } catch (err) {
           console.log(`  ${C.red}✗${C.off} hook credentials: ${err.message}`);
@@ -1514,17 +1814,20 @@ async function main() {
       }
     }
 
-    // client=local: the hooks run the local copy of this version's hook
-    // client. When the engine pins another version, or the copy cannot be
-    // written, the npx manifest is installed instead (the pinned version's
-    // first heal moves it to its own local copy).
-    let hookClient = null;
-    if (!args.remove && !mcpOnly && manifest.hook_client === "local") {
-      hookClient = localClientFor(manifest, home, { install: !args.dryRun });
-      if (hookClient) {
-        console.log(`  ${C.green}${args.dryRun ? "→" : "✓"}${C.off} local hook client ${CLIENT_VERSION} ${C.dim}${hookClient.replace(home, "~")} (no npx per event)${C.off}`);
+    // client=launcher: the hooks run the stable launcher, which runs the
+    // pinned version under ~/.valorbrain/bin/connect/. When the pin cannot be
+    // installed (no launcher in the manifest, unsafe directory, a download
+    // that failed its check) the npx manifest is installed instead.
+    let launcher = null;
+    if (!args.remove && !mcpOnly && manifest.hook_client === "launcher") {
+      const pin = manifest.hook_client_version;
+      const r = args.dryRun
+        ? (launcherPin(pin) ? { launcher: launcherPath(home), version: pin } : { error: `the engine pins ${pin}, which has no launcher` })
+        : await ensureLauncher(home, manifest);
+      if (r.launcher) {
+        launcher = r.launcher;
+        console.log(`  ${C.green}${args.dryRun ? "→" : "✓"}${C.off} hook launcher → ${r.version} ${C.dim}${launcher.replace(home, "~")} (updates never touch the files below again)${C.off}`);
       } else {
-        const pin = manifest.hook_client_version;
         try {
           manifest = scopedManifest(await loadManifest(harness, false), { harness, scope: args.scope, home, kiroEngine: args.kiroEngine });
         } catch (err) {
@@ -1532,17 +1835,12 @@ async function main() {
           failed++;
           continue;
         }
-        const why = pin === CLIENT_VERSION
-          ? "the local hook client could not be written"
-          : healPin(pin)
-            ? `the engine pins ${pin} (this is ${CLIENT_VERSION}); its first self-heal installs the local copy`
-            : `the engine pins ${pin}, which has no local hook client`;
-        console.log(`  ${C.dim}note: hooks run npx @valorbrain/connect@${pin} — ${why}${C.off}`);
+        console.log(`  ${C.dim}note: hooks run npx @valorbrain/connect@${pin} — ${r.error}${C.off}`);
       }
     }
     // An explicit install replaces self-hosted ValorBrain hooks in the same
     // files (listed in the plan); --mcp-only and --remove never touch them.
-    const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove, process.cwd(), { hookClient, migrateSelfHosted: !args.remove && !mcpOnly });
+    const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove, process.cwd(), { launcher, migrateSelfHosted: !args.remove && !mcpOnly });
     if (!args.remove) await confirmHandEdits(changes, home, args);
     const res = apply(changes, args);
     if (!args.dryRun) recordWritten(home, changes, { forget: args.remove });
@@ -1585,14 +1883,24 @@ async function main() {
         } catch { /* fail-open */ }
       }
     }
-    if (!args.dryRun) {
-      // Which local client versions this harness now runs; versions nobody
-      // runs go (--remove: at once).
-      recordHookClients(home, harness, [...changes.filter((c) => isPerTurn(c.artifact)).map((c) => c.path), ...pruned]);
-      gcLocalClients(home, args.remove ? { graceMs: 0 } : { keep: hookClient ? CLIENT_VERSION : null });
-    }
     if (args.remove && !args.dryRun && removeCreds(home, harness)) {
       console.log(`  ${C.green}✓${C.off} delete hook credentials ${C.dim}${credsLabel} [${harness}]${C.off}`);
+    }
+    if (!args.dryRun) {
+      // What this harness now runs; versions nothing runs go (--remove: at
+      // once, and the launcher too once no harness runs it).
+      recordHookClients(home, harness, [...changes.filter((c) => isPerTurn(c.artifact)).map((c) => c.path), ...pruned]);
+      const gone = gcClientVersions(home, args.remove ? { graceMs: 0 } : {});
+      if (args.remove && gone.includes("launcher.mjs")) console.log(`  ${C.green}✓${C.off} delete the hook launcher ${C.dim}${launcherPath(home).replace(home, "~")} (no harness runs it any more)${C.off}`);
+      // A person ran the installer: a held update (scope) and a Codex reinstall are settled.
+      const st = readHealState(home);
+      if (st.update_blocked?.[harness] || st.needs_reinstall?.[harness]) {
+        const blocked = { ...(st.update_blocked || {}) };
+        const reinstall = { ...(st.needs_reinstall || {}) };
+        delete blocked[harness];
+        if (!changes.some((c) => c.kept && isPerTurn(c.artifact))) delete reinstall[harness];
+        writeHealState(home, { ...st, update_blocked: blocked, needs_reinstall: reinstall });
+      }
     }
 
     // Instalou/atualizou: informa o engine do estado deste harness (fail-open).
@@ -1705,7 +2013,7 @@ async function declareContract(api, token, harness, home, manifest) {
     })();
     await fetch(`${api.replace(/\/$/, "")}/api/v1/runtimes/register`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      headers: { ...clientHeaders(home, harness), "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({
         runtime_key: `${harness}:${host}:${home}`,
         agent_platform: harness,
@@ -1773,7 +2081,7 @@ function detectHarness(home) {
       if (!existsSync(p)) continue;
       try {
         const body = readFileSync(p, "utf-8");
-        if (body.includes("@valorbrain/connect") || body.includes("valorbrain hook") || hookClientVersions(body).length > 0) return id;
+        if (body.includes("@valorbrain/connect") || body.includes("valorbrain hook") || hookClientVersions(body).length > 0 || launcherReferenced(body)) return id;
       } catch {
         /* segue para o próximo */
       }
@@ -1783,14 +2091,15 @@ function detectHarness(home) {
 }
 
 /**
- * `force` skips the 6h throttle (still recorded): the `heal` subcommand, whose
- * caller (the local client) already claimed it, and the npx hook of a version
- * whose local client was never tried. Never throws.
+ * `force` skips the 6h throttle (still recorded): the `heal` subcommand
+ * (spawned by a hook that already claimed it, or by the omp bridge / Hermes
+ * plugin through the launcher), and the npx hook of a version that never
+ * tried the launcher. Never throws.
  */
 async function maybeSelfHeal(api, token, harness, home, credsSource = null, engineHint = null, { force = false } = {}) {
-  if (!token) return;
   const id = harness || detectHarness(home);
-  if (!id) return;
+  // Hermes keeps its token in its own config: its plugin heals without one.
+  if (!id || (!token && id !== "hermes")) return;
   try {
     // Migração v1 → v2 (ADR-058): o hook v1 recebe o token pelo argv; a entrada
     // DESTE harness no connect.json é gravada ANTES de os hooks serem
@@ -1817,12 +2126,14 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     } else if (credsSource !== "connect") {
       canMigrateHooks = false; // env/config: nada garante que o hook v2 terá credencial
     }
-    // Instalado com --mcp-only: o heal nunca traz hooks de volta (nem cliente local).
+    // Instalado com --mcp-only: o heal nunca traz hooks de volta (nem launcher).
     const mcpOnly = readCreds(home, id)?.mode === "mcp-only";
-    const wantLocal = !mcpOnly && localClientWanted(process.env);
-    // throttle mesmo em falha: hook roda a cada prompt. `local_client_tried`
-    // bounds the npx hook's first-event heal (dispatch) to once per version.
-    if (!claimHeal(home, { env: process.env, force, patch: { local_client_tried: CLIENT_VERSION } })) return;
+    const wantLauncher = !mcpOnly && launcherWanted(process.env);
+    // throttle mesmo em falha: hook roda a cada prompt. `launcher_tried`
+    // bounds the npx hook's first-event heal to once per version.
+    if (!claimHeal(home, { env: process.env, force, patch: { launcher_tried: CLIENT_VERSION } })) return;
+    // 0.11 migration: install ids and consented scope on every saved harness.
+    try { ensureInstallIds(home); } catch { /* fail-open */ }
     const state = readHealState(home);
     // Modo: SÓ o opt-in registrado (--kiro-engine=legacy no connect.json)
     // decide legado. Agent config nosso em $HOME não prova nada — a 0.5.1
@@ -1842,18 +2153,41 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     const homeAgentOurs = id === "kiro" && kiroMode === "v3" ? staleKiroFiles({ home, cwd: home, kiroEngine: "v3" }) : [];
     const kiroSecondLoaderRisk = id === "kiro" && kiroMode === "v3" &&
       (homeAgentOurs.length > 0 || (!homeIsCwd && kiroProjectHasOurHooks(process.cwd())));
-    let manifest = scopedManifest(await fetchManifest(api, id, { local: wantLocal }), { harness: id, scope: null, home, kiroEngine: kiroMode });
-    let hookClient = null;
-    if (manifest.hook_client === "local") {
-      const pin = healPin(manifest.hook_client_version);
-      if (pin && pin !== CLIENT_VERSION) {
-        // Only the version the engine pins may run the hooks: it heals with
-        // its own local client. This one writes nothing.
-        spawnDetached("npx", [...HEAL_NPX_FLAGS, "-y", `@valorbrain/connect@${pin}`, "heal", `--harness=${id}`, ...(engineHint ? [`--caller-engine=${engineHint}`] : [])]);
+    let manifest = scopedManifest(await fetchManifest(api, id, { launcher: wantLauncher }), { harness: id, scope: null, home, kiroEngine: kiroMode });
+    // Scope guard (contract C): an update that would collect more by default
+    // than this person consented to is held — nothing installed, no file
+    // touched — until they run the installer. One log line per held scope.
+    const scope = Number.isInteger(manifest.data_scope) ? manifest.data_scope : 1;
+    {
+      const st = readHealState(home);
+      const blocked = { ...(st.update_blocked || {}) };
+      if (scope > consentedScope(home, id)) {
+        if (blocked[id]?.scope !== scope) {
+          logConnect(home, `${id}: update held — the engine's data_scope ${scope} is above the consented ${consentedScope(home, id)}; review with: npx -y @valorbrain/connect --harness ${id}`);
+          blocked[id] = { scope, at: new Date().toISOString() };
+          writeHealState(home, { ...st, update_blocked: blocked });
+        }
+        await declareContract(api, token, id, home, manifest);
         return;
       }
-      hookClient = pin ? installLocalClient(home) : null;
-      if (!hookClient) manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });
+      if (blocked[id]) {
+        delete blocked[id];
+        writeHealState(home, { ...st, update_blocked: blocked });
+      }
+    }
+    // The pinned version under ~/.valorbrain/bin/connect/: already there, this
+    // package, or the signed tarball. A failed update keeps the launcher on
+    // the version it runs (the harness files stay as they are); with no
+    // launcher at all the hooks stay on npx.
+    let launcher = null;
+    if (manifest.hook_client === "launcher") {
+      const r = await ensureLauncher(home, manifest);
+      if (r.launcher) launcher = r.launcher;
+      else {
+        logConnect(home, `${id}: update to ${manifest.hook_client_version} not applied — ${r.error}`);
+        launcher = existsSync(join(clientRoot(home), "launcher.mjs")) && readCurrent(home) ? launcherPath(home) : null;
+      }
+      if (!launcher) manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });
     }
     const installed = installedContractVersion(manifest, home);
     const expected = String(manifest?.contract_version || "");
@@ -1861,7 +2195,7 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     // Plano SEM os artefatos de MCP: com o planejamento encadeado, um arquivo
     // compartilhado (settings.json do Gemini) carregaria a entrada MCP — e o
     // token do heal — para dentro da mudança de hooks.
-    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(mcpOnly && isPerTurn(a))) }, token, home, false, process.cwd(), { hookClient })
+    const plan = planFor({ ...manifest, artifacts: (manifest.artifacts || []).filter((a) => a.kind !== "mcp" && !(mcpOnly && isPerTurn(a))) }, token, home, false, process.cwd(), { launcher })
       .filter((c) => !c.error);
     const planned = plan.filter((c) => c.changed);
     // A guarda de segundo loader barra só a CRIAÇÃO do standalone em $HOME
@@ -1874,12 +2208,18 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
       ? planned.filter((c) => c.artifact.kind !== "hooks" || (c.before !== null && isOurStandaloneHooks(c.before)))
       : planned;
     // Contrato em drift: reaplica regras + hooks. Sem drift de contrato, só hooks
-    // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta.
-    // O Codex fica fora da migração automática: comando novo exige re-trust
-    // manual em /hooks, e migrar sozinho desligaria o recall em silêncio.
-    const hooksOk = (c) => c.artifact.kind !== "hooks" || (canMigrateHooks && !(id === "codex" && !contractDrift));
-    const changes = (contractDrift ? guarded : guarded.filter((c) => c.artifact.kind === "hooks" && hookEntriesChanged(c)))
-      .filter(hooksOk);
+    // cujas ENTRADAS mudaram (ex.: v1 → v2) — reformatação de JSON não conta — e
+    // os arquivos do plugin do Hermes cujos bytes mudaram.
+    // O Codex nunca migra sozinho: comando novo exige re-trust manual em
+    // /hooks, e migrar sozinho desligaria o recall em silêncio.
+    const relevant = contractDrift
+      ? guarded
+      : guarded.filter((c) => (c.artifact.kind === "hooks" && hookEntriesChanged(c)) || c.artifact.kind === "plugin");
+    const codexNeedsReinstall = id === "codex" && relevant.some((c) => c.artifact.kind === "hooks" && launcherReferenced(c.after) && !launcherReferenced(c.before));
+    const changes = relevant
+      .filter((c) => c.artifact.kind !== "hooks" || (canMigrateHooks && id !== "codex"))
+      // Without a token (a Hermes heal), a file that would carry the placeholder is never written.
+      .filter((c) => token || !String(c.after ?? "").includes(TOKEN_PLACEHOLDER));
     // Decision 17: a file the person edited by hand is never rewritten from
     // here — the hook has nobody to ask. Logged; a re-run of the installer
     // shows the diff and asks.
@@ -1905,7 +2245,17 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
     recordWritten(home, [...plan.filter((c) => !c.changed), ...safe]);
     // Read back from disk: a hook file kept (hand edit, Codex) still runs what it ran.
     recordHookClients(home, id, plan.filter((c) => isPerTurn(c.artifact)).map((c) => c.path));
-    gcLocalClients(home, { keep: hookClient ? CLIENT_VERSION : null });
+    gcClientVersions(home);
+    // Codex: a hook command it was not told about stays off until someone
+    // trusts it in /hooks, so the move to the launcher is the installer's job
+    // (a human present). Reported in the request headers until then.
+    if (id === "codex") {
+      const st = readHealState(home);
+      const flags = { ...(st.needs_reinstall || {}) };
+      if (codexNeedsReinstall) flags.codex = true;
+      else delete flags.codex;
+      writeHealState(home, { ...st, needs_reinstall: flags });
+    }
     // Hosted and self-hosted hooks in one file both fire on every event. The
     // heal never removes the self-hosted ones (nobody to ask); it says so once
     // per heal, in the log, with the command that replaces them.
@@ -1965,32 +2315,34 @@ if (process.env.VALORBRAIN_CONNECT_NO_MAIN === '1') {
 } else if (process.argv[2] === 'hook') {
     // The hook client lives in hook.mjs (protocol v2, ADR-058); this file lends
     // it the self-heal, which needs the installer's planning code. Run through
-    // npx, the heal stays in-process (≤2.5s); the local copy never awaits one.
-    // An npx hook of a version whose local client was never tried heals now,
-    // not in 6h: that is how a 0.9 install the engine moved to this pin gets
-    // off npx at its first event.
+    // npx, the heal stays in-process (≤2.5s); under the launcher it never does.
+    // An npx hook of a version that never tried the launcher heals now, not
+    // in 6h: that is how an npx install moves to the launcher at its first
+    // event. A cue naming another pin heals at once, detached.
+    const argv = process.argv.slice(3);
     readStdinPayload()
-        .then((payload) => runHook(process.argv.slice(3), {
+        .then((payload) => runHook(argv, {
             payload,
             clientVersion: CLIENT_VERSION,
+            onPinHint: (pin) => noticePin(pin, argv, payload),
             heal: ({ api, token, harness, home, credsSource }) =>
                 maybeSelfHeal(api, token, harness, home, credsSource, kiroEngineFromPayload(payload), {
-                    force: localClientWanted(process.env) && !existsSync(localClientFile(home)) && readHealState(home).local_client_tried !== CLIENT_VERSION,
+                    force: launcherWanted(process.env) && !existsSync(join(clientRoot(home), "launcher.mjs")) && readHealState(home).launcher_tried !== CLIENT_VERSION,
                 }),
         }))
         .then((code) => process.exit(code))
         .catch(() => process.exit(0));
 } else if (process.argv[2] === 'heal') {
-    // `npx -y @valorbrain/connect@<pin> heal --harness=<id>`, spawned detached
-    // by the local hook client (heal-dispatch in hook.mjs) when a heal is due:
-    // it already claimed the throttle. Silent, exit 0, every guard of the
-    // in-hook heal applies.
+    // `<launcher> heal --harness=<id>` (the hook's detached heal, the omp
+    // bridge, the Hermes plugin) or `npx -y @valorbrain/connect@<pin> heal`
+    // (a 0.10 local client). The caller already claimed the throttle.
+    // Silent, exit 0, every guard of the in-hook heal applies; no stdin.
     const argv = process.argv.slice(3);
     const harness = canonicalHarness(argv.find((a) => a.startsWith('--harness='))?.slice(10) || '');
     const engine = argv.find((a) => /^--caller-engine=(v3|legacy)$/.test(a))?.slice(16) || null;
     const home = homedir();
     const creds = harness ? resolveCredentials({ argv: [], env: process.env, home, harness }) : {};
-    (creds.token ? maybeSelfHeal(creds.api, creds.token, harness, home, creds.source, engine, { force: true }) : Promise.resolve())
+    (creds.token || harness === 'hermes' ? maybeSelfHeal(creds.api, creds.token ?? null, harness, home, creds.source ?? null, engine, { force: true }) : Promise.resolve())
         .catch(() => {})
         .finally(() => process.exit(0));
 } else if (process.argv[2] === 'mcp') {
