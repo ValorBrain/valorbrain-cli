@@ -900,12 +900,20 @@ export function readHealState(home) {
     return readJson(healStatePath(home)) || {};
 }
 
+/**
+ * tmp + rename: claimHeal runs on every local hook event, and a reader must
+ * never see a half-written file — it would read `{}` and the next write would
+ * drop `written` and `hook_clients`.
+ */
 export function writeHealState(home, state) {
+    const path = healStatePath(home);
+    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
     try {
-        mkdirSync(dirname(healStatePath(home)), { recursive: true });
-        writeFileSync(healStatePath(home), JSON.stringify(state));
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(tmp, JSON.stringify(state));
+        renameSync(tmp, path);
     } catch {
-        /* fail-open */
+        try { unlinkSync(tmp); } catch { /* never written */ }
     }
 }
 

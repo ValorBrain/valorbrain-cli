@@ -129,7 +129,7 @@ test('a fresh install asks for client=local, installs the local client and wires
         assert.equal(statSync(d).mode & 0o777, 0o700, d);
     }
     assert.match(r.stdout, /local hook client 0\.10\.0/);
-    assert.deepEqual(readHealState(h).hook_clients, { 'claude-code': [CLIENT_VERSION] });
+    assert.deepEqual(readHealState(h).hook_clients, { 'claude-code': { [join(h, '.claude', 'settings.json')]: [CLIENT_VERSION] } });
 });
 
 test('an engine without client=local keeps the npx hooks and writes no local client', async () => {
@@ -189,10 +189,10 @@ test('placeholder substitution happens in planFor, after the signature check; ne
     const h = home();
     const m = claudeManifest({ pin: CLIENT_VERSION, local: true });
     const file = localClientFile(h);
-    const [, hooks] = planFor(m, 'vbm_x', h, false, h, file);
+    const [, hooks] = planFor(m, 'vbm_x', h, false, h, { hookClient: file });
     assert.ok(hooks.after.includes(`node \\"${file}\\" hook stop --harness=claude-code ||`));
     assert.ok(!hooks.after.includes(PH));
-    const [, refused] = planFor(m, 'vbm_x', h, false, h, null);
+    const [, refused] = planFor(m, 'vbm_x', h, false, h, { hookClient: null });
     assert.match(refused.error, /local hook client is not installed/);
     assert.equal(refused.changed, false);
 });
@@ -402,7 +402,7 @@ test('GC: an unused version goes after a grace period, a used or kept one stays'
         mkdirSync(join(root, v), { recursive: true });
         writeFileSync(join(root, v, 'hook.mjs'), '');
     }
-    writeHealState(h, { hook_clients: { 'claude-code': ['0.10.1'] } });
+    writeHealState(h, { hook_clients: { 'claude-code': { '/h/.claude/settings.json': ['0.10.1'] } } });
     const t = Date.now();
     // First sight of an unused version only starts its clock (a running session may still run it).
     assert.deepEqual(gcLocalClients(h, { now: t, keep: '0.10.2' }), []);
@@ -420,7 +420,7 @@ test('--remove deletes the local client once no harness references it', async ()
     const h = home();
     assert.equal((await install(h, url)).code, 0);
     // A second harness running the same version keeps it alive.
-    writeHealState(h, { ...readHealState(h), hook_clients: { ...readHealState(h).hook_clients, cursor: [CLIENT_VERSION] } });
+    writeHealState(h, { ...readHealState(h), hook_clients: { ...readHealState(h).hook_clients, cursor: { '/h/.cursor/hooks.json': [CLIENT_VERSION] } } });
     assert.equal((await cli(h, url, ['--remove', '--harness', 'claude-code'])).code, 0);
     assert.ok(existsSync(localClientFile(h)));
     writeHealState(h, { ...readHealState(h), hook_clients: {} });
