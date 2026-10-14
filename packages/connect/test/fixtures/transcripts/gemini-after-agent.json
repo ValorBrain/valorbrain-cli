@@ -1,0 +1,10 @@
+{
+  "session_id": "52e7a217-e4c5-4bb6-8a2a-1d91415831da",
+  "transcript_path": "<TRANSCRIPT>",
+  "cwd": "/work/proj",
+  "hook_event_name": "AfterAgent",
+  "timestamp": "2026-10-14T17:36:40.112Z",
+  "prompt": "Rename the helper and run the tests.",
+  "prompt_response": "Renamed it; all tests pass.",
+  "stop_hook_active": false
+}

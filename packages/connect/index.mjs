@@ -33,7 +33,7 @@ import { gunzipSync } from "node:zlib";
 import {
   CLIENT_VERSION, HOOK_PROTOCOL, PRIVACY_KEYS, canonicalHarness, claimHeal, clientHeaders, consentedScope, credsPath, ensureInstallIds, logConnect,
   kiroEngineFromPayload, launcherPin, listCreds, noticePin, readCreds, readHealState, readStdinPayload, removeCreds, resolveCredentials,
-  runHook, savedApiForToken, setPrivacy, writeCreds, writeHealState,
+  runHook, savedApiForToken, setPrivacy, STOP_TRANSCRIPT_HARNESSES, writeCreds, writeHealState,
 } from "./hook.mjs";
 import { deviceLabel, deviceLogin, installId, isUnattended, resolveAppUrl } from "./login.mjs";
 import { trustedManifestKeys, verifyManifest } from "./manifest-signature.mjs";
@@ -62,8 +62,8 @@ const WARN = process.stderr.isTTY && !process.env.NO_COLOR ? "\x1b[33m!\x1b[0m" 
 
 /** Flag each saved switch answers to (`--prompt off` → send_prompt). */
 const SWITCH_FLAGS = { send_prompt: "prompt", send_transcript: "transcript", checkpoint: "checkpoint" };
-/** Harnesses whose transcript `--transcript on` sends: the Hermes plugin, the omp bridge, and the Stop hook where the engine parses the format. */
-const TRANSCRIPT_HARNESSES = new Set(["hermes", "claude-code", "grok", "omp"]);
+/** Harnesses whose transcript `--transcript on` sends: the Hermes plugin, the omp bridge, and every Stop hook that uploads one. */
+const TRANSCRIPT_HARNESSES = new Set(["hermes", "omp", ...STOP_TRANSCRIPT_HARNESSES]);
 
 /** Artifacts that act on every turn — what --mcp-only leaves out. */
 export const isPerTurn = (artifact) => artifact?.kind === "hooks";
@@ -173,9 +173,11 @@ Options
                     named (or every one saved there) and exits.
                     VALORBRAIN_SEND_PROMPT=off does the same for the whole machine.
   --transcript on|off  upload the session transcript for conversation memory
-                    (default off). Hermes: its memory plugin. Claude Code and
-                    Grok: the Stop hook, in the background, after 3 turns and
-                    then at most every 10 min while the file grows. Saved like
+                    (default off). Hermes: its memory plugin. Claude Code,
+                    Codex, Gemini CLI, Cursor, Kiro, Grok and OpenCode: the
+                    Stop hook, in the background, after 3 turns and then at
+                    most every 10 min while the file grows; never for -p/exec/
+                    SDK runs or sub-agents. Saved like
                     --prompt; VALORBRAIN_SEND_TRANSCRIPT=off|on wins over it.
   --checkpoint on|off  let the Stop hook ask the agent for a short memory
                     checkpoint every few turns (default on). Saved like

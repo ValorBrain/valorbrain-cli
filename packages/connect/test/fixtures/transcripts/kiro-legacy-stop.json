@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "stop",
+  "cwd": "/work/proj",
+  "session_id": "0db24024-dfdb-4bb7-babd-7813f6955b6e",
+  "assistant_response": "Renamed it; all tests pass."
+}

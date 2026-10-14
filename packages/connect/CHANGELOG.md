@@ -2,6 +2,58 @@
 
 ## [Unreleased]
 
+## 0.12.0 — 2026-10-14
+
+Publicar só depois do deploy dos leitores de transcript do engine (Codex,
+Gemini, Kiro, Cursor): antes deles, o engine recebe esses arquivos e não
+extrai nada.
+
+- **Transcript no Stop para Codex, Gemini CLI, Kiro, Cursor e OpenCode.**
+  Com `--transcript on`, o hook de Stop desses harnesses envia o transcript da
+  sessão como já fazia o do Claude Code e do Grok: mesmas portas (turno
+  concluído de verdade, sem continuação de bloqueio, 3 turnos antes do
+  primeiro envio, no máximo a cada 10 min com crescimento, 8 envios por
+  harness a cada 10 min).
+  - **Codex:** o rollout do `transcript_path`. `codex exec` (também o SDK do
+    Codex), `codex mcp-server`, clientes SDK do app-server e threads de
+    sub-agente não enviam: o hook lê `source`, `thread_source` e
+    `originator` da linha `session_meta`. Visto num `codex exec` real
+    (codex-cli 0.160.0): o Stop dispara, e o de um sub-agente traz o
+    `session_id` do pai com o rollout do filho.
+  - **Gemini CLI:** o `transcript_path` do `AfterAgent`. Sessões de
+    sub-agente (`kind: "subagent"`) não enviam, e o `AfterAgent` nem dispara
+    para elas (0.43.0). `gemini -p`, pergunta na linha de comando e `CI=true`
+    não enviam (a regra de headless do próprio Gemini).
+  - **Kiro:** o Stop traz só `session_id` e `cwd`. O hook acha o arquivo em
+    `~/.kiro/sessions/<sha256(cwd)[:16]>/<sess_…>/messages.jsonl` (Kiro CLI
+    3.0/`--v3`) ou `~/.kiro/sessions/cli/<id>.jsonl` (motor legado). Não
+    enviam: `kiro-cli chat --no-interactive` e, no legado, as sessões que um
+    cliente ACP abriu (`session_created_reason: "subagent"`).
+  - **Cursor:** o `transcript_path` (ou `CURSOR_TRANSCRIPT_PATH`), e quando o
+    CLI não o manda, pelo `conversation_id` em
+    `~/.cursor/projects/<workspace>/agent-transcripts/`. Só `.jsonl`. O
+    `stop` só dispara para a conversa principal (sub-agente tem o
+    `subagentStop`). `cursor-agent -p` não envia.
+  - **OpenCode:** aceita o Stop do plugin hospedado
+    (`hook stop --harness=opencode`, JSONL no formato do Claude Code). Só
+    turnos com `status: "completed"`.
+  - Gemini, Kiro e Cursor não dizem no payload que a execução é não
+    interativa: o hook olha a linha de comando do processo do harness, com
+    um `ps` (Linux, macOS). No Windows fica só o mínimo de 3 turnos.
+  - Um Stop que chega pelo arquivo de hooks de outro harness (o Cursor roda
+    o `settings.json` do Claude Code) só envia pelo arquivo do próprio
+    harness.
+  - Um transcript em JSON de arquivo único (Gemini CLI antigo) acima de
+    8 MiB não é cortado e não é enviado.
+  - `--transcript on` deixa de avisar "nothing is sent" para esses harnesses.
+- **`sessionAttended` do Claude Code.** O Stop lê
+  `CLAUDE_CODE_SESSION_ATTENDED`. Com `1`, o envio leva
+  `input.sessionAttended: "1"` nas duas chamadas a `/api/v1/hooks/run`, e o
+  engine só tira fatos dos turnos digitados por uma pessoa (FB-0205). Com `0`
+  (`-p`/SDK, sessão em segundo plano, claude aberto por outro claude) o
+  transcript não é enviado, como já era com o SDK. Sem a variável, nada muda.
+  Os outros harnesses não têm um sinal equivalente; as execuções sem pessoa
+  ficam de fora pelas regras acima.
 - **Checkpoint no Claude Code sem "Stop hook error".** O checkpoint de memória
   saía como `{"decision":"block","reason"}`, que o Claude Code mostra como
   `Stop hook error: …` e com o aviso "Stop hook error occurred". Agora, no
