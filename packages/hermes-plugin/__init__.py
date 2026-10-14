@@ -1,17 +1,28 @@
 """ValorBrain memory provider plugin for Hermes Agent.
 
-On-device hybrid memory with composite scoring, graph traversal, and
-lifecycle management. Integrates via REST API (tools) and CLI shell-out
-(lifecycle hooks).
+Hybrid memory with composite scoring, graph traversal, and lifecycle
+management. Tools go through the REST API; lifecycle hooks run either on the
+hosted engine (REST) or through a local `valorbrain` binary (self-hosted).
 
-Requires:
-  - valorbrain binary on PATH (or configured via VALORBRAIN_BIN)
-  - valorbrain serve running (or managed mode starts it automatically)
+Hosted (default path for customers):
+  VALORBRAIN_HOOKS_MODE=hosted + VALORBRAIN_ENGINE_URL + a `vbm_` VALORBRAIN_API_TOKEN.
+  The plugin never runs a local binary, even if one is on PATH or VALORBRAIN_BIN is set:
+  every lifecycle hook goes to `POST /api/v1/hooks/run`, REST never falls back to
+  127.0.0.1:VALORBRAIN_SERVE_PORT, and the tenant/user come from the token (no
+  X-Tenant-ID / X-User-ID header).
+
+Self-hosted (VALORBRAIN_HOOKS_MODE unset or "self-hosted"):
+  valorbrain binary on PATH (or VALORBRAIN_BIN) runs the hooks; without a binary the
+  hooks go to VALORBRAIN_ENGINE_URL when set. valorbrain serve running (or managed mode).
 
 Config via environment variables:
-  VALORBRAIN_BIN           — Path to valorbrain binary (default: auto-detect on PATH)
-  VALORBRAIN_SERVE_PORT    — REST API port (default: 7438)
-  VALORBRAIN_SERVE_MODE    — "external" (default) or "managed" (plugin starts/stops serve)
+  VALORBRAIN_HOOKS_MODE    — "hosted" or "self-hosted" (default: self-hosted). Where the
+                             lifecycle hooks run; "hosted" pins the whole plugin to the engine
+  VALORBRAIN_ENGINE_URL    — REST base of the engine (alias: VALORBRAIN_API_URL)
+  VALORBRAIN_API_TOKEN     — bearer for the REST API (`vbm_` in hosted mode)
+  VALORBRAIN_BIN           — Path to valorbrain binary (default: auto-detect on PATH; self-hosted only)
+  VALORBRAIN_SERVE_PORT    — local REST API port (default: 7438; self-hosted only)
+  VALORBRAIN_SERVE_MODE    — "external" (default) or "managed" (plugin starts/stops serve; self-hosted only)
   VALORBRAIN_PROFILE       — Retrieval profile: speed, balanced, deep (default: balanced)
   VALORBRAIN_EMBED_URL     — GPU embedding server URL (optional)
   VALORBRAIN_LLM_URL       — GPU LLM server URL (optional)
@@ -70,7 +81,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.7.0"
+_PLUGIN_VERSION = "1.8.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -109,9 +120,36 @@ def _privacy_flag(env_name: str, key: str, default: bool) -> bool:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Where the lifecycle hooks run. "hosted" = always on the engine via REST, never a
+# local binary; anything else (unset included) = self-hosted: binary first, then
+# the engine when VALORBRAIN_ENGINE_URL is set. Explicit because the binary on PATH
+# used to decide alone: a hosted install on a machine that also had the engine
+# binary (the engine host itself) silently ran self-hosted.
+_HOOKS_MODE_ENV = "VALORBRAIN_HOOKS_MODE"
+_HOOKS_MODE_HOSTED = "hosted"
+_HOOKS_MODE_SELF_HOSTED = "self-hosted"
+
+
+def _hosted_mode() -> bool:
+    """VALORBRAIN_HOOKS_MODE=hosted. Read on every use, like the privacy flags."""
+    return (os.environ.get(_HOOKS_MODE_ENV) or "").strip().lower() == _HOOKS_MODE_HOSTED
+
+
+def _engine_url() -> Optional[str]:
+    """REST base of the engine from VALORBRAIN_ENGINE_URL (or VALORBRAIN_API_URL)."""
+    url = os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
+    return url.rstrip("/") if url else None
+
+
 def _find_valorbrain_bin() -> Optional[str]:
     """Find the valorbrain binary. Check env (VALORBRAIN_BIN, then CLAWMEM_BIN
-    for backward compat), then PATH. Falls back to legacy `clawmem` name."""
+    for backward compat), then PATH. Falls back to legacy `clawmem` name.
+
+    Hosted mode never has a binary: every `self._bin` comes from here, so this is
+    the single gate that keeps hosted from shelling out (hooks and managed serve).
+    """
+    if _hosted_mode():
+        return None
     for env_name in ("VALORBRAIN_BIN", "CLAWMEM_BIN"):
         env_bin = os.environ.get(env_name)
         if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
@@ -214,11 +252,17 @@ def _run_hook(bin_path: str, hook_name: str, hook_input: dict,
         return None
 
 
-def _engine_base_url(port: int) -> str:
-    """Remote engine URL when set; otherwise local valorbrain serve."""
-    url = os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
+def _engine_base_url(port: int) -> Optional[str]:
+    """Remote engine URL when set; otherwise local valorbrain serve.
+
+    Hosted mode has no local fallback: without VALORBRAIN_ENGINE_URL it is None
+    (the call fails as a config error) instead of hitting 127.0.0.1:<port>.
+    """
+    url = _engine_url()
     if url:
-        return url.rstrip("/")
+        return url
+    if _hosted_mode():
+        return None
     return f"http://127.0.0.1:{port}"
 
 
@@ -227,15 +271,18 @@ def _runtime_seed() -> Optional[str]:
 
     Tenant quando houver; senão o prefixo do token (modo hospedado: o engine
     deriva o tenant do bearer e o prefixo já aparece no dashboard). Sem nenhum
-    dos dois não há o que registrar.
+    dos dois não há o que registrar. No modo hospedado só o token conta: o
+    VALORBRAIN_TENANT_ID do host do engine não identifica este cliente.
     """
+    token = (os.environ.get("VALORBRAIN_API_TOKEN") or "").strip()
+    if _hosted_mode():
+        return token[:12] if token else None
     tenant_id = (
         os.environ.get("VALORBRAIN_TENANT_ID")
         or os.environ.get("VALORBRAIN_DEFAULT_TENANT_ID")
     )
     if tenant_id:
         return tenant_id
-    token = (os.environ.get("VALORBRAIN_API_TOKEN") or "").strip()
     return token[:12] if token else None
 
 
@@ -331,9 +378,16 @@ def _rest_call(port: int, method: str, path: str,
     Multi-tenant headers:
       X-Tenant-ID    — from VALORBRAIN_TENANT_ID env (engine scopes data
                        to this tenant via RLS when running as valorbrain_app).
+                       Self-hosted only.
+      X-User-ID      — from VALORBRAIN_USER_ID env. Self-hosted only.
       X-Source-Agent — defaults to 'hermes-plugin' so the engine can attribute
                        writes to this client.
       X-Source-System — from VALORBRAIN_SOURCE_SYSTEM env, defaults 'hermes'.
+
+    Hosted mode (VALORBRAIN_HOOKS_MODE=hosted) sends neither X-Tenant-ID nor
+    X-User-ID: the `vbm_` token decides tenant and user. Those env vars are the
+    engine host's (an admin key's tenant); forwarding them would let a host value
+    disagree with the token, and only the platform credential honors the headers.
 
     Com `_out` (lista de uma posição), recebe {kind, detail, url, status} no
     lugar de None como metadado da falha — o chamador decide se usa.
@@ -343,13 +397,14 @@ def _rest_call(port: int, method: str, path: str,
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    tenant_id = os.environ.get("VALORBRAIN_TENANT_ID") or os.environ.get("VALORBRAIN_DEFAULT_TENANT_ID")
-    if tenant_id:
-        headers["X-Tenant-ID"] = tenant_id
+    if not _hosted_mode():
+        tenant_id = os.environ.get("VALORBRAIN_TENANT_ID") or os.environ.get("VALORBRAIN_DEFAULT_TENANT_ID")
+        if tenant_id:
+            headers["X-Tenant-ID"] = tenant_id
 
-    user_id = os.environ.get("VALORBRAIN_USER_ID")
-    if user_id:
-        headers["X-User-ID"] = user_id
+        user_id = os.environ.get("VALORBRAIN_USER_ID")
+        if user_id:
+            headers["X-User-ID"] = user_id
 
     source_agent = _resolve_source_agent()
     headers["X-Source-Agent"] = source_agent
@@ -360,11 +415,18 @@ def _rest_call(port: int, method: str, path: str,
     base = _engine_base_url(port)
 
     def _fail(kind: str, detail: str, status: Optional[int] = None):
-        url = f"{base}{path}"
+        url = f"{base}{path}" if base else path
         logger.debug("ValorBrain REST %s %s failed (%s/%s): %s", method, path, kind, status, detail)
         if _out is not None:
             _out[0] = {"kind": kind, "detail": detail, "url": url, "status": status}
         return None
+
+    if base is None:
+        return _fail(
+            "config",
+            f"{_HOOKS_MODE_ENV}=hosted sem VALORBRAIN_ENGINE_URL: configure a base REST "
+            "do engine hospedado (o modo hospedado não usa 127.0.0.1)",
+        )
 
     def _ok(payload_text: str):
         if raw:
@@ -630,6 +692,13 @@ class ValorBrainProvider(MemoryProvider):
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {
+                "key": "hooks_mode",
+                "description": "Where lifecycle hooks run: 'hosted' (always the engine via REST, never a local binary) or 'self-hosted' (local valorbrain binary first)",
+                "default": _HOOKS_MODE_SELF_HOSTED,
+                "choices": [_HOOKS_MODE_SELF_HOSTED, _HOOKS_MODE_HOSTED],
+                "env_var": _HOOKS_MODE_ENV,
+            },
+            {
                 "key": "serve_port",
                 "description": "ValorBrain REST API port",
                 "default": str(_DEFAULT_PORT),
@@ -651,7 +720,7 @@ class ValorBrainProvider(MemoryProvider):
             },
             {
                 "key": "bin_path",
-                "description": "Path to valorbrain binary (auto-detected if on PATH)",
+                "description": "Path to valorbrain binary (auto-detected if on PATH; ignored in hosted mode)",
                 "env_var": "VALORBRAIN_BIN",
             },
             {
@@ -692,28 +761,37 @@ class ValorBrainProvider(MemoryProvider):
         """Disponível com binário local (hooks) OU engine remoto configurado.
 
         Hospedado não tem binário `valorbrain`: com VALORBRAIN_ENGINE_URL (ou
-        VALORBRAIN_API_URL) + VALORBRAIN_API_TOKEN o provider funciona para
-        tools/registro; os hooks de ciclo de vida seguem exigindo o binário.
+        VALORBRAIN_API_URL) + VALORBRAIN_API_TOKEN o provider roda tools,
+        registro e os hooks de ciclo de vida no engine. Com
+        VALORBRAIN_HOOKS_MODE=hosted só o engine conta (binário no PATH não).
         """
         if _find_valorbrain_bin() is not None:
             return True
-        return bool(
-            os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
-        )
+        return _engine_url() is not None
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._bin = _find_valorbrain_bin()
-        remote_engine = bool(
-            os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
-        )
-        if not self._bin and not remote_engine:
-            logger.warning("valorbrain binary not found on PATH — provider disabled")
+        hosted = _hosted_mode()
+        if not self._bin and not self._remote_engine():
+            if hosted:
+                logger.warning(
+                    "valorbrain: %s=hosted sem VALORBRAIN_ENGINE_URL — provider disabled",
+                    _HOOKS_MODE_ENV,
+                )
+            else:
+                logger.warning("valorbrain binary not found on PATH — provider disabled")
             return
-        if not self._bin:
-            logger.info(
-                "valorbrain: engine remoto configurado — tools/registro ativos; "
-                "hooks de ciclo de vida seguem desativados (sem binário local)"
-            )
+        if hosted:
+            token = (os.environ.get("VALORBRAIN_API_TOKEN") or "").strip()
+            if not token.startswith("vbm_"):
+                logger.warning(
+                    "valorbrain: %s=hosted espera um token vbm_ em VALORBRAIN_API_TOKEN — "
+                    "o tenant vem do token e o plugin não envia X-Tenant-ID",
+                    _HOOKS_MODE_ENV,
+                )
+            logger.info("valorbrain: modo hospedado — hooks via POST /api/v1/hooks/run, sem binário local")
+        elif not self._bin:
+            logger.info("valorbrain: sem binário local — hooks via engine remoto (POST /api/v1/hooks/run)")
 
         self._session_id = session_id
         try:
@@ -729,34 +807,37 @@ class ValorBrainProvider(MemoryProvider):
                 self._agent_context,
             )
 
-        # Build env for hook shell-outs (GPU endpoints, profile)
-        for var in (
-            "VALORBRAIN_EMBED_URL",
-            "VALORBRAIN_LLM_URL",
-            "VALORBRAIN_LLM_MODEL",
-            "VALORBRAIN_LLM_REASONING_EFFORT",
-            "VALORBRAIN_LLM_NO_THINK",
-            "VALORBRAIN_RERANK_URL",
-            "VALORBRAIN_PROFILE",
-            "VALORBRAIN_API_TOKEN",
-            "VALORBRAIN_ENGINE_URL",
-            "VALORBRAIN_API_URL",
-            "VALORBRAIN_USER_ID",
-        ):
-            val = os.environ.get(var)
-            if val:
-                self._env_extra[var] = val
-
-        tenant_id = (
-            os.environ.get("VALORBRAIN_TENANT_ID")
-            or os.environ.get("VALORBRAIN_DEFAULT_TENANT_ID")
-        )
-        if tenant_id:
-            self._env_extra["VALORBRAIN_TENANT_ID"] = tenant_id
-            self._env_extra["VALORBRAIN_DEFAULT_TENANT_ID"] = tenant_id
-
+        # Env for the binary shell-outs (hooks, managed serve). Only built when a
+        # binary exists: hosted mode never has one, so the engine host's tenant
+        # (VALORBRAIN_TENANT_ID of an admin key) has nowhere to go.
         source_agent = _resolve_source_agent()
-        self._env_extra["VALORBRAIN_SOURCE_AGENT"] = source_agent
+        if self._bin:
+            for var in (
+                "VALORBRAIN_EMBED_URL",
+                "VALORBRAIN_LLM_URL",
+                "VALORBRAIN_LLM_MODEL",
+                "VALORBRAIN_LLM_REASONING_EFFORT",
+                "VALORBRAIN_LLM_NO_THINK",
+                "VALORBRAIN_RERANK_URL",
+                "VALORBRAIN_PROFILE",
+                "VALORBRAIN_API_TOKEN",
+                "VALORBRAIN_ENGINE_URL",
+                "VALORBRAIN_API_URL",
+                "VALORBRAIN_USER_ID",
+            ):
+                val = os.environ.get(var)
+                if val:
+                    self._env_extra[var] = val
+
+            tenant_id = (
+                os.environ.get("VALORBRAIN_TENANT_ID")
+                or os.environ.get("VALORBRAIN_DEFAULT_TENANT_ID")
+            )
+            if tenant_id:
+                self._env_extra["VALORBRAIN_TENANT_ID"] = tenant_id
+                self._env_extra["VALORBRAIN_DEFAULT_TENANT_ID"] = tenant_id
+
+            self._env_extra["VALORBRAIN_SOURCE_AGENT"] = source_agent
         # Keep process env aligned so hooks inherit the resolved slug
         os.environ["VALORBRAIN_SOURCE_AGENT"] = source_agent
 
@@ -813,9 +894,7 @@ class ValorBrainProvider(MemoryProvider):
         self._register_runtime()
 
     def _remote_engine(self) -> bool:
-        return bool(
-            os.environ.get("VALORBRAIN_ENGINE_URL") or os.environ.get("VALORBRAIN_API_URL")
-        )
+        return _engine_url() is not None
 
     def _has_hooks(self) -> bool:
         """Hooks rodam local (binário) ou no engine via REST (hospedado)."""
@@ -831,9 +910,10 @@ class ValorBrainProvider(MemoryProvider):
         """Roda um hook de ciclo de vida.
 
         Self-hosted: shell-out para o binário (comportamento original).
-        Hospedado: POST /api/v1/hooks/run — o engine roda o MESMO código com o
-        tenant do token; o cliente só manda o transcript (o engine não lê o
-        disco dele).
+        Hospedado (sem binário, ou VALORBRAIN_HOOKS_MODE=hosted, em que
+        `self._bin` é sempre None): POST /api/v1/hooks/run — o engine roda o
+        MESMO código com o tenant do token; o cliente só manda o transcript (o
+        engine não lê o disco dele).
         """
         if self._bin:
             return _run_hook(
