@@ -1,5 +1,5 @@
 // connect 0.9 — --mcp-only, unknown flags warned (never an error), and the
-// saved --checkpoint switch (Gemini CLI strips env from hooks). Run: npm test
+// saved --checkpoint switch (the only one Gemini CLI hooks see on a GitHub runner). Run: npm test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';

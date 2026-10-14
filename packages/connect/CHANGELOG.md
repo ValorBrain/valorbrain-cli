@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+- **Docs: o ambiente dos hooks do Gemini CLI.** O README, o `--help` e os
+  comentários diziam que o Gemini CLI roda os hooks sem o ambiente. O Gemini
+  CLI 0.43 passa o ambiente do processo e só filtra com
+  `security.environmentVariableRedaction.enabled` (tira nomes de segredo, como
+  `VALORBRAIN_TOKEN`) ou num runner do GitHub (só uma lista curta passa). Então
+  `VALORBRAIN_SEND_PROMPT`, `VALORBRAIN_CHECKPOINT` e
+  `VALORBRAIN_SEND_TRANSCRIPT` valem no Gemini, menos num runner do GitHub, onde
+  também `CI` não chega ao hook. As chaves em `connect.json` valem sempre.
+  Nenhuma mudança de comportamento.
+
 ## 0.12.1 — 2026-10-14
 
 - **Repair of the hosted MCP auth in codex and grok.** connect ≤ 0.12.0

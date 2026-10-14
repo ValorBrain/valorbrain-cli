@@ -152,8 +152,9 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
   `npx -y @valorbrain/connect --harness <id> --checkpoint off` (grava
   `checkpoint: false` na entrada do harness; `--checkpoint on` volta), ou na
   máquina inteira com `VALORBRAIN_CHECKPOINT=off` — que vence o arquivo nos dois
-  sentidos (`VALORBRAIN_CHECKPOINT=on` religa). No Gemini CLI, que roda os hooks
-  sem o ambiente, só o arquivo vale.
+  sentidos (`VALORBRAIN_CHECKPOINT=on` religa). No Gemini CLI a variável vale
+  também, menos num runner do GitHub (veja "Gemini CLI e o ambiente dos hooks"
+  abaixo); ali só o arquivo vale.
 - **Transcript da sessão**: só com opt-in, desligado por padrão. Liga por
   harness com `npx -y @valorbrain/connect --harness <id> --transcript on`
   (grava `send_transcript: true`; `--transcript off` desliga), ou na máquina
@@ -189,7 +190,8 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
       `session_meta` do rollout (`source`, `originator`).
     - `gemini -p`, Gemini com a pergunta na linha de comando e Gemini em CI
       (`CI=true`), a mesma regra de "headless" do Gemini; sessões de
-      sub-agente (`kind: "subagent"`).
+      sub-agente (`kind: "subagent"`). Num runner do GitHub o Gemini não passa
+      `CI` aos hooks; ali vale só a checagem da linha de comando.
     - `kiro-cli chat --no-interactive`; no motor legado, as sessões que um
       cliente ACP abriu (`session_created_reason: "subagent"`).
     - `cursor-agent -p`, e turnos do Cursor ou do OpenCode que não terminaram
@@ -359,9 +361,21 @@ isso não há fallback para `decision:block`. Atualize o Claude Code
 
 Estado local por sessão em `~/.valorbrain/state/hooks/` (apagado após 7 dias).
 Para desligar o checkpoint de um harness, `--checkpoint off` (fica em
-`connect.json`; é o que vale no Gemini CLI, que roda os hooks sem o ambiente);
-numa máquina inteira, `VALORBRAIN_CHECKPOINT=off` no ambiente do harness, que
-vence o arquivo. A mesma variável no engine desliga para todos.
+`connect.json` e vale em qualquer harness); numa máquina inteira,
+`VALORBRAIN_CHECKPOINT=off` no ambiente do harness, que vence o arquivo. A
+mesma variável no engine desliga para todos.
+
+**Gemini CLI e o ambiente dos hooks.** O Gemini CLI (0.43) passa aos hooks o
+ambiente do próprio processo, mais as variáveis `GEMINI_*`. Ele só filtra esse
+ambiente em dois casos: com `security.environmentVariableRedaction.enabled:
+true` no `settings.json` do Gemini (saem nomes de segredo, como
+`VALORBRAIN_TOKEN`, e os listados em `blocked`) e num runner do GitHub
+(`GITHUB_SHA` ou `SURFACE=Github`: só passa uma lista curta, como `PATH` e
+`HOME`, e os listados em `allowed`). Então `VALORBRAIN_SEND_PROMPT`,
+`VALORBRAIN_CHECKPOINT` e `VALORBRAIN_SEND_TRANSCRIPT` valem no Gemini como nos
+outros harnesses, menos num runner do GitHub, onde também `CI` e
+`GITHUB_ACTIONS` não chegam ao hook. As chaves salvas em `connect.json`
+(`--prompt`, `--checkpoint`, `--transcript`) valem sempre.
 
 ### Hooks que se atualizam sozinhos (0.11)
 
