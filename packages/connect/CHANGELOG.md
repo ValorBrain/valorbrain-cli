@@ -16,11 +16,24 @@ instalações 0.11.0 sem ninguém mexer: só muda `~/.valorbrain/bin/connect/`.
   - Em sistema de arquivos sem hard link (FAT/exFAT, alguns mounts de rede:
     `EPERM`, `ENOTSUP`, `EXDEV`), o lock é criado com `wx` e o token é relido
     para confirmar. As mesmas garantias valem.
-- **`$HOME` gravável por todos.** No Linux e no macOS, um `$HOME` de outro
-  usuário ou gravável por todos (o+w) é recusado como os demais diretórios da
-  cadeia, na instalação, no heal e no launcher. Gravável só pelo grupo
-  (0775/2775, grupo privado por usuário) é aceito sem aviso. O connect nunca
-  muda a permissão do `$HOME`.
+- **`$HOME` gravável por todos.** No Linux e no macOS, a instalação (com a
+  pessoa presente) recusa um `$HOME` de outro usuário ou gravável por todos
+  (o+w sem sticky bit). Gravável pelo grupo (0775/2775) e sticky (1777) são
+  aceitos. O connect nunca muda a permissão do `$HOME`.
+  - **Uma atualização automática nunca silencia uma instalação que funciona.**
+    O launcher só registra um problema no `$HOME` uma vez em `connect.log`,
+    nunca recusa por isso. O heal mantém a versão em uso e só deixa de subir
+    para uma versão nova enquanto o `$HOME` estiver gravável por todos (uma
+    linha no log por versão). Testado com o 0.11.0 publicado instalando num
+    `$HOME` 1777 e noutro 0777 e o heal do próprio 0.11.0 trocando para esta
+    versão.
+  - O launcher confere a pasta real que contém o `.valorbrain` (a partir do
+    próprio caminho), não o `homedir()` do ambiente do hook.
+  - Pastas com sticky bit não são recusadas pelos bits de escrita, em nenhum
+    ponto da cadeia.
+  - Um heal já na versão fixada não escreve nada e não checa diretórios.
+- O GC apaga sobras `.lock-<v>.own-*` / `.break-*` de um heal que caiu, depois
+  da janela de lock vencido.
 - **Teste determinístico da corrida no `placeVersion`.** Uma barreira (só para
   teste) faz os dois heals passarem pela checagem "já instalado?" antes de
   qualquer um renomear. Com o lock, um só preenche e a primeira cópia nunca é

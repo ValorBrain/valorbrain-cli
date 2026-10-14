@@ -199,9 +199,11 @@ touch the harness files again. An update that would collect more by default
 than you installed under waits for you to run this installer.
 VALORBRAIN_HOOK_CLIENT=npx keeps the npx command. On Linux and macOS the
 launcher refuses to run unless ~/.valorbrain, bin/, connect/ and the version it
-runs are yours and not writable by others, and $HOME is yours and not
-world-writable (group write is fine there; $HOME is never chmodded). On
-Windows only the symlink and type checks apply (there are no uid or mode bits).
+runs are yours and not writable by others (sticky directories excepted). An
+install refuses a $HOME that is not yours or is world-writable (group write and
+sticky are fine; $HOME is never chmodded); once installed, a $HOME problem is
+only logged, never a reason to stop the hooks. On Windows only the symlink and
+type checks apply (there are no uid or mode bits).
 
 Every manifest the engine sends is checked against the ed25519 key built into
 this package before a single file is written; an unsigned or altered one is
@@ -405,7 +407,9 @@ const MAX_UNPACKED_BYTES = 20 * 1024 * 1024;
  * can write to would let them swap `connect/` for their own. `$HOME` itself
  * must be ours and not world-writable; group write is allowed there (homes of
  * 0775/2775 under user private groups are common) and `$HOME` is never
- * chmodded (not ours to change), only refused. `.valorbrain` and `bin` lose
+ * chmodded (not ours to change), only refused. A sticky directory (1777, a
+ * /tmp home) is not refused for write bits: others cannot rename or remove
+ * what we own in it. `.valorbrain` and `bin` lose
  * group/other write, `connect` is 0700; anything not ours, a symlink for
  * `bin` or `connect`, or still writable by others is refused — '' when safe,
  * else the reason. Paths a shell or a JSON string would have to escape are
@@ -419,7 +423,7 @@ export function ensureClientRoot(home) {
     if (posix) {
       const st = statSync(home);
       if (st.uid !== process.getuid()) return `${home} belongs to another user`;
-      if ((st.mode & 0o002) !== 0) return `${home} is writable by everyone`;
+      if ((st.mode & 0o002) !== 0 && (st.mode & 0o1000) === 0) return `${home} is writable by everyone`;
     }
     const chain = [join(home, ".valorbrain"), join(home, ".valorbrain", "bin"), clientRoot(home)];
     for (const [i, d] of chain.entries()) {
@@ -432,7 +436,8 @@ export function ensureClientRoot(home) {
       if (st.uid !== process.getuid()) return `${d} belongs to another user`;
       const mode = i === chain.length - 1 ? 0o700 : st.mode & 0o755;
       if ((st.mode & 0o777) !== mode) chmodSync(d, mode);
-      if ((statSync(d).mode & 0o022) !== 0) return `${d} is writable by others`;
+      const now = statSync(d).mode;
+      if ((now & 0o022) !== 0 && (now & 0o1000) === 0) return `${d} is writable by others`;
     }
     return "";
   } catch (err) {
@@ -696,6 +701,18 @@ export async function downloadClientVersion(home, { version, tarball, integrity 
   if (!versionInstalled(home, version)) throw new Error("unpacked version is incomplete");
 }
 
+/** current.json names this pin and integrity, its directory is complete, and the launcher is the one it ships. */
+function isCurrent(home, version, integrity) {
+  const current = readCurrent(home);
+  if (current?.version !== version || current?.integrity !== integrity || !versionInstalled(home, version)) return false;
+  try {
+    const shipped = join(clientRoot(home), version, "launcher.mjs");
+    return !existsSync(shipped) || readFileSync(shipped).equals(readFileSync(join(clientRoot(home), "launcher.mjs")));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Make the pinned version of a `client=launcher` manifest runnable: its
  * directory, current.json and the launcher itself. Returns the launcher path,
@@ -705,6 +722,10 @@ export async function downloadClientVersion(home, { version, tarball, integrity 
 export async function ensureLauncher(home, manifest, { fetchImpl, selfDir = dirname(fileURLToPath(import.meta.url)) } = {}) {
   const version = launcherPin(manifest?.hook_client_version);
   if (manifest?.hook_client !== "launcher" || !version) return { error: "the manifest names no launcher version" };
+  // Already running this pin with this launcher: nothing to write, so nothing
+  // to check — a heal never turns a working install off over the directory
+  // rules (those apply when something is written: installs and updates).
+  if (isCurrent(home, version, manifest.hook_client_integrity ?? null)) return { launcher: launcherPath(home), version };
   const unsafe = ensureClientRoot(home);
   if (unsafe) return { error: `unsafe client directory: ${unsafe}` };
   try {
@@ -807,6 +828,11 @@ export function gcClientVersions(home, { now = Date.now(), graceMs = CLIENT_GRAC
       try { if (graceMs === 0 || now - statSync(path).mtimeMs > 3600 * 1000) rmSync(path, { recursive: true, force: true }); } catch { /* gone */ }
       continue;
     }
+    if (/^\.lock-.+\.(?:own|break)-/.test(v)) {
+      // Left by a heal that crashed between creating and removing them; never the lock itself.
+      try { if (graceMs === 0 || now - statSync(path).mtimeMs > PLACE_LOCK_STALE_MS) unlinkSync(path); } catch { /* gone */ }
+      continue;
+    }
     if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(v)) continue; // launcher.mjs, current.json
     if (used.has(v)) { delete unused[v]; continue; }
     const since = unused[v] ?? now;
@@ -823,6 +849,7 @@ export function gcClientVersions(home, { now = Date.now(), graceMs = CLIENT_GRAC
     for (const f of ["launcher.mjs", "current.json"]) {
       try { if (existsSync(join(root, f))) { unlinkSync(join(root, f)); deleted.push(f); } } catch { /* fail-open */ }
     }
+    try { unlinkSync(join(root, ".home-warning")); } catch { /* absent */ }
     for (const d of [root, dirname(root)]) {
       try { if (readdirSync(d).length === 0) rmSync(d, { recursive: true }); } catch { /* absent or not empty */ }
     }
@@ -2262,7 +2289,14 @@ async function maybeSelfHeal(api, token, harness, home, credsSource = null, engi
       const r = await ensureLauncher(home, manifest);
       if (r.launcher) launcher = r.launcher;
       else {
-        logConnect(home, `${id}: update to ${manifest.hook_client_version} not applied — ${r.error}`);
+        // Declined (unsafe $HOME, bad download…): the running version keeps
+        // running, and the reason is logged once per pin and reason, not per heal.
+        const st = readHealState(home);
+        const note = `${manifest.hook_client_version}|${r.error}`;
+        if (st.update_declined?.[id] !== note) {
+          logConnect(home, `${id}: update to ${manifest.hook_client_version} not applied — ${r.error}; the current version keeps running`);
+          writeHealState(home, { ...st, update_declined: { ...(st.update_declined || {}), [id]: note } });
+        }
         launcher = existsSync(join(clientRoot(home), "launcher.mjs")) && readCurrent(home) ? launcherPath(home) : null;
       }
       if (!launcher) manifest = scopedManifest(await fetchManifest(api, id), { harness: id, scope: null, home, kiroEngine: kiroMode });

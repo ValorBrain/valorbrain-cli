@@ -570,11 +570,12 @@ test('directory chain: install takes group/other write off ~/.valorbrain and bin
         chmodSync(dir, 0o755);
     }
     if (process.getuid?.() === 0) {
-        // Someone else's bin/: the heal refuses to install there and logs why, once.
+        // Someone else's bin/: the launcher refuses (0.11.0 refused this too); an
+        // install, with a person present, refuses to write there and says why.
         chownSync(join(h, '.valorbrain', 'bin'), 65534, 65534);
         assert.match((await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD })).stderr, /belongs to another user/);
-        await cli(h, url, ['heal', '--harness=claude-code']);
-        assert.match(readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8'), /unsafe client directory: .*bin belongs to another user/);
+        rmSync(join(h, '.valorbrain', 'bin', 'connect', 'current.json'));
+        assert.match((await install(h, url)).stdout, /unsafe client directory: .*bin belongs to another user/);
         chownSync(join(h, '.valorbrain', 'bin'), 0, 0);
     }
     server.close();
@@ -690,44 +691,102 @@ test('tryLock: two processes breaking the same stale lock — exactly one wins, 
     assert.deepEqual(readdirSync(h).filter((f) => f.startsWith('.lock-')), [], 'no .own-/.break- leftovers');
 });
 
-test('$HOME: group-writable (0775, user private groups) works silently; world-writable (0777) is refused by install, heal and the launcher; $HOME is never chmodded', async () => {
+test('$HOME at install (a person present): 0775 and sticky 1777 install; non-sticky 0777 is refused (hooks stay on npx); $HOME is never chmodded', async () => {
     const { server, url } = await stubEngine();
-    // 0775: installs, runs, says nothing.
-    const ok = home();
-    chmodSync(ok, 0o775);
-    assert.equal(ensureClientRoot(ok), '');
-    assert.equal((await install(ok, url)).code, 0);
-    assert.equal(statSync(ok).mode & 0o777, 0o775, '$HOME left as it was');
-    assert.ok(existsSync(launcherPath(ok)));
-    writeHealState(ok, { ...readHealState(ok), lastHealAt: Date.now() });
-    const ran = await launch(ok, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
-    assert.match(ran.stdout, /recall/);
-    assert.equal(ran.stderr, '', 'no line per event');
-    await launch(ok, url, ['heal', '--harness=claude-code']);
-    const okLog = join(ok, '.valorbrain', 'connect.log');
-    assert.equal(existsSync(okLog) && /writable/.test(readFileSync(okLog, 'utf-8')), false);
-    chmodSync(ok, 0o700);
-    // 0777: refused at install (hooks stay on npx), $HOME untouched.
+    for (const mode of [0o775, 0o1777]) {
+        const ok = home();
+        chmodSync(ok, mode);
+        assert.equal(ensureClientRoot(ok), '', mode.toString(8));
+        assert.equal((await install(ok, url)).code, 0);
+        assert.equal(statSync(ok).mode & 0o7777, mode, '$HOME left as it was');
+        writeHealState(ok, { ...readHealState(ok), lastHealAt: Date.now() });
+        const ran = await launch(ok, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+        assert.match(ran.stdout, /recall/);
+        assert.equal(ran.stderr, '', `${mode.toString(8)}: nothing per event`);
+        assert.equal(existsSync(join(ok, '.valorbrain', 'connect.log')), false, `${mode.toString(8)}: nothing logged`);
+        chmodSync(ok, 0o700);
+    }
     const h = home();
     chmodSync(h, 0o777);
     assert.match(ensureClientRoot(h), /is writable by everyone/);
     const r = await install(h, url);
+    server.close();
     assert.equal(statSync(h).mode & 0o777, 0o777, '$HOME left as it was');
     assert.match(r.stdout, /unsafe client directory: .* is writable by everyone/);
     assert.equal(existsSync(launcherPath(h)), false);
     chmodSync(h, 0o700);
-    // Installed while safe, then $HOME opened to everyone: the launcher stays silent, one stderr line.
-    const g = home();
-    assert.equal((await install(g, url)).code, 0);
-    writeHealState(g, { ...readHealState(g), lastHealAt: Date.now() });
-    chmodSync(g, 0o777);
-    const out = await launch(g, url, ['hook', 'prompt', '--harness=gemini-cli'], { stdin: PAYLOAD });
-    server.close();
-    assert.equal(out.code, 0);
-    assert.equal(out.stdout.trim(), '{}');
-    assert.equal(out.stderr.trim().split('\n').length, 1);
-    assert.match(out.stderr, new RegExp(`${g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is writable by everyone`));
-    chmodSync(g, 0o700);
+});
+
+// The reviewer's scenario on #27: an install made by the PUBLISHED 0.11.0 (which
+// never looked at $HOME) under a 1777 or 0777 home, moved to this version by
+// 0.11.0's own heal (the real swap path), must keep answering hooks.
+const CONNECT_0110 = readFileSync(new URL('./fixtures/connect-0.11.0.tgz', import.meta.url));
+const CONNECT_0110_INTEGRITY = 'sha512-PwEnYiC5stqJ4uDTNUQR8KMi3sYzlH7+rcLR1pISRhzcVOHXGQndJMW7sfkvu4AOiuuUEuA+XNZvMQWCcoeD0A=='; // npm view @valorbrain/connect@0.11.0 dist.integrity
+
+for (const mode of [0o1777, 0o777]) {
+    test(`auto-update never silences: a 0.11.0 install with a ${mode.toString(8)} home, updated by 0.11.0's heal, keeps answering`, async () => {
+        assert.equal(integrityOf(CONNECT_0110), CONNECT_0110_INTEGRITY, 'the fixture is the published 0.11.0');
+        const { server, state, url } = await stubEngine();
+        state.tarballs['0.11.0'] = CONNECT_0110;
+        state.pin = '0.11.0';
+        // Install with 0.11.0's own index.mjs.
+        const old = home();
+        for (const f of untarPackage(CONNECT_0110)) {
+            mkdirSync(dirname(join(old, f.name)), { recursive: true });
+            writeFileSync(join(old, f.name), f.data);
+        }
+        const h = home();
+        chmodSync(h, mode);
+        const installed = await run(process.execPath, [join(old, 'index.mjs'), '--token', 'vbm_test', '--harness', 'claude-code'], { h, url });
+        assert.equal(installed.code, 0, installed.stderr);
+        assert.equal(readCurrent(h).version, '0.11.0');
+        // The engine pins this version; 0.11.0's heal (through 0.11.0's launcher) swaps it in.
+        state.tarballs['0.11.1'] = packageAt('0.11.1');
+        state.pin = '0.11.1';
+        assert.equal((await launch(h, url, ['heal', '--harness=claude-code'])).code, 0);
+        assert.equal(readCurrent(h).version, '0.11.1', 'swapped by 0.11.0');
+        assert.deepEqual(readFileSync(launcherPath(h)), readFileSync(join(PKG, 'launcher.mjs')), 'the new launcher is in place');
+        // The new launcher keeps answering, every time, quietly.
+        writeHealState(h, { ...readHealState(h), lastHealAt: Date.now() });
+        for (let i = 0; i < 3; i++) {
+            const r = await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+            assert.match(r.stdout, /recall/, `hook ${i}`);
+            assert.equal(r.stderr, '', `hook ${i}: no stderr`);
+        }
+        assert.equal(state.requests.filter((q) => q.path === '/api/v1/hooks/cue').at(-1).headers['x-valorbrain-client'], 'connect/0.11.1');
+        const log = () => (existsSync(join(h, '.valorbrain', 'connect.log')) ? readFileSync(join(h, '.valorbrain', 'connect.log'), 'utf-8') : '');
+        const warned = (log().match(/launcher: .* is writable by others/g) || []).length;
+        assert.equal(warned, mode === 0o777 ? 1 : 0, 'warned once for 0777, never for a sticky home');
+        // Its own heal at the same pin changes nothing and keeps it running.
+        assert.equal((await launch(h, url, ['heal', '--harness=claude-code'])).code, 0);
+        assert.equal(readCurrent(h).version, '0.11.1');
+        // A newer pin: a sticky home updates; a 0777 home declines (logged once) and keeps 0.11.1 running.
+        state.tarballs['0.11.9'] = packageAt('0.11.9');
+        state.pin = '0.11.9';
+        await launch(h, url, ['heal', '--harness=claude-code']);
+        await launch(h, url, ['heal', '--harness=claude-code']);
+        const after = await launch(h, url, ['hook', 'prompt', '--harness=claude-code'], { stdin: PAYLOAD });
+        server.close();
+        assert.match(after.stdout, /recall/);
+        if (mode === 0o777) {
+            assert.equal(readCurrent(h).version, '0.11.1');
+            assert.equal((log().match(/update to 0\.11\.9 not applied — unsafe client directory: .* is writable by everyone; the current version keeps running/g) || []).length, 1);
+        } else {
+            assert.equal(readCurrent(h).version, '0.11.9');
+        }
+        chmodSync(h, 0o700);
+    });
+}
+
+test('GC removes .own-/.break- leftovers of a crashed lock holder after the stale window, never the lock itself', () => {
+    const h = home();
+    const root = join(h, '.valorbrain', 'bin', 'connect');
+    mkdirSync(root, { recursive: true });
+    const old = (Date.now() - 10 * 60_000) / 1000;
+    for (const f of ['.lock-0.11.9', '.lock-0.11.9.own-1-abc', '.lock-0.11.9.break-2-def', '.lock-0.11.9.own-3-fresh']) writeFileSync(join(root, f), 'x');
+    for (const f of ['.lock-0.11.9', '.lock-0.11.9.own-1-abc', '.lock-0.11.9.break-2-def']) utimesSync(join(root, f), old, old);
+    gcClientVersions(h);
+    assert.deepEqual(readdirSync(root).sort(), ['.lock-0.11.9', '.lock-0.11.9.own-3-fresh']);
 });
 
 test('tryLock without hard links (EPERM / ENOTSUP / EXDEV): wx-create + re-check, same guarantees', () => {
