@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "ses_3f2a9c1e7ffeAbCdEf012345",
+  "transcript_path": "<TRANSCRIPT>",
+  "cwd": "/work/proj",
+  "turn_id": "msg_3f2a9d0b4001XyZ987654321",
+  "status": "completed"
+}

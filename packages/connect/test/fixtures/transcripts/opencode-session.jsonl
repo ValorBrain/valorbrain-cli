@@ -1,0 +1,2 @@
+{"type": "user", "uuid": "u1", "sessionId": "ses_3f2a9c1e7ffeAbCdEf012345", "timestamp": "2026-10-14T17:40:00.000Z", "cwd": "/work/proj", "message": {"role": "user", "content": [{"type": "text", "text": "Rename the helper and run the tests."}]}}
+{"type": "assistant", "uuid": "u2", "sessionId": "ses_3f2a9c1e7ffeAbCdEf012345", "timestamp": "2026-10-14T17:40:20.000Z", "cwd": "/work/proj", "message": {"role": "assistant", "content": [{"type": "text", "text": "Renamed it; all tests pass."}]}}

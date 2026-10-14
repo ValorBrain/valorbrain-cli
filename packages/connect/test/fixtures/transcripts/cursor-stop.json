@@ -1,0 +1,14 @@
+{
+  "conversation_id": "6f1c2a4e-9b0d-4c1e-8a7f-2d3b4c5e6f70",
+  "generation_id": "<GENERATION>",
+  "model": "claude-4.5-sonnet",
+  "hook_event_name": "stop",
+  "cursor_version": "2026.05.20-2b5dd59",
+  "workspace_roots": [
+    "/work/proj"
+  ],
+  "user_email": null,
+  "transcript_path": "<TRANSCRIPT>",
+  "status": "completed",
+  "loop_count": 0
+}

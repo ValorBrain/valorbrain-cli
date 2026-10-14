@@ -9,7 +9,8 @@
  *                   harness's OWN model through the harness's continuation
  *                   mechanism; the model records through MCP (or records nothing)
  *
- * Nothing here uploads a transcript or asks the server to run a model.
+ * With `send_transcript` on, the Stop hook also hands the session transcript
+ * to the engine's extraction (opt-in, decision 18; see "transcript upload").
  *
  * Rules this file keeps:
  *   - The token never travels on argv. It comes from `~/.valorbrain/connect.json`
@@ -37,17 +38,17 @@
  *     naming another pin) it spawns the sibling `index.mjs heal` detached.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
     appendFileSync, chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync,
-    readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
+    readSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** This package's version. Also its directory name under ~/.valorbrain/bin/connect/. */
-export const CLIENT_VERSION = '0.11.1';
+export const CLIENT_VERSION = '0.12.0';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
@@ -263,8 +264,8 @@ export function consentedScope(home, harness) {
 /**
  * What leaves the machine, per harness (PRD decision 18): `send_prompt`
  * (default true — the prompt of each turn goes to /api/v1/hooks/cue for recall),
- * `send_transcript` (default false — the Hermes plugin, and the Stop hook of
- * harnesses whose transcript the engine reads: Claude Code, Grok) and
+ * `send_transcript` (default false — the Hermes plugin, the omp bridge, and
+ * the Stop hook of the harnesses in STOP_TRANSCRIPT_HARNESSES) and
  * `checkpoint` (default true — the Stop hook may ask the agent for a
  * memory checkpoint). Kept in this harness's entry of connect.json, so
  * `--prompt off` for Codex leaves Claude Code alone.
@@ -605,7 +606,8 @@ export function isContinuation(payload, state, now = Date.now()) {
 /** Only a turn that really completed is work worth a checkpoint. */
 export function isGenuineCompletion(dialect, payload) {
     const p = payload || {};
-    if (dialect === 'cursor' && typeof p.status === 'string') return p.status === 'completed';
+    // Cursor's Stop and the OpenCode plugin's: 'completed' | 'aborted' | 'error'.
+    if ((dialect === 'cursor' || dialect === 'text') && typeof p.status === 'string') return p.status === 'completed';
     if (dialect === 'grok' && typeof p.reason === 'string' && p.reason) return p.reason === 'end_turn';
     return true;
 }
@@ -1181,13 +1183,25 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION) {
 // self-hosted Stop hooks do with the local file. The hook only decides and
 // spawns `transcript-upload` detached; it never waits for the upload.
 //
-// Which harnesses: Claude Code (transcript_path, JSONL the engine parses) and
-// Grok (transcriptPath, the engine's ACP parser). Codex and Gemini send a
-// transcript_path too, but in formats the engine does not parse (Codex rollout
-// `response_item` lines, Gemini's single JSON file): an upload would ingest
-// nothing. Kiro and Cursor send none.
+// Which harnesses, and where each Stop finds its transcript:
+//   Claude Code   transcript_path (Claude JSONL)
+//   Grok          transcriptPath (ACP session updates)
+//   Codex         transcript_path (rollout JSONL)
+//   Gemini CLI    transcript_path (session JSONL; older CLIs: one JSON file)
+//   Cursor        transcript_path / CURSOR_TRANSCRIPT_PATH, else by
+//                 conversation_id under ~/.cursor/projects/<workspace>/agent-transcripts
+//   Kiro          no path in the payload: found by session_id under ~/.kiro/sessions
+//   OpenCode      the plugin's Claude-format JSONL (transcript_path)
+// A Stop uploads only through its own harness's hook file: Cursor running
+// Claude's settings.json, or Grok running Cursor's, is the other harness's
+// dialect and uploads through its own file.
 
-const TRANSCRIPT_DIALECTS = new Set(['claude', 'grok']);
+const TRANSCRIPT_DIALECT = {
+    'claude-code': 'claude', grok: 'grok', codex: 'codex', 'gemini-cli': 'gemini',
+    cursor: 'cursor', kiro: 'kiro', opencode: 'text',
+};
+/** Harnesses whose Stop hook uploads the session transcript when `send_transcript` is on. */
+export const STOP_TRANSCRIPT_HARNESSES = Object.keys(TRANSCRIPT_DIALECT);
 /** Later uploads of a session: at most one per this interval (growth required). */
 const TRANSCRIPT_INTERVAL_MS = 10 * MIN;
 /** First upload of a session: after this many completed turns (a one-shot `-p` run never uploads). */
@@ -1250,22 +1264,229 @@ export function claimTranscriptUpload(home, { harness, key, size, stopId = '', n
     }
 }
 
-/** Stop hook: when the opt-in is on and the transcript is due, spawn the detached uploader. */
+/** Session and conversation ids that may name a file: no separators, no dots. */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** The first line of a file as JSON (at most `max` bytes read); null when it is not one. */
+function firstJsonLine(path, max = 1024 * 1024) {
+    let fd;
+    try {
+        fd = openSync(path, 'r');
+        const chunks = [];
+        let total = 0;
+        const buf = Buffer.alloc(64 * 1024);
+        while (total < max) {
+            const n = readSync(fd, buf, 0, buf.length, total);
+            if (n <= 0) break;
+            const nl = buf.subarray(0, n).indexOf(0x0a);
+            chunks.push(Buffer.from(buf.subarray(0, nl < 0 ? n : nl)));
+            total += n;
+            if (nl >= 0) break;
+        }
+        const v = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+        return v && typeof v === 'object' ? v : null;
+    } catch {
+        return null;
+    } finally {
+        if (fd !== undefined) try { closeSync(fd); } catch { /* closed */ }
+    }
+}
+
+/**
+ * A Codex rollout that is not a person's main session: `codex exec` (also what
+ * the Codex SDK runs), `codex mcp-server`, an SDK client of the app-server, or
+ * a sub-agent thread. Read from the rollout's `session_meta` line; a rollout
+ * that does not start with one is not classified as a person's session either.
+ */
+export function codexScriptedRollout(path) {
+    const first = firstJsonLine(path);
+    const meta = first?.type === 'session_meta' ? first.payload : null;
+    if (!meta || typeof meta !== 'object') return true;
+    if (meta.source && typeof meta.source === 'object') return true; // { subagent: { thread_spawn … } }
+    if (meta.thread_source === 'subagent') return true;
+    if (meta.source === 'exec' || meta.source === 'mcp') return true;
+    return /sdk/i.test(str(meta.originator));
+}
+
+/** A Gemini CLI conversation file recorded for a sub-agent (`kind: "subagent"`). */
+export function geminiSubagentSession(path) {
+    const head = path.endsWith('.json') ? readJson(path) : firstJsonLine(path);
+    return head?.kind === 'subagent';
+}
+
+/**
+ * Kiro's Stop names the session but not the file. Kiro CLI 3.0 / `--v3`:
+ * `~/.kiro/sessions/<sha256(cwd)[:16]>/<sess_…>/messages.jsonl` (any workspace
+ * directory, when the cwd hash misses). The legacy engine:
+ * `~/.kiro/sessions/cli/<id>.jsonl`, whose `<id>.json` marks the sessions an ACP
+ * client opened (`session_created_reason: "subagent"`) — those are not uploaded.
+ * A sub-agent's own execution lives inside its parent's directory, so no Stop
+ * id resolves to it.
+ */
+export function kiroTranscriptPath(home, payload) {
+    const sid = str(payload?.session_id);
+    if (!home || !SAFE_ID.test(sid)) return '';
+    const root = join(home, '.kiro', 'sessions');
+    if (sid.startsWith('sess_')) {
+        const cwd = str(payload.cwd);
+        if (cwd) {
+            const guess = join(root, createHash('sha256').update(cwd).digest('hex').slice(0, 16), sid, 'messages.jsonl');
+            if (existsSync(guess)) return guess;
+        }
+        try {
+            for (const d of readdirSync(root)) {
+                const p = join(root, d, sid, 'messages.jsonl');
+                if (existsSync(p)) return p;
+            }
+        } catch { /* no sessions directory */ }
+        return '';
+    }
+    const p = join(root, 'cli', `${sid}.jsonl`);
+    if (!existsSync(p)) return '';
+    return readJson(join(root, 'cli', `${sid}.json`))?.session_created_reason === 'subagent' ? '' : p;
+}
+
+/** Cursor's project directory name for a workspace path (its own rule: non-alphanumerics → '-'). */
+export function cursorProjectSlug(workspace) {
+    return str(workspace).replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** Cursor's main-conversation transcript: the payload's path, else found by conversation id. JSONL only. */
+export function cursorTranscriptPath(home, payload, env = {}) {
+    const given = str(payload?.transcript_path) || str(env.CURSOR_TRANSCRIPT_PATH);
+    if (given) return given.endsWith('.jsonl') ? given : '';
+    const id = str(payload?.conversation_id);
+    const roots = Array.isArray(payload?.workspace_roots) ? payload.workspace_roots : [];
+    const workspace = str(roots[0]) || str(env.CURSOR_PROJECT_DIR);
+    if (!home || !SAFE_ID.test(id) || !workspace) return '';
+    const dir = join(home, '.cursor', 'projects', cursorProjectSlug(workspace), 'agent-transcripts');
+    for (const p of [join(dir, `${id}.jsonl`), join(dir, id, `${id}.jsonl`)]) {
+        if (existsSync(p)) return p;
+    }
+    return '';
+}
+
+/** Where this Stop's transcript is, by dialect; '' when there is none to send. */
+export function transcriptPathFor(dialect, payload, { home, env = {} } = {}) {
+    const p = payload || {};
+    switch (dialect) {
+        case 'kiro': return kiroTranscriptPath(home, p);
+        case 'cursor': return cursorTranscriptPath(home, p, env);
+        default: return str(p.transcript_path) || str(p.transcriptPath);
+    }
+}
+
+/**
+ * Command lines of this process's ancestors, nearest first, from one `ps`
+ * (Linux, macOS). Empty on Windows or when `ps` fails.
+ */
+export function ancestorCommands({ pid = process.ppid, platform = process.platform, spawnSyncImpl = spawnSync } = {}) {
+    if (platform === 'win32') return [];
+    let out = '';
+    try {
+        const r = spawnSyncImpl('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'args='], { encoding: 'utf-8', timeout: 2000, windowsHide: true });
+        out = typeof r?.stdout === 'string' ? r.stdout : '';
+    } catch { return []; }
+    return ancestorsFromTable(out, pid);
+}
+
+/** `pid ppid args` lines → the args of `pid` and its ancestors, nearest first. */
+export function ancestorsFromTable(table, pid) {
+    const procs = new Map();
+    for (const line of String(table).split('\n')) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+        if (m) procs.set(Number(m[1]), { ppid: Number(m[2]), args: m[3].trim() });
+    }
+    const chain = [];
+    for (let p = Number(pid), hops = 0; procs.has(p) && hops < 12; hops++) {
+        const proc = procs.get(p);
+        chain.push(proc.args);
+        if (proc.ppid === p) break;
+        p = proc.ppid;
+    }
+    return chain;
+}
+
+const baseName = (token) => token.split(/[\\/]/).pop().toLowerCase();
+/** Gemini CLI options that take a value (0.43 yargs): the token after them is not a query. */
+const GEMINI_VALUE_FLAGS = new Set([
+    '-m', '--model', '-p', '--prompt', '-i', '--prompt-interactive', '-w', '--worktree', '--approval-mode',
+    '--policy', '--admin-policy', '--allowed-mcp-server-names', '--allowed-tools', '-e', '--extensions',
+    '-r', '--resume', '--session-file', '--session-id', '--delete-session', '--include-directories',
+    '-o', '--output-format', '--fake-responses', '--record-responses',
+]);
+
+/** Gemini's own headless rule (isHeadlessMode) on its argv: `-p`/`--prompt`, or a query with no `-i`. */
+function geminiArgsHeadless(args) {
+    if (args.some((a) => a === '-p' || a === '--prompt' || a.startsWith('--prompt='))) return true;
+    if (args.some((a) => a === '-i' || a === '--prompt-interactive' || a.startsWith('--prompt-interactive='))) return false;
+    for (let i = 0; i < args.length; i++) {
+        if (GEMINI_VALUE_FLAGS.has(args[i])) { i++; continue; }
+        if (!args[i].startsWith('-')) return true;
+    }
+    return false;
+}
+
+/** Per harness: the CLI's process (by argv token) and its flags for a scripted, non-interactive run. */
+const HEADLESS_CLI = {
+    gemini: { entry: (t) => ['gemini', 'gemini.js'].includes(baseName(t)), headless: geminiArgsHeadless },
+    kiro: { entry: (t) => ['kiro-cli', 'kiro-cli-chat'].includes(baseName(t)), headless: (args) => args.includes('--no-interactive') },
+    cursor: {
+        entry: (t) => baseName(t) === 'cursor-agent' || /cursor-agent[\\/]versions[\\/][^\\/]+[\\/]index\.js$/.test(t),
+        headless: (args) => args.some((a) => a === '-p' || a === '--print'),
+    },
+};
+
+/**
+ * A scripted run of a harness whose Stop payload does not say so: `gemini -p`
+ * (or a query argument, or CI — Gemini's own headless rule),
+ * `kiro-cli chat --no-interactive`, `cursor-agent -p`. Read from the argv of
+ * the harness process that spawned this hook.
+ */
+export function headlessRun(dialect, env = {}, ancestors = []) {
+    if (dialect === 'gemini' && env.GEMINI_CLI_INTEGRATION_TEST !== 'true' && (env.CI === 'true' || env.GITHUB_ACTIONS === 'true')) return true;
+    const cli = HEADLESS_CLI[dialect];
+    if (!cli) return false;
+    for (const cmd of ancestors) {
+        const tokens = String(cmd).trim().split(/\s+/);
+        const at = tokens.findIndex(cli.entry);
+        if (at >= 0) return cli.headless(tokens.slice(at + 1));
+    }
+    return false;
+}
+
+/**
+ * Stop hook: when the opt-in is on and the transcript is due, spawn the
+ * detached uploader. Only a person's main session uploads: SDK and
+ * non-interactive runs, sub-agents and continuations of a block never do.
+ */
 function kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps }) {
-    if (!harness || !sessionId || !TRANSCRIPT_DIALECTS.has(dialect)) return false;
+    if (!harness || !sessionId || TRANSCRIPT_DIALECT[harness] !== dialect) return false;
     if (!transcriptSharing(home, harness, env)) return false;
-    // Programmatic runs (SDK) and continuations of a block are not new work.
-    if (/^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT))) return false;
+    // Claude Code: SDK/-p runs, and every session it marks unattended
+    // (CLAUDE_CODE_SESSION_ATTENDED=0: also background/daemon sessions and a
+    // claude started by another claude).
+    const attended = dialect === 'claude' ? str(env.CLAUDE_CODE_SESSION_ATTENDED) : '';
+    if (dialect === 'claude' && (/^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT)) || attended === '0')) return false;
     if (!isGenuineCompletion(dialect, payload) || isContinuation(payload, state, now)) return false;
-    const path = str(payload.transcript_path) || str(payload.transcriptPath);
+    const path = transcriptPathFor(dialect, payload, { home, env });
     if (!path) return false;
     let size = 0;
     try { size = statSync(path).size; } catch { return false; }
+    // A whole-file JSON transcript (older Gemini CLIs) cannot be cut to the cap.
+    if (size > MAX_TRANSCRIPT_BYTES && !path.endsWith('.jsonl')) return false;
+    if (dialect === 'codex' && codexScriptedRollout(path)) return false;
+    if (dialect === 'gemini' && geminiSubagentSession(path)) return false;
+    if (HEADLESS_CLI[dialect] && headlessRun(dialect, env, deps.ancestors ?? ancestorCommands({ spawnSyncImpl: deps.spawnSyncImpl }))) return false;
     const stopId = str(payload.generation_id) || str(payload.promptId) || str(payload.turn_id);
     if (!claimTranscriptUpload(home, { harness, key, size, stopId, now })) return false;
-    const cwd = str(payload.cwd) || str(payload.workspaceRoot) || '';
+    const roots = Array.isArray(payload.workspace_roots) ? payload.workspace_roots : [];
+    const cwd = str(payload.cwd) || str(payload.workspaceRoot) || str(roots[0]);
     const self = deps.self ?? fileURLToPath(import.meta.url);
-    return spawnDetached(process.execPath, [self, 'transcript-upload', `--harness=${harness}`, `--session=${sessionId}`, `--transcript=${path}`, ...(cwd ? [`--cwd=${cwd}`] : [])], { env, spawnImpl: deps.spawnImpl });
+    return spawnDetached(process.execPath, [
+        self, 'transcript-upload', `--harness=${harness}`, `--session=${sessionId}`, `--transcript=${path}`,
+        ...(cwd ? [`--cwd=${cwd}`] : []), ...(attended === '1' ? ['--attended=1'] : []),
+    ], { env, spawnImpl: deps.spawnImpl });
 }
 
 /**
@@ -1288,7 +1509,15 @@ export async function uploadTranscript(argv, deps = {}) {
     if (!creds.token) return [];
     let transcript;
     try { transcript = readTranscriptCapped(path); } catch { return []; }
-    const input = { sessionId, hookEventName: 'Stop', ...(arg('cwd') ? { workingDir: arg('cwd') } : {}) };
+    // `--attended`: the harness's own word that a person is at this session
+    // (Claude Code's CLAUDE_CODE_SESSION_ATTENDED); the engine keeps facts from
+    // human-typed turns only when it is "1".
+    const attended = arg('attended');
+    const input = {
+        sessionId, hookEventName: 'Stop',
+        ...(arg('cwd') ? { workingDir: arg('cwd') } : {}),
+        ...(attended === '1' || attended === '0' ? { sessionAttended: attended } : {}),
+    };
     const done = [];
     for (const hook of ['episode-extractor', 'decision-extractor']) {
         let status = 0;

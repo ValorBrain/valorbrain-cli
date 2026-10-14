@@ -160,19 +160,49 @@ Página completa, por harness: <https://docs.valorbrain.com.br/docs/concepts/wha
   inteira com `VALORBRAIN_SEND_TRANSCRIPT=on|off`, que vence o arquivo nos dois
   sentidos.
   - **Hermes:** o plugin de memória envia o transcript aos hooks de extração.
-  - **Claude Code e Grok:** o hook de Stop envia o arquivo de transcript da
-    sessão para `/api/v1/hooks/run` (`episode-extractor`, que cria o documento
-    da conversa e os episódios, e depois `decision-extractor`). A primeira vez
-    é depois de 3 turnos concluídos; depois disso, só quando o arquivo cresceu
-    e no máximo a cada 10 min por sessão. Turnos que só continuam um bloqueio
-    (`stop_hook_active`) e sessões via SDK não enviam.
+  - **Hook de Stop** (Claude Code, Codex, Gemini CLI, Cursor, Kiro, Grok e
+    OpenCode): envia o arquivo de transcript da sessão para
+    `/api/v1/hooks/run` (`episode-extractor`, que cria o documento da conversa
+    e os episódios, e depois `decision-extractor`). A primeira vez é depois de
+    3 turnos concluídos; depois disso, só quando o arquivo cresceu e no máximo
+    a cada 10 min por sessão. Turnos que só continuam um bloqueio
+    (`stop_hook_active`) não enviam.
+  - Onde o hook acha o arquivo:
+
+    | Harness | Arquivo |
+    | --- | --- |
+    | Claude Code | `transcript_path` do payload |
+    | Grok | `transcriptPath` do payload |
+    | Codex | `transcript_path` (o rollout em `~/.codex/sessions`) |
+    | Gemini CLI | `transcript_path` (`~/.gemini/tmp/<projeto>/chats/session-*.jsonl`) |
+    | Cursor | `transcript_path` ou `CURSOR_TRANSCRIPT_PATH`; sem eles, pelo `conversation_id` em `~/.cursor/projects/<workspace>/agent-transcripts/` |
+    | Kiro | o payload não traz caminho: pelo `session_id` em `~/.kiro/sessions/` (`<hash>/sess_*/messages.jsonl` no Kiro CLI 3.0/`--v3`, `cli/<id>.jsonl` no motor legado) |
+    | OpenCode | o JSONL que o plugin grava em `~/.valorbrain/state/opencode/` |
+
+  - Só a sessão principal de uma pessoa envia. Ficam de fora:
+    - Claude Code via SDK ou `-p`, e toda sessão que o Claude Code marca como
+      sem ninguém (`CLAUDE_CODE_SESSION_ATTENDED=0`: também sessões em segundo
+      plano e um claude aberto por outro). Com `=1`, o envio leva
+      `sessionAttended: "1"` para o engine.
+    - `codex exec` (é o que o SDK do Codex roda), `codex mcp-server`, clientes
+      SDK do app-server e threads de sub-agente: o hook lê a linha
+      `session_meta` do rollout (`source`, `originator`).
+    - `gemini -p`, Gemini com a pergunta na linha de comando e Gemini em CI
+      (`CI=true`), a mesma regra de "headless" do Gemini; sessões de
+      sub-agente (`kind: "subagent"`).
+    - `kiro-cli chat --no-interactive`; no motor legado, as sessões que um
+      cliente ACP abriu (`session_created_reason: "subagent"`).
+    - `cursor-agent -p`, e turnos do Cursor ou do OpenCode que não terminaram
+      como `completed`.
+    - Gemini, Kiro e Cursor não dizem no payload que a execução é
+      não interativa: o hook olha a linha de comando do processo do harness
+      com `ps` (Linux e macOS). No Windows essa checagem não existe e só vale
+      o mínimo de 3 turnos.
   - O envio roda em segundo plano e o hook não espera por ele. O limite é de
-    8 MiB: um arquivo maior manda o final.
+    8 MiB: um arquivo maior manda o final. Um transcript em JSON de arquivo
+    único (Gemini CLI antigo) acima disso não é cortado e não é enviado.
   - Falhas viram uma linha em `~/.valorbrain/connect.log`, nunca o conteúdo.
     Depois de 401/403/413 o envio pausa 6 h; depois de 429, 30 min.
-  - **Codex e Gemini CLI** também informam um transcript, mas o engine ainda
-    não lê esses formatos, então nada é enviado. **Kiro e Cursor** não
-    informam transcript.
   - **Hooks de extração ligados à mão** (`decision-extractor`,
     `episode-extractor`, `handoff-generator`, `feedback-loop`,
     `precompact-extract`, `staleness-check` no comando do hook). Ligar um
