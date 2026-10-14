@@ -155,6 +155,21 @@ test('an engine pinning another version gets the npx hooks of THAT version, neve
     assert.match(r.stdout, /the engine pins 0\.10\.9/);
 });
 
+test('rollout window: engine serves client=local but still pins 0.9.0 → npx@0.9.0 hooks, no local dir, no heal loop', async () => {
+    const { server, state, url } = await stubEngine();
+    state.pin = '0.9.0';
+    const h = home();
+    const r = await install(h, url);
+    server.close();
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(promptCommand(h), 'npx -y @valorbrain/connect@0.9.0 hook prompt --harness=claude-code');
+    assert.ok(!readFileSync(join(h, '.claude', 'settings.json'), 'utf-8').includes(PH));
+    assert.equal(existsSync(join(h, '.valorbrain', 'bin')), false);
+    assert.match(r.stdout, /the engine pins 0\.9\.0, which has no local hook client/);
+    // heal-dispatch (local clients only) would refuse this pin rather than run 0.9's CLI with `heal`.
+    assert.equal(manifestHealPin(claudeManifest({ pin: '0.9.0', local: true })), null);
+});
+
 test('VALORBRAIN_HOOK_CLIENT=npx opts out; Windows defaults to npx', async () => {
     assert.equal(localClientWanted({}, 'linux'), true);
     assert.equal(localClientWanted({}, 'darwin'), true);

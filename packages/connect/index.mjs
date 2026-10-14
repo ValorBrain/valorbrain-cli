@@ -1412,7 +1412,12 @@ async function main() {
           failed++;
           continue;
         }
-        console.log(`  ${C.dim}note: hooks run npx @valorbrain/connect@${pin} — ${pin !== CLIENT_VERSION ? `the engine pins ${pin} (this is ${CLIENT_VERSION}); its first self-heal installs the local copy` : "the local hook client could not be written"}${C.off}`);
+        const why = pin === CLIENT_VERSION
+          ? "the local hook client could not be written"
+          : healPin(pin)
+            ? `the engine pins ${pin} (this is ${CLIENT_VERSION}); its first self-heal installs the local copy`
+            : `the engine pins ${pin}, which has no local hook client`;
+        console.log(`  ${C.dim}note: hooks run npx @valorbrain/connect@${pin} — ${why}${C.off}`);
       }
     }
     const changes = planFor(manifest, tokenFor(harness), home, mcpOnly ? isPerTurn : args.remove, process.cwd(), hookClient);
