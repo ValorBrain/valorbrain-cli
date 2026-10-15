@@ -152,8 +152,9 @@ test("init --agent --json lists the connect commands with the token, detected cl
     assert.ok(next.connect[0].mcp_manual.includes(`--url ${SIGNUP.mcp_url}`));
     const gemini = next.connect.find((c) => c.client === "gemini");
     assert.equal(gemini.harness, "gemini-cli");
-    assert.ok(!gemini.consent.includes("VALORBRAIN_"), "Gemini CLI strips the env of its hooks");
-    assert.match(gemini.consent, /--prompt off` and `--checkpoint off`/);
+    // Gemini CLI passes the env to its hooks except on a GitHub runner (its strict allowlist).
+    assert.match(gemini.consent, /--prompt off` and `--checkpoint off` \(or VALORBRAIN_SEND_PROMPT=off \/ VALORBRAIN_CHECKPOINT=off, except on a GitHub runner, where Gemini CLI does not pass them to its hooks; the saved choices always work\)/);
+    assert.ok(!next.connect[0].consent.includes("GitHub runner"), "the runner caveat is Gemini's alone");
     const claude = next.connect.find((c) => c.client === "claude-code");
     assert.equal(claude.detected, false);
     assert.equal(claude.mcp_manual,

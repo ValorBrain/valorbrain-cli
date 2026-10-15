@@ -27,8 +27,9 @@ the first command is the connect installer — `npx -y @valorbrain/connect@lates
 --token <mcp_token> --harness <claude-code|codex|gemini-cli>`, MCP + rules +
 hooks — followed by one consent line: the hooks send the prompt of each turn to
 your ValorBrain workspace; opt out with `--prompt off` and `--checkpoint off`
-(or `VALORBRAIN_SEND_PROMPT=off` / `VALORBRAIN_CHECKPOINT=off`, not on Gemini
-CLI); to drop only the hooks, re-run the install with `--mcp-only`; `--remove`
+(or `VALORBRAIN_SEND_PROMPT=off` / `VALORBRAIN_CHECKPOINT=off`; Gemini CLI passes
+them to its hooks too, except on a GitHub runner, and the saved choices always
+work); to drop only the hooks, re-run the install with `--mcp-only`; `--remove`
 undoes everything (MCP entry, rules, hooks, saved credentials)
 ([what leaves your machine](https://docs.valorbrain.com.br/docs/concepts/what-leaves-your-machine)).
 The no-hooks path follows: the same command with `--mcp-only` (MCP server +
