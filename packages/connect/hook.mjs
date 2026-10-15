@@ -288,7 +288,8 @@ export function setPrivacy(home, harness, patch) {
 
 /**
  * Whether this harness may send the prompt. VALORBRAIN_SEND_PROMPT=off|on wins
- * (machine-wide; Gemini CLI strips env, so there the file is the switch), then
+ * (machine-wide; Gemini CLI drops it from hooks on GitHub runners, where the
+ * file is the switch), then
  * the harness's `send_prompt`, then on.
  */
 export function promptSharing(home, harness, env = {}) {
@@ -302,7 +303,7 @@ export function promptSharing(home, harness, env = {}) {
  * Whether the Stop hook may checkpoint for this harness. Same precedence as
  * promptSharing: VALORBRAIN_CHECKPOINT=off|on (machine-wide), then the
  * harness's `checkpoint` in connect.json (`--checkpoint off`; the only switch
- * Gemini CLI sees, since it strips env from hooks), then on.
+ * Gemini CLI hooks see on a GitHub runner, where it drops env), then on.
  */
 export function checkpointEnabled(home, harness, env = {}) {
     const v = str(env.VALORBRAIN_CHECKPOINT).toLowerCase();

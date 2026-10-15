@@ -182,7 +182,8 @@ Options
   --checkpoint on|off  let the Stop hook ask the agent for a short memory
                     checkpoint every few turns (default on). Saved like
                     --prompt; VALORBRAIN_CHECKPOINT=off|on wins over it. Gemini
-                    CLI strips env from hooks, so there only this switch works.
+                    CLI on a GitHub runner drops env from hooks; there only
+                    this switch works.
 
 Unknown flags are named on stderr and ignored.
 
