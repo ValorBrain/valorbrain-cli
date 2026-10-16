@@ -117,6 +117,14 @@ gateway again.
   writes a keyed decision fact only from a person's session: a one-shot
   `hermes chat -q`/`-z` or cron run gives none (FB-0205,
   `src/hooks/run-authorship.ts`).
+- **Run kind (1.11.0)**: a `cron` agent context and a session source that runs
+  on its own schedule or as a one-shot call (`oneshot`, `cron`, `batch`,
+  `kanban`, `api`) send `X-Run-Kind: routine` on every request of the session;
+  a `webhook` source sends `X-Run-Kind: pipeline` (`VALORBRAIN_RUN_KIND` for
+  the local binary). The engine keeps that output out of other agents' feeds.
+  A person's session sends none (the engine infers `conversation`), and so do
+  `subagent`, `flush`, `tool` and `a2a`: they are pieces of another run. An
+  explicit `VALORBRAIN_RUN_KIND` always wins.
 - **Client identity (1.9.0)**: every `POST /api/v1/hooks/run` and
   `POST /api/v1/runtimes/register` carries `X-ValorBrain-Client:
   hermes-plugin/<version>`, `X-ValorBrain-Harness: hermes` and
@@ -155,6 +163,9 @@ triggers a heal.
 | `VALORBRAIN_SEND_PROMPT` | `off` stops sending each turn's prompt (no per-turn recall). Default on |
 | `VALORBRAIN_SEND_TRANSCRIPT` | `on` uploads the session transcript to the hosted extraction hooks. Default off |
 | `VALORBRAIN_SERVE_PORT` | local engine port (self-hosted; default 7438) |
+| `VALORBRAIN_RUN_KIND` | `conversation`, `routine` or `pipeline`: sent as `X-Run-Kind`, over what the plugin infers. Other values are ignored |
+| `VALORBRAIN_REQUESTED_BY` | who asked for this run (≤120 chars, accents folded to ASCII): sent as `X-Requested-By`, attribution only |
+| `VALORBRAIN_AGENT_TEAM` | comma-separated team labels (≤5): sent as `X-Agent-Team` |
 
 ## Links
 

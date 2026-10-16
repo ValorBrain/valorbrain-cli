@@ -666,11 +666,12 @@ async function postCue(api, token, body, timeoutMs, fetchImpl, headers = {}) {
  * initialize handshake, a single POST with the `_meta` envelope). Fallback for
  * engines that predate the cue endpoint.
  */
-export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.6.0') {
+export async function callTool(api, token, name, args, timeoutMs, fetchImpl, clientVersion = '0.6.0', headers = {}) {
     const res = await fetchImpl(`${api}/mcp`, {
         method: 'POST',
         signal: AbortSignal.timeout(timeoutMs),
         headers: {
+            ...headers,
             'content-type': 'application/json',
             accept: 'application/json, text/event-stream',
             authorization: `Bearer ${token}`,
@@ -699,8 +700,8 @@ export async function callTool(api, token, name, args, timeoutMs, fetchImpl, cli
     return parsed.result;
 }
 
-async function legacyContext(api, token, message, timeoutMs, fetchImpl, clientVersion) {
-    const result = await callTool(api, token, 'memory_prepare', { message, fast_mode: true }, timeoutMs, fetchImpl, clientVersion);
+async function legacyContext(api, token, message, timeoutMs, fetchImpl, clientVersion, headers = {}) {
+    const result = await callTool(api, token, 'memory_prepare', { message, fast_mode: true }, timeoutMs, fetchImpl, clientVersion, headers);
     return (result?.content || []).map((c) => c?.text).filter(Boolean).join('\n').trim();
 }
 
@@ -804,11 +805,18 @@ export async function runHook(argv, deps = {}) {
             new Promise((r) => setTimeout(r, 2500)),
         ]).catch(() => {})
         : Promise.resolve();
-    // Contract D: every hosted request says which client, harness and install it is.
-    const headers = clientHeaders(home, harness || dialect);
+    // Contract D: every hosted request says which client, harness and install it is;
+    // ADR-084: and, when the harness knows, the kind of run (runHeaders). Built on
+    // the first request: reading the run kind may cost a `ps`.
+    let ancestry;
+    const ancestors = () => (ancestry ??= deps.ancestors ?? ancestorCommands({ spawnSyncImpl: deps.spawnSyncImpl }));
+    let run;
+    const runInfo = () => (run ??= runHeaders(inferRunKind(dialect, env, payload, ancestors), env));
+    let hosted;
+    const hostedHeaders = () => (hosted ??= { ...clientHeaders(home, harness || dialect), ...runInfo() });
     /** POST the cue; a `client_pin` naming another version starts a detached heal (deps.onPinHint). */
     const sendCue = async (body) => {
-        const r = await postCue(creds.api, creds.token, body, requestTimeoutMs(event, env), fetchImpl, headers);
+        const r = await postCue(creds.api, creds.token, body, requestTimeoutMs(event, env), fetchImpl, hostedHeaders());
         if (r.json?.client_pin && typeof deps.onPinHint === 'function') {
             try { deps.onPinHint(r.json.client_pin); } catch { /* fail-open */ }
         }
@@ -825,7 +833,7 @@ export async function runHook(argv, deps = {}) {
             await heal;
             return 0;
         }
-        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript, headers }).catch(() => false), heal]);
+        await Promise.all([runExtraction(creds.api, creds.token, name, payload, fetchImpl, { withTranscript, headers: hostedHeaders() }).catch(() => false), heal]);
         return 0;
     }
     if (!event) {
@@ -891,7 +899,7 @@ export async function runHook(argv, deps = {}) {
                 }
             }
             if (!served) {
-                context = await legacyContext(creds.api, creds.token, (prompt || 'session start').slice(0, 8_000), timeoutMs, fetchImpl, clientVersion);
+                context = await legacyContext(creds.api, creds.token, (prompt || 'session start').slice(0, 8_000), timeoutMs, fetchImpl, clientVersion, runInfo());
             }
         } catch (e) {
             failure = `${event}: ${e?.name === 'TimeoutError' ? 'timed out' : e?.message || 'request failed'}`;
@@ -912,7 +920,7 @@ export async function runHook(argv, deps = {}) {
     const silent = renderSilentStop(dialect);
     // Opt-in transcript upload (decision 18), before and independent of the
     // checkpoint switch. Only decides and spawns: the upload runs detached.
-    try { kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps }); } catch { /* fail-open */ }
+    try { kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps, ancestors }); } catch { /* fail-open */ }
     // Opt-out: VALORBRAIN_CHECKPOINT, then this harness's `checkpoint` in
     // connect.json (the engine has its own switch for everyone). And headless
     // runs: an SDK-driven Claude Code session's final message is somebody's
@@ -1176,6 +1184,86 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION) {
     return headers;
 }
 
+// ─── run kind, requester, team (ADR-084) ─────────────────────────────────────
+//
+// The engine keeps routine and pipeline output out of OTHER agents' feeds.
+// A hook declares `x-run-kind` only when its harness says the run is not a
+// person's session; an interactive one sends nothing (the engine infers
+// `conversation`). VALORBRAIN_RUN_KIND set by the operator always wins. The
+// vocabulary is the engine's (`runKindFromSignals`, src/hooks/run-authorship.ts):
+// a subagent, a flush and a tool/a2a call are pieces of another run and decide
+// nothing.
+
+const RUN_KINDS = new Set(['conversation', 'routine', 'pipeline']);
+/** omp ExtensionContext.mode of a one-shot run (`omp -p`, `--mode json`). */
+const ROUTINE_RUN_MODES = new Set(['print', 'json']);
+/** Claude Code entrypoints of a program, not a person (`sdk-ts`, `sdk-cli`, `mcp`). */
+const ROUTINE_ENTRYPOINT = /^(?:sdk(?:-|$)|mcp$)/;
+/** Hermes session sources that run on their own schedule or as a one-shot call. */
+const ROUTINE_SESSION_SOURCES = new Set(['oneshot', 'cron', 'batch', 'kanban', 'api']);
+/** Hermes session sources an external system pushed. */
+const PIPELINE_SESSION_SOURCES = new Set(['webhook']);
+const REQUESTED_BY_MAX_CHARS = 120;
+
+const lowerLabel = (v) => str(v).toLowerCase();
+
+/**
+ * Header-safe label: accents folded to ASCII ("João" → "Joao"; the engine
+ * decodes header bytes as latin-1 and fetch refuses other bytes), anything
+ * else outside printable ASCII dropped, trimmed, capped at `max` chars.
+ */
+export function headerLabel(raw, max = 0) {
+    const v = str(raw).normalize('NFKD').replace(/[^\x20-\x7e]/g, '').trim();
+    return max ? v.slice(0, max).trim() : v;
+}
+
+/** Claude Code: whether a person attends the session beats the entrypoint name. */
+function unattended(attended, entrypoint) {
+    const a = lowerLabel(attended);
+    if (a === '0' || a === 'false') return true;
+    if (a === '1' || a === 'true') return false;
+    return ROUTINE_ENTRYPOINT.test(lowerLabel(entrypoint));
+}
+
+/**
+ * The run kind this hook knows: a valid VALORBRAIN_RUN_KIND; else `pipeline`
+ * for a webhook session source; else `routine` for an unattended or SDK/MCP
+ * Claude Code session (payload or hook env), an omp `print`/`json` run, a
+ * Hermes `cron` context or oneshot/cron/batch/kanban/api source, a `codex
+ * exec`/SDK rollout and the scripted runs headlessRun sees (`gemini -p` or CI,
+ * `kiro-cli --no-interactive`, `cursor-agent -p`). '' when nothing says so.
+ * `ancestors` is called only for the harnesses headlessRun reads it for.
+ */
+export function inferRunKind(dialect, env = {}, payload = {}, ancestors = () => []) {
+    const explicit = lowerLabel(env.VALORBRAIN_RUN_KIND);
+    if (RUN_KINDS.has(explicit)) return explicit;
+    const p = payload && typeof payload === 'object' ? payload : {};
+    const source = lowerLabel(p.session_source ?? p.sessionSource);
+    if (PIPELINE_SESSION_SOURCES.has(source)) return 'pipeline';
+    // Payload signals vote on their own (engine rule); only the hook env lets attended beat the entrypoint.
+    if (unattended(p.session_attended ?? p.sessionAttended, '') || ROUTINE_ENTRYPOINT.test(lowerLabel(p.entrypoint))) return 'routine';
+    if (ROUTINE_RUN_MODES.has(lowerLabel(p.run_mode ?? p.runMode ?? p.mode))) return 'routine';
+    if (lowerLabel(p.agent_context ?? p.agentContext) === 'cron') return 'routine';
+    if (ROUTINE_SESSION_SOURCES.has(source)) return 'routine';
+    if (dialect === 'claude' && unattended(env.CLAUDE_CODE_SESSION_ATTENDED, env.CLAUDE_CODE_ENTRYPOINT)) return 'routine';
+    if (dialect === 'codex' && codexExecRollout(str(p.transcript_path))) return 'routine';
+    if (HEADLESS_CLI[dialect] && headlessRun(dialect, env, ancestors())) return 'routine';
+    return '';
+}
+
+/** `x-run-kind` (VALORBRAIN_RUN_KIND over `runKind`), `x-requested-by` and `x-agent-team`, each only when known. */
+export function runHeaders(runKind = '', env = {}) {
+    const headers = {};
+    const explicit = lowerLabel(env.VALORBRAIN_RUN_KIND);
+    const kind = RUN_KINDS.has(explicit) ? explicit : RUN_KINDS.has(runKind) ? runKind : '';
+    if (kind) headers['x-run-kind'] = kind;
+    const requestedBy = headerLabel(env.VALORBRAIN_REQUESTED_BY, REQUESTED_BY_MAX_CHARS);
+    if (requestedBy) headers['x-requested-by'] = requestedBy;
+    const team = headerLabel(env.VALORBRAIN_AGENT_TEAM);
+    if (team) headers['x-agent-team'] = team;
+    return headers;
+}
+
 // ─── transcript upload (opt-in, decision 18) ─────────────────────────────────
 //
 // With `send_transcript` on, the Stop hook of a harness whose transcript the
@@ -1300,14 +1388,31 @@ function firstJsonLine(path, max = 1024 * 1024) {
  * that does not start with one is not classified as a person's session either.
  */
 export function codexScriptedRollout(path) {
+    const meta = codexSessionMeta(path);
+    if (!meta) return true;
+    if (codexSubagentMeta(meta)) return true;
+    return codexExecMeta(meta);
+}
+
+/**
+ * A rollout of a scripted Codex run (`codex exec`, the SDK, `codex
+ * mcp-server`): the run kind is `routine`. A sub-agent thread says nothing
+ * about the run, and a rollout without `session_meta` (or none yet) is unknown.
+ */
+export function codexExecRollout(path) {
+    const meta = path ? codexSessionMeta(path) : null;
+    return !!meta && !codexSubagentMeta(meta) && codexExecMeta(meta);
+}
+
+function codexSessionMeta(path) {
     const first = firstJsonLine(path);
     const meta = first?.type === 'session_meta' ? first.payload : null;
-    if (!meta || typeof meta !== 'object') return true;
-    if (meta.source && typeof meta.source === 'object') return true; // { subagent: { thread_spawn … } }
-    if (meta.thread_source === 'subagent') return true;
-    if (meta.source === 'exec' || meta.source === 'mcp') return true;
-    return /sdk/i.test(str(meta.originator));
+    return meta && typeof meta === 'object' ? meta : null;
 }
+
+// { source: { subagent: { thread_spawn … } } } or thread_source: 'subagent'
+const codexSubagentMeta = (meta) => (meta.source && typeof meta.source === 'object') || meta.thread_source === 'subagent';
+const codexExecMeta = (meta) => meta.source === 'exec' || meta.source === 'mcp' || /sdk/i.test(str(meta.originator));
 
 /** A Gemini CLI conversation file recorded for a sub-agent (`kind: "subagent"`). */
 export function geminiSubagentSession(path) {
@@ -1461,7 +1566,7 @@ export function headlessRun(dialect, env = {}, ancestors = []) {
  * detached uploader. Only a person's main session uploads: SDK and
  * non-interactive runs, sub-agents and continuations of a block never do.
  */
-function kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps }) {
+function kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessionId, key, state, deps, ancestors }) {
     if (!harness || !sessionId || TRANSCRIPT_DIALECT[harness] !== dialect) return false;
     if (!transcriptSharing(home, harness, env)) return false;
     // Claude Code: SDK/-p runs, and every session it marks unattended
@@ -1478,7 +1583,7 @@ function kickTranscriptUpload({ env, home, now, harness, dialect, payload, sessi
     if (size > MAX_TRANSCRIPT_BYTES && !path.endsWith('.jsonl')) return false;
     if (dialect === 'codex' && codexScriptedRollout(path)) return false;
     if (dialect === 'gemini' && geminiSubagentSession(path)) return false;
-    if (HEADLESS_CLI[dialect] && headlessRun(dialect, env, deps.ancestors ?? ancestorCommands({ spawnSyncImpl: deps.spawnSyncImpl }))) return false;
+    if (HEADLESS_CLI[dialect] && headlessRun(dialect, env, ancestors())) return false;
     const stopId = str(payload.generation_id) || str(payload.promptId) || str(payload.turn_id);
     if (!claimTranscriptUpload(home, { harness, key, size, stopId, now })) return false;
     const roots = Array.isArray(payload.workspace_roots) ? payload.workspace_roots : [];
@@ -1525,7 +1630,9 @@ export async function uploadTranscript(argv, deps = {}) {
         try {
             const res = await fetchImpl(`${creds.api}/api/v1/hooks/run`, {
                 method: 'POST',
-                headers: { ...clientHeaders(home, harness), 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
+                // The detached uploader has no payload: only a person's main
+                // session uploads, so the run kind is only the operator's env.
+                headers: { ...clientHeaders(home, harness), ...runHeaders('', env), 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
                 body: JSON.stringify({ hook, input, transcript }),
                 signal: AbortSignal.timeout(TRANSCRIPT_REQUEST_TIMEOUT_MS),
             });
