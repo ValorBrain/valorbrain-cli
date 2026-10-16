@@ -1161,11 +1161,30 @@ function clientState(home, harness) {
 }
 
 /**
+ * The harness contract the person declares in the harness's environment
+ * (ADR-084 §1): env → header. VALORBRAIN_SOURCE_AGENT is an explicit persona
+ * and outranks the harness id this client always declares; the others are
+ * the lane, the run kind, who asked for the work and the team labels. Only a
+ * value a header can carry goes out (printable Latin-1, at most 200 chars) —
+ * anything else is dropped, never sent mangled, and never breaks the hook.
+ */
+const CONTRACT_ENV_HEADERS = [
+    ['VALORBRAIN_SOURCE_AGENT', 'x-source-agent'],
+    ['VALORBRAIN_AGENT_LANE', 'x-agent-lane'],
+    ['VALORBRAIN_RUN_KIND', 'x-run-kind'],
+    ['VALORBRAIN_REQUESTED_BY', 'x-requested-by'],
+    ['VALORBRAIN_AGENT_TEAM', 'x-agent-team'],
+];
+const HEADER_VALUE = /^[\x20-\x7e\xa0-\xff]{1,200}$/;
+
+/**
  * Headers every hosted request carries: client and version, harness, install
  * id (from this harness's connect.json entry) and, when stuck, the client
- * state. No hostname, path or anything personal. Never used for auth.
+ * state. No hostname, path or anything personal. Never used for auth: the
+ * harness id names the writer (the engine ranks it above the token's persona),
+ * and tenant, user and authority still come from the token.
  */
-export function clientHeaders(home, harness, version = CLIENT_VERSION) {
+export function clientHeaders(home, harness, version = CLIENT_VERSION, env = process.env) {
     const id = canonicalHarness(harness);
     const headers = { 'x-valorbrain-client': `connect/${version}` };
     if (id) headers['x-valorbrain-harness'] = id;
@@ -1173,6 +1192,10 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION) {
     if (INSTALL_ID.test(String(install ?? ''))) headers['x-valorbrain-install'] = install;
     const state = id ? clientState(home, id) : '';
     if (state) headers['x-valorbrain-client-state'] = state;
+    for (const [name, header] of CONTRACT_ENV_HEADERS) {
+        const value = String(env[name] ?? '').trim();
+        if (HEADER_VALUE.test(value)) headers[header] = value;
+    }
     return headers;
 }
 
