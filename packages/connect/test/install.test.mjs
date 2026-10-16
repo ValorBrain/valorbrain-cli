@@ -89,10 +89,10 @@ test('hook requests carry the harness contract the person declared in the harnes
     const bare = clientHeaders(h, 'codex', '0.0.0', {});
     assert.equal(bare['x-source-agent'], undefined);
     assert.equal(bare['x-agent-lane'], undefined);
-    // Accents fold to ASCII; a control character drops the value, never sends it mangled.
-    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: 'João' })['x-source-agent'], 'Joao');
+    // UTF-8 bytes as a latin-1 ByteString (decoded by the engine); a control character drops the value.
+    const utf8 = (v) => Buffer.from(v, 'latin1').toString('utf8');
+    assert.equal(utf8(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: 'João' })['x-source-agent']), 'João');
     assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: 'quem\npediu' })['x-source-agent'], undefined);
-    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: '😀' })['x-source-agent'], undefined);
 });
 
 test('Cursor hooks.json keeps the user hooks and gains the required version key', () => {

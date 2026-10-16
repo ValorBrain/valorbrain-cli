@@ -813,7 +813,7 @@ export async function runHook(argv, deps = {}) {
     let run;
     const runInfo = () => (run ??= runHeaders(inferRunKind(dialect, env, payload, ancestors), env));
     let hosted;
-    const hostedHeaders = () => (hosted ??= { ...clientHeaders(home, harness || dialect), ...runInfo() });
+    const hostedHeaders = () => (hosted ??= { ...clientHeaders(home, harness || dialect, CLIENT_VERSION, env), ...runInfo() });
     /** POST the cue; a `client_pin` naming another version starts a detached heal (deps.onPinHint). */
     const sendCue = async (body) => {
         const r = await postCue(creds.api, creds.token, body, requestTimeoutMs(event, env), fetchImpl, hostedHeaders());
@@ -899,7 +899,7 @@ export async function runHook(argv, deps = {}) {
                 }
             }
             if (!served) {
-                context = await legacyContext(creds.api, creds.token, (prompt || 'session start').slice(0, 8_000), timeoutMs, fetchImpl, clientVersion, runInfo());
+                context = await legacyContext(creds.api, creds.token, (prompt || 'session start').slice(0, 8_000), timeoutMs, fetchImpl, clientVersion, hostedHeaders());
             }
         } catch (e) {
             failure = `${event}: ${e?.name === 'TimeoutError' ? 'timed out' : e?.message || 'request failed'}`;
@@ -1173,8 +1173,8 @@ function clientState(home, harness) {
  * header. VALORBRAIN_SOURCE_AGENT is an explicit persona and outranks the
  * harness id this client always declares; VALORBRAIN_AGENT_LANE is the lane.
  * Run kind, requester and team go through `runHeaders`, one rule for them.
- * Same folding as `headerLabel` (accents to ASCII); a value with a control
- * character is dropped, never sent mangled, and never breaks the hook.
+ * Encoded by `headerLabel` (UTF-8 bytes, any script); a value with an
+ * invisible character is dropped, never sent mangled, and never breaks the hook.
  */
 const IDENTITY_ENV_HEADERS = [
     ['VALORBRAIN_SOURCE_AGENT', 'x-source-agent'],
@@ -1198,9 +1198,7 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION, env = pro
     const state = id ? clientState(home, id) : '';
     if (state) headers['x-valorbrain-client-state'] = state;
     for (const [name, header] of IDENTITY_ENV_HEADERS) {
-        const raw = str(env[name]);
-        if (/[\x00-\x1f\x7f]/.test(raw)) continue;
-        const value = headerLabel(raw, IDENTITY_HEADER_MAX_CHARS);
+        const value = headerLabel(env[name], IDENTITY_HEADER_MAX_CHARS);
         if (value) headers[header] = value;
     }
     return headers;
@@ -1229,14 +1227,21 @@ const REQUESTED_BY_MAX_CHARS = 120;
 
 const lowerLabel = (v) => str(v).toLowerCase();
 
+/** Control and format characters (bidi overrides, zero-width), line and paragraph separators. */
+const INVISIBLE_CHARS = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+
 /**
- * Header-safe label: accents folded to ASCII ("João" → "Joao"; the engine
- * decodes header bytes as latin-1 and fetch refuses other bytes), anything
- * else outside printable ASCII dropped, trimmed, capped at `max` chars.
+ * A label as a header value: the text's UTF-8 bytes, one per char (a latin-1
+ * ByteString, which fetch accepts), so any script arrives intact — the engine
+ * decodes UTF-8 (`headerText`). Trimmed, capped at `max` code points. A value
+ * with an invisible character (control, format, line separator) is dropped
+ * whole, never sent with it removed. '' when nothing is left.
  */
 export function headerLabel(raw, max = 0) {
-    const v = str(raw).normalize('NFKD').replace(/[^\x20-\x7e]/g, '').trim();
-    return max ? v.slice(0, max).trim() : v;
+    const v = str(raw);
+    if (!v || INVISIBLE_CHARS.test(v)) return '';
+    const capped = max ? Array.from(v).slice(0, max).join('').trim() : v;
+    return Buffer.from(capped, 'utf8').toString('latin1');
 }
 
 /** Claude Code: whether a person attends the session beats the entrypoint name. */
@@ -1654,7 +1659,7 @@ export async function uploadTranscript(argv, deps = {}) {
                 method: 'POST',
                 // The detached uploader has no payload: only a person's main
                 // session uploads, so the run kind is only the operator's env.
-                headers: { ...clientHeaders(home, harness), ...runHeaders('', env), 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
+                headers: { ...clientHeaders(home, harness, CLIENT_VERSION, env), ...runHeaders('', env), 'content-type': 'application/json', authorization: `Bearer ${creds.token}` },
                 body: JSON.stringify({ hook, input, transcript }),
                 signal: AbortSignal.timeout(TRANSCRIPT_REQUEST_TIMEOUT_MS),
             });

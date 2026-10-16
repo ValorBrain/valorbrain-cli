@@ -16,8 +16,11 @@
   sai como `X-Source-Agent` (persona explícita, vence o harness declarado),
   `VALORBRAIN_AGENT_LANE` como `X-Agent-Lane`, `VALORBRAIN_REQUESTED_BY` (até
   120 caracteres) como `X-Requested-By` e `VALORBRAIN_AGENT_TEAM` como
-  `X-Agent-Team`. Acentos viram ASCII; valor com caractere de controle não
-  sai. São só rótulos: tenant, pessoa e autoridade continuam vindo do token.
+  `X-Agent-Team`, também no fallback MCP legado. Qualquer escrita chega
+  intacta ("João Conceição", "张伟"): o valor vai como bytes UTF-8, que o
+  engine decodifica. Valor com caractere invisível (controle, formatação,
+  separador de linha) não sai. São só rótulos: tenant, pessoa e autoridade
+  continuam vindo do token.
 - **Reinstalação preserva a persona da entrada MCP.** Um `X-Source-Agent` que
   a pessoa escreveu na entrada MCP (JSON) sobrevive ao `npx
   @valorbrain/connect`; o token, a URL e o `X-ValorBrain-Harness` vêm do

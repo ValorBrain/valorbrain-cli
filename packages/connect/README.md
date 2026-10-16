@@ -466,9 +466,12 @@ não precisa recarregar hooks.
   `pipeline` para `session_source` `webhook`. Subagent, flush, tool e a2a não
   mandam nada (são pedaços de outra execução), nem a sessão interativa (o
   engine entende `conversation`). `VALORBRAIN_RUN_KIND` (`conversation`,
-  `routine` ou `pipeline`) sempre vence. `VALORBRAIN_REQUESTED_BY` (até 120 caracteres,
-  acentos viram ASCII) e `VALORBRAIN_AGENT_TEAM` saem como `X-Requested-By` e
-  `X-Agent-Team`. A config MCP gravada na instalação não leva nenhum deles.
+  `routine` ou `pipeline`) sempre vence. `VALORBRAIN_SOURCE_AGENT` (persona
+  explícita), `VALORBRAIN_AGENT_LANE`, `VALORBRAIN_REQUESTED_BY` (até 120
+  caracteres) e `VALORBRAIN_AGENT_TEAM` saem como `X-Source-Agent`,
+  `X-Agent-Lane`, `X-Requested-By` e `X-Agent-Team`, em qualquer escrita (bytes
+  UTF-8); valor com caractere invisível não sai. A config MCP gravada na
+  instalação não leva nenhum deles.
 - **Vindo da 0.10.** O primeiro heal da 0.11 troca o comando dos hooks (uma
   vez) por todos os harnesses, menos o Codex, e grava `install_id` e
   `consented_scope: 1` em cada entrada de `connect.json`. Se a ponte do omp ou o
