@@ -55,12 +55,12 @@ Agent-context isolation:
   guard. Non-primary contexts get retrieval but no vault writes.
 
 Run kind (ADR-084, ``X-Run-Kind``):
-  A cron or flush ``agent_context`` and a machine-paced session source
-  (``oneshot``, ``cron``, ``batch``, ``webhook``, ...) send
-  ``X-Run-Kind: routine`` so the engine keeps that output out of other
-  agents' feeds; a person's session sends none (the engine infers
-  ``conversation``). An explicit ``VALORBRAIN_RUN_KIND`` (conversation,
-  routine or pipeline) always wins. ``VALORBRAIN_REQUESTED_BY`` and
+  A ``cron`` ``agent_context`` and a oneshot/cron/batch/kanban/api session
+  source send ``X-Run-Kind: routine``, a ``webhook`` source ``pipeline``, so
+  the engine keeps that output out of other agents' feeds; a person's session
+  sends none (the engine infers ``conversation``), nor do subagent, flush,
+  tool or a2a (pieces of another run). An explicit ``VALORBRAIN_RUN_KIND``
+  (conversation, routine or pipeline) always wins. ``VALORBRAIN_REQUESTED_BY`` and
   ``VALORBRAIN_AGENT_TEAM`` go out as ``X-Requested-By`` / ``X-Agent-Team``.
 """
 
@@ -251,14 +251,14 @@ def _client_headers() -> dict:
 # ---------------------------------------------------------------------------
 
 _RUN_KINDS = ("conversation", "routine", "pipeline")
-# Hermes agent contexts that are never a person's turn (subagent is a child of
-# whoever runs it: it says nothing about the run).
-_ROUTINE_AGENT_CONTEXTS = frozenset({"cron", "flush"})
-# Hermes machine-paced session sources (the engine's run-authorship vocabulary,
-# without subagent).
-_ROUTINE_SESSION_SOURCES = frozenset({
-    "oneshot", "cron", "flush", "webhook", "kanban", "api", "tool", "batch", "a2a",
-})
+# The engine's vocabulary (`runKindFromSignals`, src/hooks/run-authorship.ts).
+# A subagent, a flush and a tool/a2a call are pieces of another run: they
+# decide nothing.
+_ROUTINE_AGENT_CONTEXTS = frozenset({"cron"})
+# Session sources that run on their own schedule or as a one-shot call.
+_ROUTINE_SESSION_SOURCES = frozenset({"oneshot", "cron", "batch", "kanban", "api"})
+# Session sources an external system pushed.
+_PIPELINE_SESSION_SOURCES = frozenset({"webhook"})
 _REQUESTED_BY_MAX_CHARS = 120
 
 
@@ -281,13 +281,17 @@ def _explicit_run_kind() -> str:
 
 def _run_kind(agent_context: str, session_source: str) -> str:
     """The run kind this session declares: VALORBRAIN_RUN_KIND when valid, then
-    `routine` for cron/flush contexts and machine-paced sources; '' otherwise."""
+    `pipeline` for a webhook source, `routine` for a cron context or a
+    oneshot/cron/batch/kanban/api source; '' otherwise."""
     explicit = _explicit_run_kind()
     if explicit:
         return explicit
+    source = (session_source or "").strip().lower()
+    if source in _PIPELINE_SESSION_SOURCES:
+        return "pipeline"
     if (agent_context or "").strip().lower() in _ROUTINE_AGENT_CONTEXTS:
         return "routine"
-    if (session_source or "").strip().lower() in _ROUTINE_SESSION_SOURCES:
+    if source in _ROUTINE_SESSION_SOURCES:
         return "routine"
     return ""
 

@@ -57,12 +57,20 @@ async function promptRunKind(harness, payload, opts = {}) {
 
 const claudePrompt = { hook_event_name: 'UserPromptSubmit' };
 
-test('claude code: SDK and unattended sessions are routine; an attended CLI session sends no run kind', async () => {
+test('claude code: SDK/MCP and unattended sessions are routine; attended beats the entrypoint; an attended CLI session sends none', async () => {
     assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' } }), 'routine');
     assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-cli' } }), 'routine');
+    assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'mcp' } }), 'routine');
     assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SESSION_ATTENDED: '0' } }), 'routine');
+    // Hook env (engine rule): whether a person attends beats the entrypoint name.
+    assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts', CLAUDE_CODE_SESSION_ATTENDED: '1' } }), undefined);
     assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SESSION_ATTENDED: '1' } }), undefined);
+    assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { CLAUDE_CODE_ENTRYPOINT: 'mcp-server' } }), undefined);
     assert.equal(await promptRunKind('claude-code', claudePrompt), undefined);
+    // The same signals forwarded in a payload.
+    assert.equal(await promptRunKind('hermes', { session_attended: '0' }), 'routine');
+    assert.equal(await promptRunKind('hermes', { entrypoint: 'sdk-py' }), 'routine');
+    assert.equal(await promptRunKind('hermes', { session_attended: '1', entrypoint: 'cli' }), undefined);
 });
 
 test('omp: a print/json run is routine; a tui session sends no run kind', async () => {
@@ -72,13 +80,21 @@ test('omp: a print/json run is routine; a tui session sends no run kind', async 
     assert.equal(await promptRunKind('omp', {}), undefined);
 });
 
-test('hermes: cron/flush contexts and machine-paced sources are routine; a person or a subagent sends none', async () => {
+test('hermes: cron and scheduled/call sources are routine, webhook is pipeline; pieces of another run send none', async () => {
     assert.equal(await promptRunKind('hermes', { agent_context: 'cron' }), 'routine');
-    assert.equal(await promptRunKind('hermes', { agent_context: 'flush' }), 'routine');
-    assert.equal(await promptRunKind('hermes', { session_source: 'oneshot' }), 'routine');
+    for (const source of ['oneshot', 'cron', 'batch', 'kanban', 'api']) {
+        assert.equal(await promptRunKind('hermes', { session_source: source }), 'routine', source);
+    }
     assert.equal(await promptRunKind('hermes', { sessionSource: 'batch' }), 'routine');
+    assert.equal(await promptRunKind('hermes', { session_source: 'webhook' }), 'pipeline');
+    assert.equal(await promptRunKind('hermes', { agent_context: 'cron', session_source: 'webhook' }), 'pipeline');
+    for (const context of ['flush', 'subagent']) {
+        assert.equal(await promptRunKind('hermes', { agent_context: context }), undefined, context);
+    }
+    for (const source of ['subagent', 'flush', 'tool', 'a2a']) {
+        assert.equal(await promptRunKind('hermes', { session_source: source }), undefined, source);
+    }
     assert.equal(await promptRunKind('hermes', { agent_context: 'primary', session_source: 'cli' }), undefined);
-    assert.equal(await promptRunKind('hermes', { agent_context: 'subagent', session_source: 'subagent' }), undefined);
 });
 
 test('gemini in CI, kiro --no-interactive and cursor -p are routine; their interactive runs send none', async () => {

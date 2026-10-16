@@ -150,19 +150,36 @@ class RunKindTest(unittest.TestCase):
         self.assertIn("/api/v1/memory/store", paths)
         self.assert_everywhere("x-run-kind", "routine")
 
-    def test_flush_context_sends_routine(self):
+    def test_flush_context_sends_no_run_kind(self):
+        # A memory flush is a piece of the run it flushes: it decides nothing.
         self._start(agent_context="flush", platform="cli")
-        self.assert_everywhere("x-run-kind", "routine")
+        self.assert_everywhere("x-run-kind", None)
 
     def test_oneshot_session_source_sends_routine(self):
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
         self._start(agent_context="primary", platform="cli")
         self.assert_everywhere("x-run-kind", "routine")
 
-    def test_batch_session_source_sends_routine(self):
-        os.environ["HERMES_SESSION_SOURCE"] = "batch"
+    def test_scheduled_and_call_sources_send_routine(self):
+        for source in ("batch", "kanban", "api", "cron"):
+            with self.subTest(source=source):
+                _Stub.requests = []
+                os.environ["HERMES_SESSION_SOURCE"] = source
+                self._start(agent_context="primary")
+                self.assert_everywhere("x-run-kind", "routine")
+
+    def test_webhook_source_sends_pipeline(self):
+        os.environ["HERMES_SESSION_SOURCE"] = "webhook"
         self._start(agent_context="primary")
-        self.assert_everywhere("x-run-kind", "routine")
+        self.assert_everywhere("x-run-kind", "pipeline")
+
+    def test_pieces_of_another_run_send_no_run_kind(self):
+        for source in ("subagent", "flush", "tool", "a2a"):
+            with self.subTest(source=source):
+                _Stub.requests = []
+                os.environ["HERMES_SESSION_SOURCE"] = source
+                self._start(agent_context="primary")
+                self.assert_everywhere("x-run-kind", None)
 
     def test_primary_interactive_session_sends_no_run_kind(self):
         p = self._start(agent_context="primary", platform="cli")

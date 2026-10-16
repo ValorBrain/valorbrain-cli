@@ -1187,17 +1187,22 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION) {
 // ─── run kind, requester, team (ADR-084) ─────────────────────────────────────
 //
 // The engine keeps routine and pipeline output out of OTHER agents' feeds.
-// A hook declares `x-run-kind: routine` only when its harness says the run is
-// not a person's session; an interactive one sends nothing (the engine infers
-// `conversation`). VALORBRAIN_RUN_KIND set by the operator always wins.
+// A hook declares `x-run-kind` only when its harness says the run is not a
+// person's session; an interactive one sends nothing (the engine infers
+// `conversation`). VALORBRAIN_RUN_KIND set by the operator always wins. The
+// vocabulary is the engine's (`runKindFromSignals`, src/hooks/run-authorship.ts):
+// a subagent, a flush and a tool/a2a call are pieces of another run and decide
+// nothing.
 
 const RUN_KINDS = new Set(['conversation', 'routine', 'pipeline']);
 /** omp ExtensionContext.mode of a one-shot run (`omp -p`, `--mode json`). */
 const ROUTINE_RUN_MODES = new Set(['print', 'json']);
-/** Hermes agent contexts that are no person's turn (a subagent says nothing about the run). */
-const ROUTINE_AGENT_CONTEXTS = new Set(['cron', 'flush']);
-/** Hermes machine-paced session sources (the engine's run-authorship vocabulary, without subagent). */
-const ROUTINE_SESSION_SOURCES = new Set(['oneshot', 'cron', 'flush', 'webhook', 'kanban', 'api', 'tool', 'batch', 'a2a']);
+/** Claude Code entrypoints of a program, not a person (`sdk-ts`, `sdk-cli`, `mcp`). */
+const ROUTINE_ENTRYPOINT = /^(?:sdk(?:-|$)|mcp$)/;
+/** Hermes session sources that run on their own schedule or as a one-shot call. */
+const ROUTINE_SESSION_SOURCES = new Set(['oneshot', 'cron', 'batch', 'kanban', 'api']);
+/** Hermes session sources an external system pushed. */
+const PIPELINE_SESSION_SOURCES = new Set(['webhook']);
 const REQUESTED_BY_MAX_CHARS = 120;
 
 const lowerLabel = (v) => str(v).toLowerCase();
@@ -1212,22 +1217,35 @@ export function headerLabel(raw, max = 0) {
     return max ? v.slice(0, max).trim() : v;
 }
 
+/** Claude Code: whether a person attends the session beats the entrypoint name. */
+function unattended(attended, entrypoint) {
+    const a = lowerLabel(attended);
+    if (a === '0' || a === 'false') return true;
+    if (a === '1' || a === 'true') return false;
+    return ROUTINE_ENTRYPOINT.test(lowerLabel(entrypoint));
+}
+
 /**
- * The run kind this hook knows: a valid VALORBRAIN_RUN_KIND, else `routine`
- * for Claude Code SDK/unattended sessions, an omp `print`/`json` run, a Hermes
- * cron/flush context or machine-paced source, a `codex exec`/SDK rollout and
- * the scripted runs headlessRun sees (`gemini -p` or CI, `kiro-cli
- * --no-interactive`, `cursor-agent -p`). '' when nothing says so.
+ * The run kind this hook knows: a valid VALORBRAIN_RUN_KIND; else `pipeline`
+ * for a webhook session source; else `routine` for an unattended or SDK/MCP
+ * Claude Code session (payload or hook env), an omp `print`/`json` run, a
+ * Hermes `cron` context or oneshot/cron/batch/kanban/api source, a `codex
+ * exec`/SDK rollout and the scripted runs headlessRun sees (`gemini -p` or CI,
+ * `kiro-cli --no-interactive`, `cursor-agent -p`). '' when nothing says so.
  * `ancestors` is called only for the harnesses headlessRun reads it for.
  */
 export function inferRunKind(dialect, env = {}, payload = {}, ancestors = () => []) {
     const explicit = lowerLabel(env.VALORBRAIN_RUN_KIND);
     if (RUN_KINDS.has(explicit)) return explicit;
     const p = payload && typeof payload === 'object' ? payload : {};
-    if (dialect === 'claude' && (/^sdk/i.test(str(env.CLAUDE_CODE_ENTRYPOINT)) || str(env.CLAUDE_CODE_SESSION_ATTENDED) === '0')) return 'routine';
+    const source = lowerLabel(p.session_source ?? p.sessionSource);
+    if (PIPELINE_SESSION_SOURCES.has(source)) return 'pipeline';
+    // Payload signals vote on their own (engine rule); only the hook env lets attended beat the entrypoint.
+    if (unattended(p.session_attended ?? p.sessionAttended, '') || ROUTINE_ENTRYPOINT.test(lowerLabel(p.entrypoint))) return 'routine';
     if (ROUTINE_RUN_MODES.has(lowerLabel(p.run_mode ?? p.runMode ?? p.mode))) return 'routine';
-    if (ROUTINE_AGENT_CONTEXTS.has(lowerLabel(p.agent_context ?? p.agentContext))) return 'routine';
-    if (ROUTINE_SESSION_SOURCES.has(lowerLabel(p.session_source ?? p.sessionSource))) return 'routine';
+    if (lowerLabel(p.agent_context ?? p.agentContext) === 'cron') return 'routine';
+    if (ROUTINE_SESSION_SOURCES.has(source)) return 'routine';
+    if (dialect === 'claude' && unattended(env.CLAUDE_CODE_SESSION_ATTENDED, env.CLAUDE_CODE_ENTRYPOINT)) return 'routine';
     if (dialect === 'codex' && codexExecRollout(str(p.transcript_path))) return 'routine';
     if (HEADLESS_CLI[dialect] && headlessRun(dialect, env, ancestors())) return 'routine';
     return '';
