@@ -4,7 +4,7 @@ description: "ValorBrain — hosted hybrid memory (composite scoring, graph trav
 requires_hermes: ">=0.20"
 external_dependencies:
   - name: valorbrain
-    install: "Hosted: none — https://github.com/ValorBrain/valorbrain-cli. Self-hosted: valorbrain binary (Valor Digital)."
+    install: "Hosted: none — https://github.com/ValorBrain/valorbrain-cli. Self-hosted: valorbrain binary."
     check: "valorbrain --version"
 hooks:
   - on_session_end

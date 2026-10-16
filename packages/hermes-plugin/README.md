@@ -68,7 +68,7 @@ The three hooks that used to need the client's disk have their own hosted path:
 
 ## Self-hosted
 
-Requires the `valorbrain` binary (Valor Digital). `valorbrain setup harness
+Requires the `valorbrain` binary. `valorbrain setup harness
 hermes` writes the same artifacts from the engine — including this plugin.
 `VALORBRAIN_HOOKS_MODE` unset (or `self-hosted`) keeps the self-hosted order:
 the binary runs the hooks; without one, they go to `VALORBRAIN_ENGINE_URL`.
