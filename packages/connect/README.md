@@ -454,6 +454,19 @@ não precisa recarregar hooks.
 
   Assim o engine vê a versão que de fato roda, não só a declarada na
   instalação.
+- **Tipo de execução (ADR-084).** Quando o harness diz que a sessão não é de
+  uma pessoa, os hooks mandam `X-Run-Kind: routine` no cue, no hooks/run e na
+  chamada MCP de fallback, e o engine tira essa saída do feed dos outros
+  agentes. Os sinais: Claude Code com `CLAUDE_CODE_ENTRYPOINT=sdk-*` ou
+  `CLAUDE_CODE_SESSION_ATTENDED=0`; `run_mode`/`mode` `print` ou `json` no
+  payload (omp); `agent_context` `cron`/`flush` ou `session_source` de
+  máquina (`oneshot`, `cron`, `batch`, …) no payload (Hermes); rollout de
+  `codex exec`/SDK; `gemini -p` ou CI, `kiro-cli --no-interactive`,
+  `cursor-agent -p`. Sessão interativa não manda nada (o engine entende
+  `conversation`). `VALORBRAIN_RUN_KIND` (`conversation`, `routine` ou
+  `pipeline`) sempre vence. `VALORBRAIN_REQUESTED_BY` (até 120 caracteres,
+  acentos viram ASCII) e `VALORBRAIN_AGENT_TEAM` saem como `X-Requested-By` e
+  `X-Agent-Team`. A config MCP gravada na instalação não leva nenhum deles.
 - **Vindo da 0.10.** O primeiro heal da 0.11 troca o comando dos hooks (uma
   vez) por todos os harnesses, menos o Codex, e grava `install_id` e
   `consented_scope: 1` em cada entrada de `connect.json`. Se a ponte do omp ou o

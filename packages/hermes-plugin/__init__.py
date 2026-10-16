@@ -53,6 +53,15 @@ Agent-context isolation:
   write-side surfaces (transcript appends in ``sync_turn``, extraction
   in ``on_session_end`` and ``on_pre_compress``) through a primary-only
   guard. Non-primary contexts get retrieval but no vault writes.
+
+Run kind (ADR-084, ``X-Run-Kind``):
+  A cron or flush ``agent_context`` and a machine-paced session source
+  (``oneshot``, ``cron``, ``batch``, ``webhook``, ...) send
+  ``X-Run-Kind: routine`` so the engine keeps that output out of other
+  agents' feeds; a person's session sends none (the engine infers
+  ``conversation``). An explicit ``VALORBRAIN_RUN_KIND`` (conversation,
+  routine or pipeline) always wins. ``VALORBRAIN_REQUESTED_BY`` and
+  ``VALORBRAIN_AGENT_TEAM`` go out as ``X-Requested-By`` / ``X-Agent-Team``.
 """
 
 from __future__ import annotations
@@ -81,7 +90,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.10.0"
+_PLUGIN_VERSION = "1.11.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -235,6 +244,68 @@ def _client_headers() -> dict:
         }
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# Run kind, requester and team (ADR-084)
+# ---------------------------------------------------------------------------
+
+_RUN_KINDS = ("conversation", "routine", "pipeline")
+# Hermes agent contexts that are never a person's turn (subagent is a child of
+# whoever runs it: it says nothing about the run).
+_ROUTINE_AGENT_CONTEXTS = frozenset({"cron", "flush"})
+# Hermes machine-paced session sources (the engine's run-authorship vocabulary,
+# without subagent).
+_ROUTINE_SESSION_SOURCES = frozenset({
+    "oneshot", "cron", "flush", "webhook", "kanban", "api", "tool", "batch", "a2a",
+})
+_REQUESTED_BY_MAX_CHARS = 120
+
+
+def _header_value(raw: Optional[str], max_chars: int = 0) -> str:
+    """Header-safe label: accents folded to ASCII ("João" → "Joao"; the engine
+    decodes header bytes as latin-1, and the HTTP client refuses non-ASCII),
+    anything else non-printable dropped, trimmed, capped at `max_chars`."""
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", raw or "")
+    v = "".join(c for c in folded if " " <= c <= "~").strip()
+    if max_chars:
+        v = v[:max_chars].strip()
+    return v
+
+
+def _explicit_run_kind() -> str:
+    v = (os.environ.get("VALORBRAIN_RUN_KIND") or "").strip().lower()
+    return v if v in _RUN_KINDS else ""
+
+
+def _run_kind(agent_context: str, session_source: str) -> str:
+    """The run kind this session declares: VALORBRAIN_RUN_KIND when valid, then
+    `routine` for cron/flush contexts and machine-paced sources; '' otherwise."""
+    explicit = _explicit_run_kind()
+    if explicit:
+        return explicit
+    if (agent_context or "").strip().lower() in _ROUTINE_AGENT_CONTEXTS:
+        return "routine"
+    if (session_source or "").strip().lower() in _ROUTINE_SESSION_SOURCES:
+        return "routine"
+    return ""
+
+
+def _attribution_headers(run_kind: str = "") -> dict:
+    """X-Run-Kind (the explicit env wins over `run_kind`), X-Requested-By and
+    X-Agent-Team, each only when known."""
+    headers: dict = {}
+    kind = _explicit_run_kind() or (run_kind if run_kind in _RUN_KINDS else "")
+    if kind:
+        headers["X-Run-Kind"] = kind
+    requested_by = _header_value(os.environ.get("VALORBRAIN_REQUESTED_BY"), _REQUESTED_BY_MAX_CHARS)
+    if requested_by:
+        headers["X-Requested-By"] = requested_by
+    team = _header_value(os.environ.get("VALORBRAIN_AGENT_TEAM"))
+    if team:
+        headers["X-Agent-Team"] = team
+    return headers
 
 
 def _heal_reason(state: dict, pin: Any, current: Any, now: float) -> Optional[str]:
@@ -568,7 +639,7 @@ def _rest_actionable_error(kind: str, detail: str, url: str = "",
 
 def _rest_call_detail(port: int, method: str, path: str,
                       body: Optional[dict] = None, timeout: float = _REST_TIMEOUT,
-                      raw: bool = False):
+                      raw: bool = False, run_kind: str = ""):
     """`_rest_call` com o motivo da falha. Devolve (data, err).
 
     `err` é None em sucesso; caso contrário um dict {kind, detail, url, status}:
@@ -579,7 +650,7 @@ def _rest_call_detail(port: int, method: str, path: str,
     viravam o mesmo `None` e saíam como "REST API unreachable".
     """
     out: list = [None]
-    data = _rest_call(port, method, path, body=body, timeout=timeout, raw=raw, _out=out)
+    data = _rest_call(port, method, path, body=body, timeout=timeout, raw=raw, _out=out, run_kind=run_kind)
     return data, out[0]
 
 
@@ -601,7 +672,7 @@ def _tool_call_error(err: Optional[dict]) -> str:
 
 def _rest_call(port: int, method: str, path: str,
                body: Optional[dict] = None, timeout: float = _REST_TIMEOUT,
-               raw: bool = False, _out: Optional[list] = None):
+               raw: bool = False, _out: Optional[list] = None, run_kind: str = ""):
     """Call the ValorBrain REST API. Parsed JSON, raw text (raw=True), or None.
 
     Multi-tenant headers:
@@ -612,6 +683,9 @@ def _rest_call(port: int, method: str, path: str,
       X-Source-Agent — defaults to 'hermes-plugin' so the engine can attribute
                        writes to this client.
       X-Source-System — from VALORBRAIN_SOURCE_SYSTEM env, defaults 'hermes'.
+      X-Run-Kind / X-Requested-By / X-Agent-Team — `_attribution_headers`:
+                       `run_kind` is the session's (the provider passes it),
+                       VALORBRAIN_RUN_KIND wins over it.
 
     Hosted mode (VALORBRAIN_HOOKS_MODE=hosted) sends neither X-Tenant-ID nor
     X-User-ID: the `vbm_` token decides tenant and user. Those env vars are the
@@ -640,6 +714,7 @@ def _rest_call(port: int, method: str, path: str,
 
     source_system = os.environ.get("VALORBRAIN_SOURCE_SYSTEM", "hermes")
     headers["X-Source-System"] = source_system
+    headers.update(_attribution_headers(run_kind))
 
     # Contrato D: hooks/run e runtimes/register dizem quem é o cliente.
     if path.split("?", 1)[0] in _CLIENT_HEADER_PATHS:
@@ -897,6 +972,8 @@ class ValorBrainProvider(MemoryProvider):
         # Hermes session source (`_session_source`), sent with the extraction
         # hooks so the engine can tell a person's session from a one-shot run.
         self._session_source: str = ""
+        # X-Run-Kind this session declares (`_run_kind`); '' = not known.
+        self._run_kind: str = ""
 
         # Prefetch state (generation counter prevents stale overwrites)
         self._prefetch_result: str = ""
@@ -1038,6 +1115,7 @@ class ValorBrainProvider(MemoryProvider):
         self._hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
         self._agent_context = str(kwargs.get("agent_context", "primary") or "primary")
         self._session_source = _session_source(str(kwargs.get("platform") or ""))
+        self._run_kind = _run_kind(self._agent_context, self._session_source)
         if self._agent_context != "primary":
             logger.info(
                 "valorbrain: agent_context=%s — reads enabled, writes suppressed",
@@ -1075,6 +1153,9 @@ class ValorBrainProvider(MemoryProvider):
                 self._env_extra["VALORBRAIN_DEFAULT_TENANT_ID"] = tenant_id
 
             self._env_extra["VALORBRAIN_SOURCE_AGENT"] = source_agent
+            # The local binary reads the run kind from its env (ADR-084).
+            if self._run_kind:
+                self._env_extra["VALORBRAIN_RUN_KIND"] = self._run_kind
         # Keep process env aligned so hooks inherit the resolved slug
         os.environ["VALORBRAIN_SOURCE_AGENT"] = source_agent
 
@@ -1105,7 +1186,7 @@ class ValorBrainProvider(MemoryProvider):
         # dumps waste tokens and bury the facts (review finding).
         if not self._bootstrap_context:
             try:
-                wc_text = _rest_call(self._port, "GET", "/api/v1/memory/working-context?format=md", raw=True)
+                wc_text = _rest_call(self._port, "GET", "/api/v1/memory/working-context?format=md", raw=True, run_kind=self._run_kind)
                 if isinstance(wc_text, str) and len(wc_text) > 10:
                     self._bootstrap_context = wc_text
                     logger.info("valorbrain: REST working_context returned %d chars", len(wc_text))
@@ -1185,7 +1266,7 @@ class ValorBrainProvider(MemoryProvider):
                 with open(transcript_path, "r", errors="replace") as fh:
                     payload["transcript"] = fh.read(_HOOK_TRANSCRIPT_MAX_BYTES)
             data = _rest_call(
-                self._port, "POST", "/api/v1/hooks/run", payload, timeout=float(timeout)
+                self._port, "POST", "/api/v1/hooks/run", payload, timeout=float(timeout), run_kind=self._run_kind
             )
             # Hospedado (este caminho só roda sem binário): pin novo ou 6 h → heal.
             _maybe_heal(data)
@@ -1216,7 +1297,7 @@ class ValorBrainProvider(MemoryProvider):
         self._runtime_key = runtime_key
         import socket
         host = socket.gethostname()
-        health = _rest_call(self._port, "GET", "/health") or {}
+        health = _rest_call(self._port, "GET", "/health", run_kind=self._run_kind) or {}
         config_health = "ok" if health else "unreachable"
         payload = {
             "runtime_key": runtime_key,
@@ -1233,7 +1314,7 @@ class ValorBrainProvider(MemoryProvider):
             },
             "config_health": config_health,
         }
-        res = _rest_call(self._port, "POST", "/api/v1/runtimes/register", payload, timeout=8.0)
+        res = _rest_call(self._port, "POST", "/api/v1/runtimes/register", payload, timeout=8.0, run_kind=self._run_kind)
         if not self._bin:
             _maybe_heal(res)
         if res and res.get("runtime", {}).get("id"):
@@ -1255,7 +1336,7 @@ class ValorBrainProvider(MemoryProvider):
             "config_health": "ok",
             "capabilities": {"contract_version": _CONTRACT_VERSION},
         }
-        _rest_call(self._port, "POST", "/api/v1/runtimes/heartbeat", payload, timeout=5.0)
+        _rest_call(self._port, "POST", "/api/v1/runtimes/heartbeat", payload, timeout=5.0, run_kind=self._run_kind)
 
     def _maybe_fetch_setup_instructions(self, query: str) -> str:
         """Sprint 11.5 — Detect 'Setup ValorBrain from <url>' or '/vb-setup'
@@ -1291,7 +1372,7 @@ class ValorBrainProvider(MemoryProvider):
         # Fetch instructions
         try:
             agent = os.environ.get("VALORBRAIN_SOURCE_AGENT", "hermes-plugin")
-            resp = _rest_call(self._port, "GET", f"/setup/instructions?agent={agent}")
+            resp = _rest_call(self._port, "GET", f"/setup/instructions?agent={agent}", run_kind=self._run_kind)
             if not resp or "valorbrain_setup" not in resp:
                 return ""
             data = resp["valorbrain_setup"]
@@ -1326,7 +1407,7 @@ class ValorBrainProvider(MemoryProvider):
         continues with whatever else is configured.
         """
         try:
-            data = _rest_call(self._port, "GET", f"/foundations?limit={limit}")
+            data = _rest_call(self._port, "GET", f"/foundations?limit={limit}", run_kind=self._run_kind)
             if not data or not isinstance(data, dict):
                 return ""
             foundations = data.get("foundations", [])
@@ -1506,7 +1587,7 @@ class ValorBrainProvider(MemoryProvider):
                 # não.
                 try:
                     rest_body = {"message": query, "recall_budget": 600, "fast_mode": True}
-                    rest_data = _rest_call(self._port, "POST", "/api/v1/memory/prepare", rest_body)
+                    rest_data = _rest_call(self._port, "POST", "/api/v1/memory/prepare", rest_body, run_kind=self._run_kind)
                     if rest_data:
                         rest_ctx = json.dumps(rest_data, ensure_ascii=False)
                         if rest_ctx and len(rest_ctx) > 10:
@@ -1715,7 +1796,7 @@ class ValorBrainProvider(MemoryProvider):
         body = {"query": query, "compact": True}
         if args.get("limit"):
             body["limit"] = args["limit"]
-        data, err = _rest_call_detail(self._port, "POST", "/retrieve", body)
+        data, err = _rest_call_detail(self._port, "POST", "/retrieve", body, run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1724,7 +1805,7 @@ class ValorBrainProvider(MemoryProvider):
         docid = args.get("docid", "")
         if not docid:
             return json.dumps({"error": "docid is required"})
-        data, err = _rest_call_detail(self._port, "GET", f"/documents/{docid}")
+        data, err = _rest_call_detail(self._port, "GET", f"/documents/{docid}", run_kind=self._run_kind)
         if data is None:
             # 404 aqui é o caso comum (docid curto/inexistente), não engine fora
             # do ar: antes respondia "Document not found" para 401 e 5xx também.
@@ -1735,7 +1816,7 @@ class ValorBrainProvider(MemoryProvider):
 
     def _tool_session_log(self, args: dict) -> str:
         limit = args.get("limit", 5)
-        data, err = _rest_call_detail(self._port, "GET", f"/sessions?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/sessions?limit={limit}", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1746,7 +1827,7 @@ class ValorBrainProvider(MemoryProvider):
             return json.dumps({"error": "docid is required"})
         before = args.get("before", 5)
         after = args.get("after", 5)
-        data, err = _rest_call_detail(self._port, "GET", f"/timeline/{docid}?before={before}&after={after}")
+        data, err = _rest_call_detail(self._port, "GET", f"/timeline/{docid}?before={before}&after={after}", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1756,7 +1837,7 @@ class ValorBrainProvider(MemoryProvider):
         if not docid:
             return json.dumps({"error": "docid is required"})
         limit = args.get("limit", 5)
-        data, err = _rest_call_detail(self._port, "GET", f"/graph/similar/{docid}?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/graph/similar/{docid}?limit={limit}", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1776,7 +1857,7 @@ class ValorBrainProvider(MemoryProvider):
         }
         if args.get("tags"):
             body["tags"] = args["tags"]
-        data, err = _rest_call_detail(self._port, "POST", "/api/v1/memory/store", body)
+        data, err = _rest_call_detail(self._port, "POST", "/api/v1/memory/store", body, run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1784,14 +1865,14 @@ class ValorBrainProvider(MemoryProvider):
     def _tool_health(self, args: dict) -> str:
         """Check memory health via GET /api/v1/memory/health."""
         limit = args.get("limit", 3)
-        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/memory/health?limit={limit}")
+        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/memory/health?limit={limit}", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_working_context(self, args: dict) -> str:
         """Get working context via GET /api/v1/memory/working-context."""
-        data, err = _rest_call_detail(self._port, "GET", "/api/v1/memory/working-context")
+        data, err = _rest_call_detail(self._port, "GET", "/api/v1/memory/working-context", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1808,12 +1889,12 @@ class ValorBrainProvider(MemoryProvider):
             for key in ("category", "priority"):
                 if args.get(key):
                     body[key] = args[key]
-            data, err = _rest_call_detail(self._port, "POST", "/api/v1/feedback", body=body)
+            data, err = _rest_call_detail(self._port, "POST", "/api/v1/feedback", body=body, run_kind=self._run_kind)
             if data is None:
                 return _tool_call_error(err)
             return json.dumps(data, ensure_ascii=False)
         feedback_id = args.get("feedback_id") or "all"
-        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/feedback/{feedback_id}")
+        data, err = _rest_call_detail(self._port, "GET", f"/api/v1/feedback/{feedback_id}", run_kind=self._run_kind)
         if data is None:
             return _tool_call_error(err)
         return json.dumps(data, ensure_ascii=False)
@@ -1841,7 +1922,7 @@ class ValorBrainProvider(MemoryProvider):
                     self._serve_proc = None
                     return
                 time.sleep(0.5)
-                health = _rest_call(self._port, "GET", "/health", timeout=1.0)
+                health = _rest_call(self._port, "GET", "/health", timeout=1.0, run_kind=self._run_kind)
                 if health:
                     logger.info("valorbrain: managed serve ready (pid=%d, port=%d)",
                                 self._serve_proc.pid, self._port)
