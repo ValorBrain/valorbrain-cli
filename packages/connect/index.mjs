@@ -291,7 +291,14 @@ function mergeJson(existingRaw, renderedRaw, remove) {
       if (existing[root]) delete existing[root].valorbrain;
     } else {
       existing[root] = existing[root] && typeof existing[root] === "object" ? existing[root] : {};
-      existing[root].valorbrain = rendered[root].valorbrain;
+      const entry = rendered[root].valorbrain;
+      // A persona the person set on the entry (X-Source-Agent) is theirs and
+      // outranks the harness id the engine's render declares: it survives the
+      // rewrite. Token, URL and the rest come from the render.
+      const own = Object.entries(existing[root].valorbrain?.headers ?? {}).find(([k, v]) => k.toLowerCase() === "x-source-agent" && typeof v === "string" && v.trim());
+      existing[root].valorbrain = own && entry.headers && typeof entry.headers === "object"
+        ? { ...entry, headers: { ...entry.headers, [own[0]]: own[1] } }
+        : entry;
     }
   }
   // OpenCode references its instructions file from config.
