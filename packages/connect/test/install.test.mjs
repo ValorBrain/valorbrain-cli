@@ -7,7 +7,7 @@ import { join } from 'node:path';
 
 process.env.VALORBRAIN_CONNECT_NO_MAIN = '1';
 const { planFor, mergeHooksJson, hookEntriesChanged } = await import('../index.mjs');
-const { clientHeaders } = await import('../hook.mjs');
+const { clientHeaders, runHeaders } = await import('../hook.mjs');
 
 const homes = [];
 function home() {
@@ -75,20 +75,24 @@ test('hook requests carry the harness contract the person declared in the harnes
         VALORBRAIN_REQUESTED_BY: 'Joana Teste',
         VALORBRAIN_AGENT_TEAM: 'time-a,time-b',
     };
-    const headers = clientHeaders(h, 'codex', '0.0.0', env);
+    // What a hook sends: identity (clientHeaders) plus run kind, requester and team (runHeaders).
+    const headers = { ...clientHeaders(h, 'codex', '0.0.0', env), ...runHeaders('', env) };
     assert.equal(headers['x-valorbrain-harness'], 'codex');
     assert.equal(headers['x-source-agent'], 'minha-persona');
     assert.equal(headers['x-agent-lane'], 'faixa-a');
     assert.equal(headers['x-run-kind'], 'routine');
     assert.equal(headers['x-requested-by'], 'Joana Teste');
     assert.equal(headers['x-agent-team'], 'time-a,time-b');
+    // Run kind, requester and team have one owner: clientHeaders never sends them.
+    assert.equal(clientHeaders(h, 'codex', '0.0.0', env)['x-run-kind'], undefined);
     // Nothing declared: only the harness names the writer.
     const bare = clientHeaders(h, 'codex', '0.0.0', {});
     assert.equal(bare['x-source-agent'], undefined);
     assert.equal(bare['x-agent-lane'], undefined);
-    // A value no header can carry is dropped, never sent mangled.
-    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_REQUESTED_BY: 'quem\npediu' })['x-requested-by'], undefined);
-    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_REQUESTED_BY: '😀' })['x-requested-by'], undefined);
+    // Accents fold to ASCII; a control character drops the value, never sends it mangled.
+    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: 'João' })['x-source-agent'], 'Joao');
+    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: 'quem\npediu' })['x-source-agent'], undefined);
+    assert.equal(clientHeaders(h, 'codex', '0.0.0', { VALORBRAIN_SOURCE_AGENT: '😀' })['x-source-agent'], undefined);
 });
 
 test('Cursor hooks.json keeps the user hooks and gains the required version key', () => {

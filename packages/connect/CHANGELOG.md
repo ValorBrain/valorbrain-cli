@@ -1,7 +1,27 @@
 # Changelog — @valorbrain/connect
 
-## [Unreleased]
+## 0.13.0 — 2026-10-16
 
+- **Tipo de execução (ADR-084, D3).** Quando o harness diz que a sessão não é
+  de uma pessoa, os hooks mandam `X-Run-Kind` no cue, no `hooks/run` e na
+  chamada MCP de fallback, com o vocabulário do engine (`runKindFromSignals`):
+  `routine` para Claude Code não assistido ou com entrypoint SDK/MCP, `omp -p`
+  e `--mode json`, Hermes `cron`/`oneshot`/`batch`/`kanban`/`api`,
+  `codex exec`, `gemini -p` ou CI, `kiro-cli --no-interactive` e
+  `cursor-agent -p`; `pipeline` para sessão vinda de webhook. Sessão
+  interativa, subagent, flush e tool não mandam nada. `VALORBRAIN_RUN_KIND`
+  sempre vence. O engine tira `routine` e `pipeline` do feed dos outros
+  agentes.
+- **Persona e contrato do harness pelo env (D1).** `VALORBRAIN_SOURCE_AGENT`
+  sai como `X-Source-Agent` (persona explícita, vence o harness declarado),
+  `VALORBRAIN_AGENT_LANE` como `X-Agent-Lane`, `VALORBRAIN_REQUESTED_BY` (até
+  120 caracteres) como `X-Requested-By` e `VALORBRAIN_AGENT_TEAM` como
+  `X-Agent-Team`. Acentos viram ASCII; valor com caractere de controle não
+  sai. São só rótulos: tenant, pessoa e autoridade continuam vindo do token.
+- **Reinstalação preserva a persona da entrada MCP.** Um `X-Source-Agent` que
+  a pessoa escreveu na entrada MCP (JSON) sobrevive ao `npx
+  @valorbrain/connect`; o token, a URL e o `X-ValorBrain-Harness` vêm do
+  manifesto.
 - **Docs: o ambiente dos hooks do Gemini CLI.** O README, o `--help` e os
   comentários diziam que o Gemini CLI roda os hooks sem o ambiente. O Gemini
   CLI 0.43 passa o ambiente do processo e só filtra com

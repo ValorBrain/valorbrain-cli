@@ -48,7 +48,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /** This package's version. Also its directory name under ~/.valorbrain/bin/connect/. */
-export const CLIENT_VERSION = '0.12.1';
+export const CLIENT_VERSION = '0.13.0';
 
 export const HOOK_PROTOCOL = 2;
 export const DEFAULT_API = 'https://valorbrain-api.valor.digital';
@@ -1169,21 +1169,18 @@ function clientState(home, harness) {
 }
 
 /**
- * The harness contract the person declares in the harness's environment
- * (ADR-084 §1): env → header. VALORBRAIN_SOURCE_AGENT is an explicit persona
- * and outranks the harness id this client always declares; the others are
- * the lane, the run kind, who asked for the work and the team labels. Only a
- * value a header can carry goes out (printable Latin-1, at most 200 chars) —
- * anything else is dropped, never sent mangled, and never breaks the hook.
+ * Who the person declares in the harness's environment (ADR-084 §1): env →
+ * header. VALORBRAIN_SOURCE_AGENT is an explicit persona and outranks the
+ * harness id this client always declares; VALORBRAIN_AGENT_LANE is the lane.
+ * Run kind, requester and team go through `runHeaders`, one rule for them.
+ * Same folding as `headerLabel` (accents to ASCII); a value with a control
+ * character is dropped, never sent mangled, and never breaks the hook.
  */
-const CONTRACT_ENV_HEADERS = [
+const IDENTITY_ENV_HEADERS = [
     ['VALORBRAIN_SOURCE_AGENT', 'x-source-agent'],
     ['VALORBRAIN_AGENT_LANE', 'x-agent-lane'],
-    ['VALORBRAIN_RUN_KIND', 'x-run-kind'],
-    ['VALORBRAIN_REQUESTED_BY', 'x-requested-by'],
-    ['VALORBRAIN_AGENT_TEAM', 'x-agent-team'],
 ];
-const HEADER_VALUE = /^[\x20-\x7e\xa0-\xff]{1,200}$/;
+const IDENTITY_HEADER_MAX_CHARS = 120;
 
 /**
  * Headers every hosted request carries: client and version, harness, install
@@ -1200,9 +1197,11 @@ export function clientHeaders(home, harness, version = CLIENT_VERSION, env = pro
     if (INSTALL_ID.test(String(install ?? ''))) headers['x-valorbrain-install'] = install;
     const state = id ? clientState(home, id) : '';
     if (state) headers['x-valorbrain-client-state'] = state;
-    for (const [name, header] of CONTRACT_ENV_HEADERS) {
-        const value = String(env[name] ?? '').trim();
-        if (HEADER_VALUE.test(value)) headers[header] = value;
+    for (const [name, header] of IDENTITY_ENV_HEADERS) {
+        const raw = str(env[name]);
+        if (/[\x00-\x1f\x7f]/.test(raw)) continue;
+        const value = headerLabel(raw, IDENTITY_HEADER_MAX_CHARS);
+        if (value) headers[header] = value;
     }
     return headers;
 }
