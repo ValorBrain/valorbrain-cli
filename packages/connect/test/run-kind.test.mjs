@@ -3,10 +3,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DEFAULT_POLICY, runHook, uploadTranscript, writeCreds } from '../hook.mjs';
+import { DEFAULT_POLICY, clientHeaders, runHeaders, runHook, uploadTranscript, writeCreds } from '../hook.mjs';
+
+/** What the engine does with a header (`headerText` in src/tenant-context.ts): bytes as latin-1, decoded as UTF-8. */
+const engineText = (v) => (v === undefined ? undefined : Buffer.from(v, 'latin1').toString('utf8'));
 
 const MIN = 60_000;
 const T0 = Date.parse('2026-10-16T12:00:00Z');
@@ -139,12 +143,12 @@ test('VALORBRAIN_RUN_KIND wins over inference; an invalid value is ignored', asy
     assert.equal(await promptRunKind('claude-code', claudePrompt, { env: { ...sdk, VALORBRAIN_RUN_KIND: 'cron' } }), 'routine');
 });
 
-test('requester and team come from the env, folded to header-safe ASCII; absent when unset', async () => {
+test('requester and team come from the env as UTF-8 bytes; absent when unset', async () => {
     const calls = await hook(['prompt', '--harness=claude-code'], {
         payload: { ...claudePrompt, session_id: 's', prompt: 'deploy?' },
         env: { VALORBRAIN_REQUESTED_BY: '  Joana Ação  ', VALORBRAIN_AGENT_TEAM: 'ops,growth' },
     });
-    assert.equal(calls[0].headers['x-requested-by'], 'Joana Acao');
+    assert.equal(engineText(calls[0].headers['x-requested-by']), 'Joana Ação');
     assert.equal(calls[0].headers['x-agent-team'], 'ops,growth');
     const long = await hook(['prompt', '--harness=claude-code'], {
         payload: { ...claudePrompt, session_id: 's', prompt: 'deploy?' }, env: { VALORBRAIN_REQUESTED_BY: 'r'.repeat(300) },
@@ -201,4 +205,43 @@ test('transcript uploader: only the operator env declares the run kind, requeste
     seen.length = 0;
     await uploadTranscript(argv, { env: {}, home: h, fetchImpl, now: T0 });
     for (const headers of seen) assert.equal('x-run-kind' in headers, false);
+});
+
+// Persona, lane, requester and team in any script: through the real fetch to
+// an HTTP server that decodes the header the engine's way, they arrive intact;
+// a value with a line break or a tab inside is omitted, never concatenated.
+test('identity and requester headers arrive intact in any script through real fetch', async () => {
+    const seen = [];
+    const server = createServer((req, res) => { seen.push(req.headers); res.end('{}'); });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const url = `http://127.0.0.1:${server.address().port}/api/v1/hooks/cue`;
+    const send = async (env) => {
+        await fetch(url, { method: 'POST', headers: { ...clientHeaders(home(), 'codex', '0.0.0', env), ...runHeaders('', env) }, body: '{}' });
+        return seen[seen.length - 1];
+    };
+    try {
+        const got = await send({
+            VALORBRAIN_SOURCE_AGENT: 'joão',
+            VALORBRAIN_AGENT_LANE: 'migração',
+            VALORBRAIN_REQUESTED_BY: 'João Conceição',
+            VALORBRAIN_AGENT_TEAM: '张伟,vendas',
+        });
+        assert.equal(engineText(got['x-source-agent']), 'joão');
+        assert.equal(engineText(got['x-agent-lane']), 'migração');
+        assert.equal(engineText(got['x-requested-by']), 'João Conceição');
+        assert.equal(engineText(got['x-agent-team']), '张伟,vendas');
+        const cjk = await send({ VALORBRAIN_REQUESTED_BY: '张伟' });
+        assert.equal(engineText(cjk['x-requested-by']), '张伟');
+        // Invisible characters drop the whole value.
+        for (const bad of ['quem\npediu', 'quem\tpediu', 'a\u200bb', 'x\u202ey', 'a\u2028b']) {
+            const r = await send({ VALORBRAIN_REQUESTED_BY: bad, VALORBRAIN_SOURCE_AGENT: bad });
+            assert.equal(r['x-requested-by'], undefined, JSON.stringify(bad));
+            assert.equal(r['x-source-agent'], undefined, JSON.stringify(bad));
+        }
+        // The cap counts code points, never splitting a character.
+        const capped = await send({ VALORBRAIN_REQUESTED_BY: 'ç'.repeat(300) });
+        assert.equal(engineText(capped['x-requested-by']), 'ç'.repeat(120));
+    } finally {
+        server.close();
+    }
 });
