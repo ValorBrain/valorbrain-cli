@@ -75,7 +75,7 @@ the binary runs the hooks; without one, they go to `VALORBRAIN_ENGINE_URL`.
 
 ## Moving a machine from the binary to hosted
 
-1. Get a `vbm_` token for the agent (one token per agent or persona).
+1. Get the `vbm_` token of the person the agent acts for — one per person, any harness and persona. The Hermes plugin sends no `X-User-ID` per person, so never use a gateway token here.
 2. In the `env:` block of `~/.hermes/config.yaml`:
    - set `VALORBRAIN_HOOKS_MODE: hosted`,
      `VALORBRAIN_ENGINE_URL: https://valorbrain-api.valor.digital` and
