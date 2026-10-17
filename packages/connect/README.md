@@ -42,7 +42,7 @@ diz onde achar o token certo. A ordem:
 3. `VALORBRAIN_TOKEN` (depreciada, com aviso; só vale se for `vbm_` — qualquer
    outra coisa é a chave REST e é ignorada aqui)
 4. o `mcp_token` que `npx -y @valorbrain/cli init --agent` gravou em
-   `~/.valorbrain/config.json` — para os agentes que ainda não têm token próprio
+   `~/.valorbrain/config.json` — para os agentes que ainda não têm token salvo
    neste computador (os já conectados mantêm o seu; `--relogin` troca todos)
 5. sem nada disso, o login pelo navegador (abaixo)
 
@@ -226,9 +226,10 @@ Sem `--token`, o instalador faz o device flow (RFC 8628) com o app:
    (`VALORBRAIN_NO_BROWSER=1`), só imprime o link;
 3. a pessoa confere o código e autoriza. Quem ainda não tem conta cria no
    caminho e volta para a mesma página;
-4. o app cria **um token MCP por harness**, atribuído àquele agente e
-   revogável sozinho em Configurações → Tokens MCP, e entrega uma única vez em
-   `POST /api/v1/cli/device/token`.
+4. o app cria **um token MCP por computador**, seu, usado por todos os agentes
+   que autorizou (cada um continua se identificando pelo `X-ValorBrain-Harness`)
+   e revogável em Configurações → Tokens MCP, e entrega uma única vez em
+   `POST /api/v1/cli/device/token`, sob cada harness.
 
 `--app URL` (ou `VALORBRAIN_APP_URL`) aponta para outro app (staging). O engine
 de cada harness passa a ser o do app que autorizou, salvo `--api` ou

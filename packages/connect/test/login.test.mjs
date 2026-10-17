@@ -43,7 +43,7 @@ function fakeApp(tokenAnswers, codeAnswer = null) {
 
 const quiet = { log: () => {}, sleep: async () => {}, open: () => false };
 
-test('login: asks for a connect code with the harnesses and hands back one token per harness', async () => {
+test('login: asks for a connect code with the harnesses and hands back the token of each harness', async () => {
     const { calls, fetchImpl } = fakeApp([
         jsonResponse(400, { error: 'authorization_pending' }),
         new Error('ECONNRESET'), // a network blip mid-wait is not fatal
@@ -149,8 +149,9 @@ function stubAppAndEngine() {
             if (u.pathname === '/api/v1/cli/device/token') {
                 seen.polls++;
                 if (seen.polls < 2) return send(400, { error: 'authorization_pending' });
+                // The app hands the computer's token under each harness it approved.
                 const sfx = seen.round > 1 ? `_${seen.round}` : '';
-                return send(200, { access_token: `vbm_claude${sfx}`, tokens: { 'claude-code': `vbm_claude${sfx}`, codex: `vbm_codex${sfx}` }, tenant_id: 't1', valorbrain_url: `http://127.0.0.1:${server.address().port}` });
+                return send(200, { access_token: `vbm_computer${sfx}`, tokens: { 'claude-code': `vbm_computer${sfx}`, codex: `vbm_computer${sfx}` }, tenant_id: 't1', valorbrain_url: `http://127.0.0.1:${server.address().port}` });
             }
             if (u.pathname === '/setup/artifacts') {
                 const manifest = JSON.stringify(u.searchParams.get('agent') === 'codex' ? codexManifest() : claudeManifest());
@@ -167,7 +168,7 @@ function stubAppAndEngine() {
     return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, seen, url: `http://127.0.0.1:${server.address().port}` })));
 }
 
-test('no --token: the CLI logs in through the browser flow and wires each harness with its own token', async () => {
+test("no --token: the CLI logs in through the browser flow and wires each harness with the computer's token", async () => {
     const { server, seen, url } = await stubAppAndEngine();
     const h = mkdtempSync(join(tmpdir(), 'vb-connect-login-'));
     try {
@@ -188,20 +189,21 @@ test('no --token: the CLI logs in through the browser flow and wires each harnes
         // The stub offered a page on another host: never opened or shown; the app's own page is.
         assert.doesNotMatch(stdout, /http:\/\/stub\//);
         assert.match(stdout, new RegExp(`${url.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/cli/link\\?code=WXYZ-2345`));
-        assert.match(stdout, /approved — 2 agent\(s\), each with its own token/);
+        assert.match(stdout, /approved — 2 agent\(s\), sharing one token for this computer/);
 
         const claude = JSON.parse(readFileSync(join(h, '.claude.json'), 'utf-8'));
-        assert.equal(claude.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_claude');
+        assert.equal(claude.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_computer');
         // The repair turns even the stub's old bearer_token render into the
         // header shape codex 0.160.0 accepts.
-        assert.match(readFileSync(join(h, '.codex', 'config.toml'), 'utf-8'), /http_headers = \{ "Authorization" = "Bearer vbm_codex" \}/);
+        assert.match(readFileSync(join(h, '.codex', 'config.toml'), 'utf-8'), /http_headers = \{ "Authorization" = "Bearer vbm_computer" \}/);
 
         const creds = JSON.parse(readFileSync(join(h, '.valorbrain', 'connect.json'), 'utf-8'));
-        assert.equal(creds.harnesses['claude-code'].token, 'vbm_claude');
+        assert.equal(creds.harnesses['claude-code'].token, 'vbm_computer');
         assert.equal(creds.harnesses['claude-code'].api_url, url); // the approving app's engine
+        assert.equal(creds.harnesses.codex.token, 'vbm_computer');
 
-        // Each harness declared itself with its own token.
-        assert.deepEqual(seen.registered.map((r) => [r.agent, r.auth]).sort(), [['claude-code', 'Bearer vbm_claude'], ['codex', 'Bearer vbm_codex']]);
+        // Each harness declared itself with the same token.
+        assert.deepEqual(seen.registered.map((r) => [r.agent, r.auth]).sort(), [['claude-code', 'Bearer vbm_computer'], ['codex', 'Bearer vbm_computer']]);
     } finally {
         server.close();
         rmSync(h, { recursive: true, force: true });
@@ -314,9 +316,11 @@ test('a re-run keeps the agents already connected and only approves the new one'
         assert.equal(second.code, 0, second.stderr);
         assert.match(second.stdout, /Already connected: claude-code/);
         assert.deepEqual(seen.code.harnesses, ['codex']); // only the new agent is approved
-        // The stub answers with tokens for both agents; the connected one keeps its own.
+        // The stub answers with a new computer token for both agents; the
+        // connected one keeps the token it has, the new one gets the new token.
         const claudeCfg = JSON.parse(readFileSync(join(h, '.claude.json'), 'utf-8'));
-        assert.equal(claudeCfg.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_claude');
+        assert.equal(claudeCfg.mcpServers.valorbrain.headers.Authorization, 'Bearer vbm_computer');
+        assert.match(readFileSync(join(h, '.codex', 'config.toml'), 'utf-8'), /"Bearer vbm_computer_2"/);
 
         seen.code = null;
         const third = await runCliIn(h, [], env); // everything connected: no approval at all
