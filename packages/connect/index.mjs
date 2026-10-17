@@ -131,8 +131,8 @@ Options
                     Without one, the mcp_token saved by \`npx -y @valorbrain/cli init --agent\`
                     (~/.valorbrain/config.json) is used for agents not yet connected;
                     without that either, the browser opens so you approve this computer
-                    (you create your account there if needed) and each agent
-                    gets its own token. Only vbm_ tokens are accepted.
+                    (you create your account there if needed) and it gets one token,
+                    shared by the agents on it. Only vbm_ tokens are accepted.
   --no-browser      print the approval link instead of opening it (also:
                     VALORBRAIN_NO_BROWSER=1). Needed to log in from CI or
                     piped output, which otherwise stop and ask for --token;
@@ -1779,9 +1779,10 @@ async function main() {
   for (const w of resolved.warnings) console.error(`${C.yellow}!${C.off} ${w}`);
   let token = resolved.token;
   if (resolved.source === "cli") console.log(`${C.dim}Using the MCP token saved by @valorbrain/cli (~/.valorbrain/config.json)${C.off}`);
-  // Filled by the browser login: one token per harness, and the engine URL the
-  // app that approved the computer belongs to. Agents already connected on
-  // this computer keep the token saved in ~/.valorbrain/connect.json.
+  // Filled by the browser login: the computer's token under each harness it
+  // approved (one token per computer, shared by the agents on it), and the
+  // engine URL the app that approved the computer belongs to. Agents already
+  // connected on this computer keep the token saved in ~/.valorbrain/connect.json.
   let loginTokens = null;
   let loginApi = null;
   let savedTokens = {};
@@ -1918,7 +1919,7 @@ async function main() {
         loginTokens = Object.fromEntries(resolvable.filter((h) => answered[h]).map((h) => [h, answered[h]]));
         loginApi = login.apiUrl;
         const got = resolvable.filter((h) => loginTokens[h]);
-        console.log(`${C.green}✓${C.off} approved — ${got.length} agent(s), each with its own token\n`);
+        console.log(`${C.green}✓${C.off} approved — ${got.length} agent(s), sharing one token for this computer\n`);
         const override = args.api || process.env.VALORBRAIN_API_URL;
         if (loginApi && override && override.replace(/\/+$/, "") !== loginApi) {
           console.log(`${C.yellow}!${C.off} the tokens were issued for ${loginApi}, but ${args.api ? "--api" : "VALORBRAIN_API_URL"} points the agents to ${override.replace(/\/+$/, "")}. They will fail there unless it is the same engine.\n`);

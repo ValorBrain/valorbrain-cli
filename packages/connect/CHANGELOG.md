@@ -1,5 +1,17 @@
 # Changelog — @valorbrain/connect
 
+## Não lançado
+
+- **Textos: um token por computador.** Desde 16/10/2026 a aprovação no app
+  (`/cli/link`, agentxagi/valorbrain-saas#80) cria um token MCP da pessoa por
+  computador, usado por todos os agentes que ela autorizou, e entrega esse
+  token sob cada harness. O `--help`, a mensagem depois da aprovação
+  (`approved — N agent(s), sharing one token for this computer`), o cabeçalho
+  de `login.mjs`, um comentário de `index.mjs` e o README diziam um token por
+  agente. Sem mudança de comportamento: a CLI já gravava em cada harness o
+  token que o app mandava para ele. O teste do login usa o formato novo do app
+  (o mesmo token para os dois harnesses).
+
 ## 0.13.0 — 2026-10-16
 
 - **Tipo de execução (ADR-084, D3).** Quando o harness diz que a sessão não é

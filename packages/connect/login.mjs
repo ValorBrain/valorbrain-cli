@@ -4,14 +4,15 @@
  * RFC 8628 device flow served by the ValorBrain app. The CLI asks the app for
  * a code naming the harnesses it found, opens the approval page
  * (/cli/link?code=…) and polls until the person approves this computer there.
- * The approval creates one MCP token per harness (attributed to that harness,
- * revocable on its own in Settings → MCP Tokens) and the app hands them over
+ * The approval creates one MCP token for this computer, shared by the agents
+ * on it (each one still names itself with `X-ValorBrain-Harness`; revocable in
+ * Settings → MCP Tokens), and the app hands it over, under each harness,
  * exactly once. A person without an account creates it on the way: the
  * approval page sends them through sign-up and back.
  *
  * Two URLs cross from the app into this machine, and neither is trusted as
  * is: the approval URL is opened only when it is an https page of the app
- * itself (http only on loopback), and the engine URL the tokens belong to is
+ * itself (http only on loopback), and the engine URL the token belongs to is
  * accepted under the same rule.
  *
  * Node built-ins only; everything that touches the network or spawns a
