@@ -30,6 +30,8 @@ Config via environment variables:
   VALORBRAIN_LLM_REASONING_EFFORT — Top-level reasoning_effort for supporting Chat Completions endpoints (optional)
   VALORBRAIN_LLM_NO_THINK  — Append /no_think to remote prompts; false disables it for standard OpenAI models (optional)
   VALORBRAIN_RERANK_URL    — GPU reranker server URL (optional)
+  VALORBRAIN_RETRIEVE_TIMEOUT_S — Seconds the search tools (retrieve, similar, working_context)
+                             wait for the engine's answer (default: 30, max 3600; the other tools keep 5)
 
 What leaves the machine (PRD decision 18):
   VALORBRAIN_SEND_PROMPT     — "off" stops sending the prompt of each turn: no per-turn
@@ -68,6 +70,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -90,14 +93,20 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.11.0"
+_PLUGIN_VERSION = "1.12.0"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
 _HOOK_TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024
 _HOOK_TIMEOUT = 30  # seconds — fast hooks (bootstrap, lifecycle)
 _CONTEXT_SURFACING_TIMEOUT = 90  # seconds — retrieval hook can take ~60s on bench tenants
-_REST_TIMEOUT = 5.0  # seconds
+_REST_TIMEOUT = 5.0  # seconds — padrão das chamadas REST
+# As tools de busca (retrieve, similar, working_context) esperam mais: o POST
+# /retrieve da produção levou 6,2 s na consulta do FB-0216, e com o teto de 5 s
+# o plugin desistia com o engine no ar (FB-0216, FB-0226).
+_RETRIEVE_TIMEOUT_ENV = "VALORBRAIN_RETRIEVE_TIMEOUT_S"
+_RETRIEVE_TIMEOUT_DEFAULT = 30.0  # seconds
+_RETRIEVE_TIMEOUT_MAX = 3600.0  # seconds — acima de ~9e9 o socket estoura (OverflowError)
 
 _FLAG_ON = ("on", "1", "true", "yes")
 _FLAG_OFF = ("off", "0", "false", "no")
@@ -123,6 +132,22 @@ def _privacy_flag(env_name: str, key: str, default: bool) -> bool:
     except Exception:
         value = None
     return value if isinstance(value, bool) else default
+
+
+def _retrieve_timeout() -> float:
+    """Teto, em segundos, das tools de busca: VALORBRAIN_RETRIEVE_TIMEOUT_S ou 30.
+
+    Lido a cada chamada. Valor não numérico, zero, negativo, infinito ou acima
+    de 3600 cai no padrão.
+    """
+    raw = (os.environ.get(_RETRIEVE_TIMEOUT_ENV) or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _RETRIEVE_TIMEOUT_DEFAULT
+    if math.isfinite(value) and 0 < value <= _RETRIEVE_TIMEOUT_MAX:
+        return value
+    return _RETRIEVE_TIMEOUT_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +627,9 @@ def _error_kind(status: int) -> str:
 
 
 def _rest_actionable_error(kind: str, detail: str, url: str = "",
-                           status: Optional[int] = None) -> str:
+                           status: Optional[int] = None,
+                           timeout_s: Optional[float] = None,
+                           method: str = "", timeout_env: str = "") -> str:
     """Mensagem que o agente pode agir, não o rótulo que sobrou (FB-0100).
 
     O relato era "ValorBrain REST API unreachable" com o MCP funcionando ao
@@ -638,6 +665,26 @@ def _rest_actionable_error(kind: str, detail: str, url: str = "",
             "apontando para ele; se é local, o processo `valorbrain serve` não está "
             "ouvindo nessa porta."
         )
+    if kind == "timeout":
+        # FB-0216/FB-0226: caía em `transport`, que manda conferir a URL e o
+        # `valorbrain serve` quando o engine só estava demorando. O próximo
+        # passo depende da chamada: só as tools de busca têm teto ajustável
+        # (`timeout_env`), e uma escrita que estourou pode ter sido aplicada.
+        limit = f"{timeout_s:g} s" if timeout_s else "o tempo limite"
+        msg = (
+            f"ValorBrain REST não respondeu a tempo: o engine em {url or 'a chamada'} "
+            f"aceitou a conexão mas não respondeu em {limit}. Não é problema de "
+            "configuração: a conexão foi aceita, então a URL e a porta muito "
+            "provavelmente estão certas."
+        )
+        if timeout_env:
+            return msg + f" Tente de novo; se a consulta for pesada, aumente {timeout_env} (hoje {limit})."
+        if method == "POST":
+            return msg + " A escrita pode ter sido aplicada: confira antes de repetir."
+        return msg + (
+            f" Tente de novo; {limit} é o teto fixo desta chamada, e se repetir o "
+            "engine está sobrecarregado."
+        )
     return f"ValorBrain REST falhou: {detail}"
 
 
@@ -647,7 +694,9 @@ def _rest_call_detail(port: int, method: str, path: str,
     """`_rest_call` com o motivo da falha. Devolve (data, err).
 
     `err` é None em sucesso; caso contrário um dict {kind, detail, url, status}:
-      transport  — ninguém respondeu (conexão recusada, DNS, timeout)
+      transport  — ninguém respondeu (conexão recusada, DNS, timeout de conexão)
+      timeout    — conectou, mas o engine não respondeu dentro do teto; o dict
+                   leva `timeout_s` e `method` (FB-0216)
       http       — o engine respondeu com status >= 400
       decode     — resposta 2xx que não é JSON
     A separação é o conserto de FB-0100: antes, 401 e 404 e recusa de conexão
@@ -658,15 +707,19 @@ def _rest_call_detail(port: int, method: str, path: str,
     return data, out[0]
 
 
-def _tool_call_error(err: Optional[dict]) -> str:
-    """Corpo de erro de tool a partir do detalhe da chamada REST."""
+def _tool_call_error(err: Optional[dict], timeout_env: str = "") -> str:
+    """Corpo de erro de tool a partir do detalhe da chamada REST.
+
+    `timeout_env`: a env que regula o teto desta tool (só as de busca têm).
+    """
     if not err:
         return json.dumps({"error": "ValorBrain REST API unreachable"})
     return json.dumps(
         {
             "error": _rest_actionable_error(
                 err.get("kind", "http"), err.get("detail", ""),
-                err.get("url", ""), err.get("status"),
+                err.get("url", ""), err.get("status"), timeout_s=err.get("timeout_s"),
+                method=err.get("method", ""), timeout_env=timeout_env,
             ),
             "status": err.get("status"),
             "kind": err.get("kind"),
@@ -697,7 +750,8 @@ def _rest_call(port: int, method: str, path: str,
     disagree with the token, and only the platform credential honors the headers.
 
     Com `_out` (lista de uma posição), recebe {kind, detail, url, status} no
-    lugar de None como metadado da falha — o chamador decide se usa.
+    lugar de None como metadado da falha (no `timeout`, também `timeout_s` e
+    `method`) — o chamador decide se usa.
     """
     headers: dict = {"Content-Type": "application/json"}
     token = os.environ.get("VALORBRAIN_API_TOKEN")
@@ -731,6 +785,9 @@ def _rest_call(port: int, method: str, path: str,
         logger.debug("ValorBrain REST %s %s failed (%s/%s): %s", method, path, kind, status, detail)
         if _out is not None:
             _out[0] = {"kind": kind, "detail": detail, "url": url, "status": status}
+            if kind == "timeout":
+                _out[0]["timeout_s"] = timeout
+                _out[0]["method"] = method
         return None
 
     if base is None:
@@ -752,6 +809,7 @@ def _rest_call(port: int, method: str, path: str,
         import httpx
     except ImportError:
         # Fallback to urllib for zero-dependency operation
+        import socket
         import urllib.request
         import urllib.error
         url = f"{base}{path}"
@@ -771,11 +829,19 @@ def _rest_call(port: int, method: str, path: str,
                 detail = ""
             kind = _error_kind(e.code)
             return _fail(kind, detail or str(e), e.code)
+        except (TimeoutError, socket.timeout) as e:
+            # Solto (sem URLError em volta) só sai da leitura da resposta: a
+            # conexão abriu. Timeout de conexão (ou do envio da requisição) vem
+            # dentro de URLError, abaixo. O urllib não separa as fases: aqui a
+            # conexão também espera o teto inteiro.
+            return _fail("timeout", f"{type(e).__name__}: {e}")
         except (urllib.error.URLError, Exception) as e:
             return _fail("transport", str(e))
 
     try:
-        client = httpx.Client(timeout=timeout)
+        # Teto maior (tools de busca, hooks, register) vale para a resposta; a
+        # conexão fica em até 5 s, e ninguém atendendo falha rápido (FB-0216).
+        client = httpx.Client(timeout=httpx.Timeout(timeout, connect=min(timeout, _REST_TIMEOUT)))
         if method == "GET":
             resp = client.get(f"{base}{path}", headers=headers)
         else:
@@ -784,8 +850,11 @@ def _rest_call(port: int, method: str, path: str,
                 json=body or {},
                 headers=headers,
             )
+    except (httpx.ReadTimeout, httpx.WriteTimeout) as e:
+        # Conectou, mas o engine não respondeu dentro do teto (FB-0216).
+        return _fail("timeout", f"{type(e).__name__}: {e}")
     except Exception as e:
-        # Antes do request: ninguém respondeu (conexão recusada, DNS, timeout).
+        # Ninguém respondeu: conexão recusada, DNS, timeout de conexão.
         return _fail("transport", f"{type(e).__name__}: {e}")
 
     status = resp.status_code
@@ -1800,9 +1869,11 @@ class ValorBrainProvider(MemoryProvider):
         body = {"query": query, "compact": True}
         if args.get("limit"):
             body["limit"] = args["limit"]
-        data, err = _rest_call_detail(self._port, "POST", "/retrieve", body, run_kind=self._run_kind)
+        data, err = _rest_call_detail(
+            self._port, "POST", "/retrieve", body, timeout=_retrieve_timeout(), run_kind=self._run_kind
+        )
         if data is None:
-            return _tool_call_error(err)
+            return _tool_call_error(err, timeout_env=_RETRIEVE_TIMEOUT_ENV)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_get(self, args: dict) -> str:
@@ -1841,9 +1912,12 @@ class ValorBrainProvider(MemoryProvider):
         if not docid:
             return json.dumps({"error": "docid is required"})
         limit = args.get("limit", 5)
-        data, err = _rest_call_detail(self._port, "GET", f"/graph/similar/{docid}?limit={limit}", run_kind=self._run_kind)
+        data, err = _rest_call_detail(
+            self._port, "GET", f"/graph/similar/{docid}?limit={limit}",
+            timeout=_retrieve_timeout(), run_kind=self._run_kind,
+        )
         if data is None:
-            return _tool_call_error(err)
+            return _tool_call_error(err, timeout_env=_RETRIEVE_TIMEOUT_ENV)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_store(self, args: dict) -> str:
@@ -1876,9 +1950,12 @@ class ValorBrainProvider(MemoryProvider):
 
     def _tool_working_context(self, args: dict) -> str:
         """Get working context via GET /api/v1/memory/working-context."""
-        data, err = _rest_call_detail(self._port, "GET", "/api/v1/memory/working-context", run_kind=self._run_kind)
+        data, err = _rest_call_detail(
+            self._port, "GET", "/api/v1/memory/working-context",
+            timeout=_retrieve_timeout(), run_kind=self._run_kind,
+        )
         if data is None:
-            return _tool_call_error(err)
+            return _tool_call_error(err, timeout_env=_RETRIEVE_TIMEOUT_ENV)
         return json.dumps(data, ensure_ascii=False)
 
     def _tool_feedback(self, args: dict) -> str:
