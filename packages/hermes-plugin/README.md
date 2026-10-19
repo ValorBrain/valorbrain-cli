@@ -125,6 +125,15 @@ gateway again.
   A person's session sends none (the engine infers `conversation`), and so do
   `subagent`, `flush`, `tool` and `a2a`: they are pieces of another run. An
   explicit `VALORBRAIN_RUN_KIND` always wins.
+- **Search timeout (1.12.0)**: `valorbrain_retrieve`, `valorbrain_similar` and
+  `valorbrain_working_context` wait up to 30 s for the engine's answer
+  (`VALORBRAIN_RETRIEVE_TIMEOUT_S`); the other tools keep 5 s, and opening the
+  connection never waits more than 5 s. An engine that accepted the
+  connection and did not answer in time is a tool error of kind `timeout`, no
+  longer a `transport` error telling the agent the engine is not listening
+  (FB-0216, FB-0226). Its message says what to do next: retry or raise the
+  variable on a search tool, retry on the others (5 s is their fixed limit),
+  and check before repeating a write, which may have been applied.
 - **Client identity (1.9.0)**: every `POST /api/v1/hooks/run` and
   `POST /api/v1/runtimes/register` carries `X-ValorBrain-Client:
   hermes-plugin/<version>`, `X-ValorBrain-Harness: hermes` and
@@ -163,6 +172,7 @@ triggers a heal.
 | `VALORBRAIN_SEND_PROMPT` | `off` stops sending each turn's prompt (no per-turn recall). Default on |
 | `VALORBRAIN_SEND_TRANSCRIPT` | `on` uploads the session transcript to the hosted extraction hooks. Default off |
 | `VALORBRAIN_SERVE_PORT` | local engine port (self-hosted; default 7438) |
+| `VALORBRAIN_RETRIEVE_TIMEOUT_S` | seconds `valorbrain_retrieve`, `valorbrain_similar` and `valorbrain_working_context` wait for the engine's answer (default 30; a number > 0 up to 3600, anything else means 30). The other tools keep 5 s |
 | `VALORBRAIN_RUN_KIND` | `conversation`, `routine` or `pipeline`: sent as `X-Run-Kind`, over what the plugin infers. Other values are ignored |
 | `VALORBRAIN_REQUESTED_BY` | who asked for this run (≤120 chars, accents folded to ASCII): sent as `X-Requested-By`, attribution only |
 | `VALORBRAIN_AGENT_TEAM` | comma-separated team labels (≤5): sent as `X-Agent-Team` |
