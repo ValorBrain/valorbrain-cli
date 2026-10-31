@@ -93,7 +93,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.12.0"
+_PLUGIN_VERSION = "1.12.1"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -2105,6 +2105,12 @@ def _tool_execution_middleware(provider):
 # ---------------------------------------------------------------------------
 
 _GATEWAY_RUNTIME_HB_STOP = threading.Event()
+# One gateway registration and one heartbeat loop per process. Hermes calls
+# register(ctx) again for every agent it builds (each session, cron run and
+# subagent), and each call used to start one more loop: 284 of them in a
+# gateway up for 3 days (31/10/2026), ~55 heartbeats a minute to the engine.
+_GATEWAY_RUNTIME_LOCK = threading.Lock()
+_GATEWAY_RUNTIME_STARTED = False
 
 
 def _gateway_runtime_heartbeat_loop(runtime_key: str, port: int) -> None:
@@ -2124,11 +2130,31 @@ def _gateway_runtime_heartbeat_loop(runtime_key: str, port: int) -> None:
 
 
 def _eager_register_gateway_runtime() -> None:
-    """Register runtime at plugin load — not only when a chat session starts."""
+    """Register runtime at plugin load — not only when a chat session starts.
+
+    Once per process: the first call that registers starts the heartbeat loop,
+    and the later ones return. A call that fails leaves the next one to retry.
+    """
+    global _GATEWAY_RUNTIME_STARTED
+    with _GATEWAY_RUNTIME_LOCK:
+        if _GATEWAY_RUNTIME_STARTED:
+            return
+        _GATEWAY_RUNTIME_STARTED = True
+    started = False
+    try:
+        started = _register_gateway_runtime()
+    finally:
+        if not started:
+            with _GATEWAY_RUNTIME_LOCK:
+                _GATEWAY_RUNTIME_STARTED = False
+
+
+def _register_gateway_runtime() -> bool:
+    """Register the gateway runtime and start its heartbeat loop; True when started."""
     seed = _runtime_seed()
     if not seed:
         logger.debug("valorbrain: skip gateway runtime register — no tenant id/token")
-        return
+        return False
     try:
         port = int(os.environ.get("VALORBRAIN_SERVE_PORT", _DEFAULT_PORT))
     except (ValueError, TypeError):
@@ -2168,8 +2194,9 @@ def _eager_register_gateway_runtime() -> None:
             daemon=True,
             name="valorbrain-runtime-hb",
         ).start()
-    else:
-        logger.warning("valorbrain: hermes gateway runtime register failed")
+        return True
+    logger.warning("valorbrain: hermes gateway runtime register failed")
+    return False
 
 
 def register(ctx) -> None:
