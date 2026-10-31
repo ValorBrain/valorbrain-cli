@@ -131,10 +131,12 @@ gateway again.
   heartbeat loop (284 loops in a gateway up for 3 days, ~55 heartbeats a
   minute) and the `tool_execution` middleware, one more link per agent in the
   chain every tool call walks (with Hermes' own runner a tool call raises
-  RecursionError past ~330-400 links). Both now register once per process; a
-  failed gateway registration is retried by the next agent, a middleware
-  disposed by a Hermes unload is registered again, and the middleware serves
-  the newest provider.
+  RecursionError past ~330-400 links). The heartbeat loop now starts once per
+  process (a failed gateway registration is retried by the next agent), and
+  the middleware is registered once per Hermes home: a gateway with
+  `multiplex_profiles` serves several profiles, each with its own plugin
+  manager, through this one module. A middleware disposed by a Hermes unload
+  is registered again, and each home's middleware serves its newest provider.
 - **Search timeout (1.12.0)**: `valorbrain_retrieve`, `valorbrain_similar` and
   `valorbrain_working_context` wait up to 30 s for the engine's answer
   (`VALORBRAIN_RETRIEVE_TIMEOUT_S`); the other tools keep 5 s, and opening the

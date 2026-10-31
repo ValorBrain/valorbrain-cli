@@ -2080,16 +2080,17 @@ def _cached_file_context(provider, path: str) -> str:
     return entry[1] if entry else ""
 
 
-def _tool_execution_middleware(provider=None):
+def _tool_execution_middleware(provider=None, home=None):
     """Appenda o contexto do vault ao resultado de tools com `file_path`.
 
-    Sem `provider`, atende o mais novo registrado (`_register_tool_middleware`,
-    um middleware por processo), lido na hora da chamada.
+    Sem `provider`, atende o mais novo registrado na `home` do Hermes
+    (`_register_tool_middleware`, um middleware por home), lido na hora da
+    chamada.
     """
 
     def middleware(tool_name, args, next_call, **context):
         result = next_call(args)
-        current = provider if provider is not None else _TOOL_MIDDLEWARE_PROVIDER
+        current = provider if provider is not None else _TOOL_MIDDLEWARE_PROVIDERS.get(home)
         try:
             candidate = None
             if isinstance(args, dict):
@@ -2105,37 +2106,50 @@ def _tool_execution_middleware(provider=None):
     return middleware
 
 
-# Um middleware tool_execution por processo. O Hermes roda register(ctx) para
-# cada agente que monta, e a lista de middlewares dele é do processo: cada
-# chamada acrescentava um elo à cadeia que toda tool percorre (um grupo de
-# frames por elo). Com o run_tool_execution_middleware do próprio Hermes, a
-# chamada de tool passa com 330 elos e dá RecursionError com 400 (limite
-# 1000), e o gateway somava ~84 elos por dia (31/10/2026).
+# Um middleware tool_execution por home do Hermes. O Hermes roda register(ctx)
+# para cada agente que monta, e cada home (perfil) tem a sua lista de
+# middlewares: cada chamada acrescentava um elo à cadeia que toda tool da home
+# percorre (um grupo de frames por elo). Com o run_tool_execution_middleware
+# do próprio Hermes, a chamada de tool passa com 330 elos e dá RecursionError
+# com 400 (limite 1000); a home padrão do gateway somava ~49 elos por dia
+# (31/10/2026). Por home, não por processo: com multiplex_profiles o gateway
+# serve vários perfis, e os perfis apontam para o mesmo diretório do plugin,
+# então este módulo é um só para todos (revisão do #730).
 _TOOL_MIDDLEWARE_LOCK = threading.Lock()
-_TOOL_MIDDLEWARE_HANDLE = None
-_TOOL_MIDDLEWARE_PROVIDER = None
+_TOOL_MIDDLEWARE_HANDLES: dict = {}
+_TOOL_MIDDLEWARE_PROVIDERS: dict = {}
+
+
+def _hermes_home_key() -> str:
+    """A home do Hermes em que o agente é montado (a chave do registro dele)."""
+    try:
+        from hermes_constants import hermes_home_key
+
+        return hermes_home_key()
+    except Exception:
+        return os.environ.get("HERMES_HOME", "")
 
 
 def _register_tool_middleware(ctx, provider) -> None:
-    """Aponta o middleware para o provider mais novo; registra só quando não há um vivo.
+    """Aponta o middleware da home para o provider mais novo; registra só quando a home não tem um vivo.
 
-    O unload do Hermes (reload de plugin, troca de perfil) descarta a
-    registração: o `active` do handle fica falso e o próximo agente registra
-    de novo. Um Hermes cujo register_middleware não devolve handle registra
-    uma vez.
+    O unload do Hermes (reload de plugin) descarta a registração: o `active`
+    do handle fica falso e o próximo agente da home registra de novo. Um
+    Hermes cujo register_middleware não devolve handle registra uma vez por
+    home.
     """
-    global _TOOL_MIDDLEWARE_HANDLE, _TOOL_MIDDLEWARE_PROVIDER
+    home = _hermes_home_key()
     with _TOOL_MIDDLEWARE_LOCK:
-        _TOOL_MIDDLEWARE_PROVIDER = provider
-        handle = _TOOL_MIDDLEWARE_HANDLE
+        _TOOL_MIDDLEWARE_PROVIDERS[home] = provider
+        handle = _TOOL_MIDDLEWARE_HANDLES.get(home)
         if handle is not None and getattr(handle, "active", True):
             return
         try:
-            registered = ctx.register_middleware("tool_execution", _tool_execution_middleware())
+            registered = ctx.register_middleware("tool_execution", _tool_execution_middleware(home=home))
         except Exception as e:
             logger.debug("valorbrain: tool middleware registration skipped: %s", e)
             return
-        _TOOL_MIDDLEWARE_HANDLE = registered if registered is not None else True
+        _TOOL_MIDDLEWARE_HANDLES[home] = registered if registered is not None else True
 
 
 # ---------------------------------------------------------------------------
