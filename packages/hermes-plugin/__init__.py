@@ -2080,17 +2080,22 @@ def _cached_file_context(provider, path: str) -> str:
     return entry[1] if entry else ""
 
 
-def _tool_execution_middleware(provider):
-    """Appenda o contexto do vault ao resultado de tools com `file_path`."""
+def _tool_execution_middleware(provider=None):
+    """Appenda o contexto do vault ao resultado de tools com `file_path`.
+
+    Sem `provider`, atende o mais novo registrado (`_register_tool_middleware`,
+    um middleware por processo), lido na hora da chamada.
+    """
 
     def middleware(tool_name, args, next_call, **context):
         result = next_call(args)
+        current = provider if provider is not None else _TOOL_MIDDLEWARE_PROVIDER
         try:
             candidate = None
             if isinstance(args, dict):
                 candidate = args.get("file_path") or args.get("path")
-            if isinstance(candidate, str) and len(candidate) >= 5 and isinstance(result, str):
-                block = _cached_file_context(provider, candidate)
+            if current is not None and isinstance(candidate, str) and len(candidate) >= 5 and isinstance(result, str):
+                block = _cached_file_context(current, candidate)
                 if block:
                     return result + "\n\n" + block
         except Exception:
@@ -2098,6 +2103,39 @@ def _tool_execution_middleware(provider):
         return result
 
     return middleware
+
+
+# Um middleware tool_execution por processo. O Hermes roda register(ctx) para
+# cada agente que monta, e a lista de middlewares dele é do processo: cada
+# chamada acrescentava um elo à cadeia que toda tool percorre (um grupo de
+# frames por elo). Com o run_tool_execution_middleware do próprio Hermes, a
+# chamada de tool passa com 330 elos e dá RecursionError com 400 (limite
+# 1000), e o gateway somava ~84 elos por dia (31/10/2026).
+_TOOL_MIDDLEWARE_LOCK = threading.Lock()
+_TOOL_MIDDLEWARE_HANDLE = None
+_TOOL_MIDDLEWARE_PROVIDER = None
+
+
+def _register_tool_middleware(ctx, provider) -> None:
+    """Aponta o middleware para o provider mais novo; registra só quando não há um vivo.
+
+    O unload do Hermes (reload de plugin, troca de perfil) descarta a
+    registração: o `active` do handle fica falso e o próximo agente registra
+    de novo. Um Hermes cujo register_middleware não devolve handle registra
+    uma vez.
+    """
+    global _TOOL_MIDDLEWARE_HANDLE, _TOOL_MIDDLEWARE_PROVIDER
+    with _TOOL_MIDDLEWARE_LOCK:
+        _TOOL_MIDDLEWARE_PROVIDER = provider
+        handle = _TOOL_MIDDLEWARE_HANDLE
+        if handle is not None and getattr(handle, "active", True):
+            return
+        try:
+            registered = ctx.register_middleware("tool_execution", _tool_execution_middleware())
+        except Exception as e:
+            logger.debug("valorbrain: tool middleware registration skipped: %s", e)
+            return
+        _TOOL_MIDDLEWARE_HANDLE = registered if registered is not None else True
 
 
 # ---------------------------------------------------------------------------
@@ -2205,8 +2243,5 @@ def register(ctx) -> None:
     ctx.register_memory_provider(provider)
     # PreToolUse nativo: contexto por arquivo no resultado das tools (o harness
     # hospedado não tem hook de PreToolUse; middleware é o caminho). Não-bloqueante.
-    try:
-        ctx.register_middleware("tool_execution", _tool_execution_middleware(provider))
-    except Exception as e:
-        logger.debug("valorbrain: tool middleware registration skipped: %s", e)
+    _register_tool_middleware(ctx, provider)
     _eager_register_gateway_runtime()

@@ -125,12 +125,16 @@ gateway again.
   A person's session sends none (the engine infers `conversation`), and so do
   `subagent`, `flush`, `tool` and `a2a`: they are pieces of another run. An
   explicit `VALORBRAIN_RUN_KIND` always wins.
-- **One gateway heartbeat (1.12.1)**: the gateway runtime registers and starts
-  its heartbeat loop once per process. Hermes calls the plugin's `register(ctx)`
-  again for every agent it builds (each session, cron run and subagent), and
-  each call used to start one more loop that never stopped: a gateway up for 3
-  days had 284 of them, ~55 heartbeats a minute. A failed registration is
-  retried by the next agent.
+- **Once per process (1.12.1)**: Hermes calls the plugin's `register(ctx)`
+  again for every agent it builds (each session, cron run and subagent). Two
+  of its effects are process-wide and used to pile up: the gateway runtime's
+  heartbeat loop (284 loops in a gateway up for 3 days, ~55 heartbeats a
+  minute) and the `tool_execution` middleware, one more link per agent in the
+  chain every tool call walks (with Hermes' own runner a tool call raises
+  RecursionError past ~330-400 links). Both now register once per process; a
+  failed gateway registration is retried by the next agent, a middleware
+  disposed by a Hermes unload is registered again, and the middleware serves
+  the newest provider.
 - **Search timeout (1.12.0)**: `valorbrain_retrieve`, `valorbrain_similar` and
   `valorbrain_working_context` wait up to 30 s for the engine's answer
   (`VALORBRAIN_RETRIEVE_TIMEOUT_S`); the other tools keep 5 s, and opening the
