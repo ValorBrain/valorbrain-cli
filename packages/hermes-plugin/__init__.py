@@ -93,7 +93,7 @@ _CONTRACT_VERSION = "8"
 
 # Versão do pacote do plugin (plugin.yaml do catálogo do Hermes). O teste
 # tests/unit/hermes-plugin.test.ts falha se divergir do manifest.
-_PLUGIN_VERSION = "1.12.0"
+_PLUGIN_VERSION = "1.12.1"
 
 # Teto do transcript enviado ao engine no caminho hospedado (o servidor corta em
 # 8MB; cortamos antes para não empurrar payload grande por nada).
@@ -2080,17 +2080,23 @@ def _cached_file_context(provider, path: str) -> str:
     return entry[1] if entry else ""
 
 
-def _tool_execution_middleware(provider):
-    """Appenda o contexto do vault ao resultado de tools com `file_path`."""
+def _tool_execution_middleware(provider=None, home=None):
+    """Appenda o contexto do vault ao resultado de tools com `file_path`.
+
+    Sem `provider`, atende o mais novo registrado na `home` do Hermes
+    (`_register_tool_middleware`, um middleware por home), lido na hora da
+    chamada.
+    """
 
     def middleware(tool_name, args, next_call, **context):
         result = next_call(args)
+        current = provider if provider is not None else _TOOL_MIDDLEWARE_PROVIDERS.get(home)
         try:
             candidate = None
             if isinstance(args, dict):
                 candidate = args.get("file_path") or args.get("path")
-            if isinstance(candidate, str) and len(candidate) >= 5 and isinstance(result, str):
-                block = _cached_file_context(provider, candidate)
+            if current is not None and isinstance(candidate, str) and len(candidate) >= 5 and isinstance(result, str):
+                block = _cached_file_context(current, candidate)
                 if block:
                     return result + "\n\n" + block
         except Exception:
@@ -2100,11 +2106,63 @@ def _tool_execution_middleware(provider):
     return middleware
 
 
+# Um middleware tool_execution por home do Hermes. O Hermes roda register(ctx)
+# para cada agente que monta, e cada home (perfil) tem a sua lista de
+# middlewares: cada chamada acrescentava um elo à cadeia que toda tool da home
+# percorre (um grupo de frames por elo). Com o run_tool_execution_middleware
+# do próprio Hermes, a chamada de tool passa com 330 elos e dá RecursionError
+# com 400 (limite 1000); a home padrão do gateway somava ~49 elos por dia
+# (31/10/2026). Por home, não por processo: com multiplex_profiles o gateway
+# serve vários perfis, e os perfis apontam para o mesmo diretório do plugin,
+# então este módulo é um só para todos (revisão do #730).
+_TOOL_MIDDLEWARE_LOCK = threading.Lock()
+_TOOL_MIDDLEWARE_HANDLES: dict = {}
+_TOOL_MIDDLEWARE_PROVIDERS: dict = {}
+
+
+def _hermes_home_key() -> str:
+    """A home do Hermes em que o agente é montado (a chave do registro dele)."""
+    try:
+        from hermes_constants import hermes_home_key
+
+        return hermes_home_key()
+    except Exception:
+        return os.environ.get("HERMES_HOME", "")
+
+
+def _register_tool_middleware(ctx, provider) -> None:
+    """Aponta o middleware da home para o provider mais novo; registra só quando a home não tem um vivo.
+
+    O unload do Hermes (reload de plugin) descarta a registração: o `active`
+    do handle fica falso e o próximo agente da home registra de novo. Um
+    Hermes cujo register_middleware não devolve handle registra uma vez por
+    home.
+    """
+    home = _hermes_home_key()
+    with _TOOL_MIDDLEWARE_LOCK:
+        _TOOL_MIDDLEWARE_PROVIDERS[home] = provider
+        handle = _TOOL_MIDDLEWARE_HANDLES.get(home)
+        if handle is not None and getattr(handle, "active", True):
+            return
+        try:
+            registered = ctx.register_middleware("tool_execution", _tool_execution_middleware(home=home))
+        except Exception as e:
+            logger.debug("valorbrain: tool middleware registration skipped: %s", e)
+            return
+        _TOOL_MIDDLEWARE_HANDLES[home] = registered if registered is not None else True
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
 _GATEWAY_RUNTIME_HB_STOP = threading.Event()
+# One gateway registration and one heartbeat loop per process. Hermes calls
+# register(ctx) again for every agent it builds (each session, cron run and
+# subagent), and each call used to start one more loop: 284 of them in a
+# gateway up for 3 days (31/10/2026), ~55 heartbeats a minute to the engine.
+_GATEWAY_RUNTIME_LOCK = threading.Lock()
+_GATEWAY_RUNTIME_STARTED = False
 
 
 def _gateway_runtime_heartbeat_loop(runtime_key: str, port: int) -> None:
@@ -2124,11 +2182,31 @@ def _gateway_runtime_heartbeat_loop(runtime_key: str, port: int) -> None:
 
 
 def _eager_register_gateway_runtime() -> None:
-    """Register runtime at plugin load — not only when a chat session starts."""
+    """Register runtime at plugin load — not only when a chat session starts.
+
+    Once per process: the first call that registers starts the heartbeat loop,
+    and the later ones return. A call that fails leaves the next one to retry.
+    """
+    global _GATEWAY_RUNTIME_STARTED
+    with _GATEWAY_RUNTIME_LOCK:
+        if _GATEWAY_RUNTIME_STARTED:
+            return
+        _GATEWAY_RUNTIME_STARTED = True
+    started = False
+    try:
+        started = _register_gateway_runtime()
+    finally:
+        if not started:
+            with _GATEWAY_RUNTIME_LOCK:
+                _GATEWAY_RUNTIME_STARTED = False
+
+
+def _register_gateway_runtime() -> bool:
+    """Register the gateway runtime and start its heartbeat loop; True when started."""
     seed = _runtime_seed()
     if not seed:
         logger.debug("valorbrain: skip gateway runtime register — no tenant id/token")
-        return
+        return False
     try:
         port = int(os.environ.get("VALORBRAIN_SERVE_PORT", _DEFAULT_PORT))
     except (ValueError, TypeError):
@@ -2168,8 +2246,9 @@ def _eager_register_gateway_runtime() -> None:
             daemon=True,
             name="valorbrain-runtime-hb",
         ).start()
-    else:
-        logger.warning("valorbrain: hermes gateway runtime register failed")
+        return True
+    logger.warning("valorbrain: hermes gateway runtime register failed")
+    return False
 
 
 def register(ctx) -> None:
@@ -2178,8 +2257,5 @@ def register(ctx) -> None:
     ctx.register_memory_provider(provider)
     # PreToolUse nativo: contexto por arquivo no resultado das tools (o harness
     # hospedado não tem hook de PreToolUse; middleware é o caminho). Não-bloqueante.
-    try:
-        ctx.register_middleware("tool_execution", _tool_execution_middleware(provider))
-    except Exception as e:
-        logger.debug("valorbrain: tool middleware registration skipped: %s", e)
+    _register_tool_middleware(ctx, provider)
     _eager_register_gateway_runtime()
