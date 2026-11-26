@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ValorBrain/valorbrain",
+  "title": "ValorBrain",
+  "description": "Shared memory for AI agents and teams: store, search and correct dated facts and decisions.",
+  "repository": {
+    "url": "https://github.com/ValorBrain/valorbrain-cli",
+    "source": "github"
+  },
+  "websiteUrl": "https://docs.valorbrain.com.br",
+  "version": "0.2.2",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcpbrain.valor.digital/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer MCP token (vbm_...). Get one with `npx -y @valorbrain/cli@latest init --agent`, or create it in the app. Clients that sign in with OAuth do not send this header.",
+          "value": "Bearer {mcp_token}",
+          "isRequired": false,
+          "isSecret": true,
+          "variables": {
+            "mcp_token": {
+              "description": "ValorBrain MCP token, starts with vbm_",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
