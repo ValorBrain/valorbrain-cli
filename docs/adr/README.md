@@ -6,3 +6,4 @@ Fonte viva: ValorBrain; snapshot navegável aqui. Convenção `NNNN-titulo-kebab
 |-----|--------|--------|
 | [0001](0001-zero-dependencias-e-superficie-agent-native.md) | Zero dependências e superfície agent-native | Aceito |
 | [0002](0002-parser-estrito-erros-json-e-identidade-por-chave.md) | Parser estrito, erros JSON com código de saída e identidade por chave | Aceito |
+| [0003](0003-registro-oficial-do-mcp-nome-e-publicacao.md) | Registro oficial do MCP: nome do servidor e publicação por OIDC | Proposto |

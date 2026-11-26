@@ -1,0 +1,98 @@
+name: publish-mcp
+
+# Publishes server.json to the official MCP Registry
+# (https://registry.modelcontextprotocol.io) as io.github.ValorBrain/valorbrain.
+#
+# Auth is GitHub OIDC: the registry reads `repository_owner` from this run's
+# OIDC token and grants io.github.ValorBrain/*. No secret, no token, no person.
+# The interactive `mcp-publisher login github` cannot publish to an organization
+# namespace (modelcontextprotocol/registry#1468), so this workflow is the path.
+#
+# Manual only (workflow_dispatch). A version in the registry is immutable: to
+# publish again, change `version` in server.json first. The job skips the
+# publish when that version is already there, so a re-run is green.
+#
+# GitHub-hosted runner on purpose: the registry's docs advise against
+# self-hosted runners for the publish job of a public repository.
+#
+# When server.json gains a `packages` entry for @valorbrain/cli, the npm version
+# it names must already be on npm with the same `mcpName` in package.json
+# (ADR 0003), or the registry refuses the publish.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC — this is the whole auth model
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.16
+      REGISTRY: https://registry.modelcontextprotocol.io
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Download and verify mcp-publisher
+        run: |
+          set -euo pipefail
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl --fail --location --silent --show-error --output "$archive" "$base_url/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base_url/$archive.sigstore.json"
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar xzf "$archive" mcp-publisher
+          rm -f "$archive" "$archive.sigstore.json"
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate server.json
+
+      - name: Is this version already in the registry?
+        id: existing
+        run: |
+          set -euo pipefail
+          name=$(jq -r .name server.json)
+          version=$(jq -r .version server.json)
+          encoded=$(jq -rn --arg n "$name" '$n|@uri')
+          code=$(curl --silent --show-error --max-time 30 --output /dev/null --write-out '%{http_code}' \
+            "$REGISTRY/v0.1/servers/$encoded/versions/$version")
+          echo "$name@$version -> HTTP $code"
+          case "$code" in
+            200) echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "unexpected answer from the registry: HTTP $code" >&2; exit 1 ;;
+          esac
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        if: steps.existing.outputs.published == 'false'
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server.json
+        if: steps.existing.outputs.published == 'false'
+        run: ./mcp-publisher publish server.json
+
+      - name: Read it back from the registry
+        run: |
+          set -euo pipefail
+          name=$(jq -r .name server.json)
+          version=$(jq -r .version server.json)
+          encoded=$(jq -rn --arg n "$name" '$n|@uri')
+          for i in $(seq 1 6); do
+            if curl --fail --silent --show-error --max-time 30 \
+              "$REGISTRY/v0.1/servers/$encoded/versions/$version" | jq -e --arg n "$name" '.server.name == $n' >/dev/null; then
+              echo "$name@$version is in the registry"; exit 0
+            fi
+            sleep 10
+          done
+          echo "$name@$version did not show up in the registry" >&2
+          exit 1
