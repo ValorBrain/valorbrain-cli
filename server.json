@@ -8,7 +8,32 @@
     "source": "github"
   },
   "websiteUrl": "https://docs.valorbrain.com.br",
-  "version": "0.2.2",
+  "version": "0.2.3",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@valorbrain/cli",
+      "version": "0.2.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "VALORBRAIN_MCP_TOKEN",
+          "description": "ValorBrain MCP token (vbm_...). Optional when `npx -y @valorbrain/cli@latest init --agent` already saved it in ~/.valorbrain/config.json.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    }
+  ],
   "remotes": [
     {
       "type": "streamable-http",
