@@ -48,3 +48,15 @@ login decide o namespace: `io.github.<org>/*` pelo GitHub, ou o domínio inverti
 - `test/server-json.test.js` falha se o nome sair de sincronia com `mcpName`, se a
   descrição passar de 100 caracteres ou se a URL do remoto divergir de
   `DEFAULT_MCP_URL`.
+
+## Ordem de release com `packages` (0.2.3 em diante)
+O `server.json` lista a ponte stdio (`npx -y @valorbrain/cli mcp`) em `packages`.
+O registro confere no npm que a versão nomeada existe e traz o `mcpName`, então a
+ordem é fixa:
+1. `npm publish --access public` local do `@valorbrain/cli` na versão do
+   `package.json` (o `publish.yml` não publica em runner self-hosted; ver o cabeçalho dele).
+2. Conferir `npm view @valorbrain/cli@<versão> mcpName`.
+3. Rodar o workflow `publish-mcp` na main e conferir
+   `GET https://registry.modelcontextprotocol.io/v0/servers?search=valorbrain`.
+
+Rodar o `publish-mcp` antes do passo 1 falha no registro; nada fica publicado pela metade.
