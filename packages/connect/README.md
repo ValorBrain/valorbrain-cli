@@ -509,7 +509,9 @@ hermes memory setup   # escolha valorbrain
 ```
 
 O plugin declara a versão do contrato no engine — é o que faz o harness aparecer
-identificado (com data de adoção) na cobertura do dashboard.
+identificado (com data de adoção) na cobertura do dashboard. Como ele não tem
+arquivo de regras, o `--status` lê `_CONTRACT_VERSION` do próprio
+`__init__.py` (procurar o marker `valorbrain-contract` ali dava falso negativo).
 
 ## MCP client (stdio)
 

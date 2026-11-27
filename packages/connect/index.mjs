@@ -1536,7 +1536,7 @@ function mergeHooksJson(existingRaw, renderedRaw, remove, { migrate = false } = 
   return JSON.stringify(existing, null, 2);
 }
 
-function statusFor(manifest, home) {
+export function statusFor(manifest, home) {
   const rows = [];
   for (const artifact of manifest.artifacts) {
     const path = expand(artifact.path, home);
@@ -1573,6 +1573,19 @@ function statusFor(manifest, home) {
           : legacy
             ? "hook protocol v1 (token on the command line) — run the installer again to migrate"
             : `hook protocol v2 — ${hookClientDetail(body, home)}`,
+      });
+    } else if (artifact.kind === "plugin") {
+      // O plugin (Hermes) não tem arquivo de regras: o contrato é declarado no
+      // próprio código, em `_CONTRACT_VERSION`. Procurar o marker de regras
+      // aqui dava falso negativo com o plugin instalado e correto.
+      const m = body.match(/_CONTRACT_VERSION\s*=\s*"([^"]+)"/);
+      const current = String(manifest.contract_version);
+      rows.push({
+        kind: "plugin",
+        state: !m ? "drift" : m[1] === current ? "ok" : "drift",
+        detail: !m
+          ? "plugin without a contract version — reinstall it"
+          : `contract v${m[1]}${m[1] === current ? "" : ` (current is v${current})`}`,
       });
     } else {
       const m = body.match(/valorbrain-contract:\s*v(\d+)/);
