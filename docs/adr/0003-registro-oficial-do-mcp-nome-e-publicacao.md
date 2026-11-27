@@ -53,8 +53,9 @@ login decide o namespace: `io.github.<org>/*` pelo GitHub, ou o domínio inverti
 O `server.json` lista a ponte stdio (`npx -y @valorbrain/cli mcp`) em `packages`.
 O registro confere no npm que a versão nomeada existe e traz o `mcpName`, então a
 ordem é fixa:
-1. `npm publish --access public` local do `@valorbrain/cli` na versão do
-   `package.json` (o `publish.yml` não publica em runner self-hosted; ver o cabeçalho dele).
+1. Rodar o workflow `publish.yml` na main: publica o `@valorbrain/cli` na versão do
+   `package.json` por trusted publishing, no runner hospedado do GitHub (ver o cabeçalho
+   dele). Um `npm publish --access public` local também serve.
 2. Conferir `npm view @valorbrain/cli@<versão> mcpName`.
 3. Rodar o workflow `publish-mcp` na main e conferir
    `GET https://registry.modelcontextprotocol.io/v0/servers?search=valorbrain`.
