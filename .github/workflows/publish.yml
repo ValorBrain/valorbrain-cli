@@ -4,17 +4,20 @@ name: publish
 # workflow — precisa estar registrado no npmjs.com como trusted publisher de
 # @valorbrain/cli e @valorbrain/connect (repo ValorBrain/valorbrain-cli,
 # workflow publish.yml). Enquanto não estiver, um publish por aqui falha com
-# E404 "Not found or you do not have permission" — e o caminho é publicar
-# localmente com token (`npm publish --access public`), como em 21/09.
+# E404 "Not found or you do not have permission".
 #
-# Roda no runner self-hosted do repo (o hospedado do GitHub estava parado por
-# billing). ATENÇÃO: o trusted publishing do npm NÃO aceita runner
-# self-hosted (docs.npmjs.com/trusted-publishers: "Self-hosted runners are not
-# currently supported"). Aqui o publish falha com E422 "Unsupported GitHub
-# Actions runner environment: self-hosted" (visto no v0.5.2, 30/09). Até isso
-# mudar, a ordem de release é: `npm publish --access public` local (conta
-# valordigital) e DEPOIS a tag — o job passa pelo check idempotente abaixo.
-# Tag sem publish local deixa o run VERMELHO, de propósito.
+# Roda no runner HOSPEDADO do GitHub (ubuntu-latest). O trusted publishing do
+# npm não aceita runner self-hosted (docs.npmjs.com/trusted-publishers:
+# "Self-hosted runners are not currently supported"): de 30/09 a 27/11 este
+# job rodou no self-hosted do repo e falhava com E422 "Unsupported GitHub
+# Actions runner environment: self-hosted", então toda versão saía por
+# `npm publish` local. A conta valordigital tem 2FA só por chave de segurança,
+# o que prende o publish local a quem tem a chave. O hospedado voltou a rodar
+# (publish-mcp.yml roda em ubuntu-latest, verde em 26/11) e o repo é público,
+# sem custo de minutos.
+#
+# Ordem de release: subir `version`, merge, rodar este workflow (ou taguear).
+# Publish local continua possível e o job passa pelo check idempotente abaixo.
 #
 # Até 30/09 o erro saía verde: `if ! npm publish; then code=$?` guarda o status
 # do `!` (0), então `exit $code` saía 0 — v0.5.0, v0.5.1 e v0.5.2 tiveram run
@@ -34,7 +37,8 @@ permissions:
 
 jobs:
   publish:
-    runs-on: [self-hosted, linux, x64, valorbrain-cli]
+    # GitHub-hosted: npm trusted publishing refuses self-hosted runners (E422).
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +68,7 @@ jobs:
             if npm view "$PKG@$V" version >/dev/null 2>&1; then
               echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
             fi
-            echo "FALHA (exit $code): $PKG@$V não está no registry. Em runner self-hosted o trusted publishing não funciona (E422, ver o cabeçalho): publique local com 'npm publish --access public' e rode este workflow de novo." >&2
+            echo "FALHA (exit $code): $PKG@$V não está no registry. E404 = este workflow não está registrado como trusted publisher do pacote no npmjs.com; E422 = o job saiu do runner hospedado (ver o cabeçalho)." >&2
             exit "$code"
           fi
 
@@ -97,6 +101,6 @@ jobs:
             if npm view "$PKG@$V" version >/dev/null 2>&1; then
               echo "publish retornou erro mas $PKG@$V está no registry (propagação) — seguindo"; exit 0
             fi
-            echo "FALHA (exit $code): $PKG@$V não está no registry. Em runner self-hosted o trusted publishing não funciona (E422, ver o cabeçalho): publique local com 'npm publish --access public' e rode este workflow de novo." >&2
+            echo "FALHA (exit $code): $PKG@$V não está no registry. E404 = este workflow não está registrado como trusted publisher do pacote no npmjs.com; E422 = o job saiu do runner hospedado (ver o cabeçalho)." >&2
             exit "$code"
           fi
